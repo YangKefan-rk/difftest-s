@@ -68,10 +68,35 @@ private:
     std::set<uint64_t> members;
     bool queued = false;
   };
+  struct Atomic {
+    OperationId id;
+    uint32_t attempt = 0;
+    uint64_t address = 0;
+    uint64_t old_data = 0;
+    uint64_t new_data = 0;
+    uint64_t response = 0;
+    uint8_t mask = 0;
+    bool request_seen = false;
+    bool awaiting_retry = false;
+    bool read_seen = false;
+    bool write_seen = false;
+    bool response_seen = false;
+    bool finished = false;
+    bool observed = false;
+    bool verified = false;
+    MemoryStore store;
+    std::shared_ptr<Load> load;
+  };
+  struct WriteObservation {
+    unsigned hart;
+    uint64_t address;
+    std::vector<uint8_t> mask;
+  };
   struct Active {
     RetiredInstruction instruction;
     std::shared_ptr<Load> load;
     bool reader = false;
+    std::shared_ptr<Atomic> atomic;
     unsigned instruction_count = 1;
     std::vector<std::pair<uint64_t, uint32_t>> reference_instructions;
   };
@@ -85,14 +110,20 @@ private:
     std::map<OperationId, std::shared_ptr<Load>> loads;
     std::map<OperationId, uint32_t> attempts;
     std::map<OperationId, std::string> unsupported_allocations;
+    std::shared_ptr<Atomic> atomic_inflight;
+    std::map<OperationId, std::shared_ptr<Atomic>> atomics;
     ReferenceRead reader;
     std::optional<Active> active;
     bool done = false;
     uint64_t end_uid = 0;
     int exit_code = 0;
   };
+  // Queue phases are separate from AtomicMemoryEvent lifecycle phases:
+  // 1 data-read sample, 2 Sbuffer write, 3 indivisible AMO write point.
+  // Overlapping cross-hart writes still require qualified hardware arbitration.
   using EventKey = std::tuple<uint64_t, unsigned, uint64_t, unsigned>;
   std::vector<Hart> harts_;
+  std::map<uint64_t, std::vector<WriteObservation>> writes_by_cycle_;
   Memory memory_;
   Checker checker_;
   std::map<std::pair<unsigned, uint64_t>, Group> groups_;
@@ -114,6 +145,9 @@ private:
   CheckResult advance(uint64_t watermark);
   CheckResult observe(const std::shared_ptr<Load> &load, ObservationTime time);
   CheckResult complete_group(Group &group, ObservationTime time);
+  CheckResult observe_atomic(unsigned hart, const std::shared_ptr<Atomic> &atomic, ObservationTime time);
+  CheckResult capture_atomics(unsigned hart, DiffTestState &state);
+  void observe_write(uint64_t cycle, unsigned hart, uint64_t address, const std::vector<uint8_t> &mask);
   CheckResult allocate(unsigned hart, uint16_t rob);
   void collect_released_stores();
   void timestamp(uint64_t cycle);

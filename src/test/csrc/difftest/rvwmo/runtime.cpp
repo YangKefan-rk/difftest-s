@@ -3,6 +3,7 @@
 #include "globalmem.h"
 #include <algorithm>
 #include <limits>
+#include <sstream>
 #include <utility>
 
 namespace rvwmo {
@@ -214,11 +215,171 @@ CheckResult Runtime::complete_group(Group &group, ObservationTime time) {
   }
   return result;
 }
+void Runtime::observe_write(uint64_t cycle, unsigned hart, uint64_t address, const std::vector<uint8_t> &mask) {
+  auto &writes = writes_by_cycle_[cycle];
+  for (const auto &other : writes)
+    if (other.hart != hart && overlap(address, mask, other.address, other.mask))
+      unsupported("INCOMPLETE_ORDER: simultaneous cross-hart writes lack arbitration order");
+  writes.push_back({hart, address, mask});
+}
+
+CheckResult Runtime::observe_atomic(unsigned hart, const std::shared_ptr<Atomic> &atomic, ObservationTime time) {
+  if (!atomic->read_seen)
+    return pending("AMO write awaits its old-value observation");
+  for (unsigned byte = 0; byte < 8; ++byte) {
+    uint8_t pending_byte = 0;
+    if (((atomic->mask >> byte) & 1) && memory_.read_local(hart, atomic->id.uid, atomic->address + byte, pending_byte))
+      return {CheckStatus::Violation, 1, "AMO write point precedes an older same-address pending store"};
+  }
+  // AtomicsUnit drains the Sbuffer before issuing. Sample before registering the
+  // AMO writer, then publish its write at this same single architectural rank.
+  auto load = std::make_shared<Load>();
+  load->operation.id = atomic->id;
+  load->operation.attempt = atomic->attempt;
+  load->operation.address = atomic->address;
+  load->operation.byte_mask = mask_bytes(atomic->mask, 8);
+  load->operation.load = load->operation.store = load->operation.atomic = true;
+  load->operation.read_time = load->operation.write_time = time;
+  load->operation.source_kind = ReadSourceKind::ModeledWitness;
+  for (unsigned byte = 0; byte < 8; ++byte)
+    load->actual.push_back(atomic->old_data >> (8 * byte));
+  auto result = checker_.observe_load(load->operation, atomic->id.uid, {});
+  if (!result)
+    return result;
+  atomic->store.po = atomic->id.uid;
+  atomic->store.address = atomic->address;
+  atomic->store.mask = load->operation.byte_mask;
+  for (unsigned byte = 0; byte < 8; ++byte)
+    atomic->store.bytes.push_back(atomic->new_data >> (8 * byte));
+  result = checker_.memory_writer(atomic->id, atomic->store.writer);
+  if (!result)
+    return result;
+  result = checker_.record_store(atomic->store, load->operation, StoreVerification::Provisional);
+  if (!result)
+    return result;
+  const auto writers = std::vector<MemoryWriter>(8, atomic->store.writer);
+  result = checker_.observe_global(atomic->address, atomic->store.bytes, atomic->store.mask,
+                                   writers, {atomic->store.writer}, time);
+  if (!result)
+    return result;
+  load->observed = true;
+  atomic->load = load;
+  atomic->observed = true;
+  harts_[hart].loads[atomic->id] = load;
+  return {};
+}
+
+CheckResult Runtime::capture_atomics(unsigned hart, DiffTestState &state) {
+#ifdef CONFIG_DIFFTEST_ATOMICMEMORYEVENT
+  auto &h = harts_[hart];
+  std::vector<DifftestAtomicMemoryEvent> events;
+  for (auto &event : state.atomic_memory)
+    if (event.valid) {
+      events.push_back(event);
+      event.valid = 0;
+    }
+  std::sort(events.begin(), events.end(), [](const auto &left, const auto &right) {
+    const auto priority = [](unsigned phase) { return phase == 3 ? 0 : phase == 4 ? 1 : phase + 2; };
+    return std::make_pair(left.timestamp, priority(left.phase)) <
+           std::make_pair(right.timestamp, priority(right.phase));
+  });
+  for (const auto &event : events) {
+    timestamp(event.timestamp);
+    if (event.phase == 3) {
+      if (h.atomic_inflight)
+        return invalid("overlapping atomic lifecycles on one hart");
+      auto allocation = h.allocations.find(event.robidx);
+      if (!event.identityValid || allocation == h.allocations.end())
+        return invalid("atomic begin lacks ROB generation");
+      auto atomic = std::make_shared<Atomic>();
+      atomic->id = allocation->second;
+      h.atomics[atomic->id] = atomic;
+      h.atomic_inflight = atomic;
+      continue;
+    }
+    auto atomic = h.atomic_inflight;
+    if (!atomic)
+      return invalid("atomic effect lacks an active lifecycle");
+    if (event.identityValid) {
+      auto allocation = h.allocations.find(event.robidx);
+      if (allocation == h.allocations.end() || !(allocation->second == atomic->id))
+        return invalid("atomic lifecycle ROB identity changed");
+    }
+    if (event.error)
+      return unsupported("atomic observation reported an access error");
+    if (event.phase == 4) {
+      if ((!atomic->request_seen && event.attempt != 0) ||
+          (atomic->request_seen && (!atomic->awaiting_retry || event.attempt != atomic->attempt + 1)))
+        return invalid("atomic request attempt is duplicated or skips its replay lifecycle");
+      atomic->attempt = event.attempt;
+      atomic->request_seen = true;
+      atomic->awaiting_retry = false;
+    } else if (event.phase == 5) {
+      if (!atomic->request_seen || atomic->awaiting_retry || atomic->write_seen || atomic->response_seen)
+        return invalid("atomic replay does not follow an outstanding request");
+      atomic->read_seen = false;
+      atomic->awaiting_retry = true;
+    } else if (event.phase == 1) {
+      if (!atomic->request_seen || atomic->awaiting_retry || atomic->read_seen || atomic->write_seen)
+        return invalid("atomic read effect is duplicated or lacks an outstanding request");
+      atomic->address = event.addr;
+      atomic->old_data = event.data;
+      atomic->mask = event.mask;
+      atomic->read_seen = true;
+    } else if (event.phase == 2) {
+      if (atomic->write_seen || !atomic->read_seen || atomic->address != event.addr || atomic->mask != event.mask)
+        return invalid("atomic write does not match its read effect");
+      if ((event.mask != 0x0f && event.mask != 0xf0 && event.mask != 0xff) || (event.addr & 7) ||
+          !global_memory().contains(event.addr, 8))
+        return unsupported("atomic write range or width is not supported");
+      if (transport_watermark_ && event.timestamp <= *transport_watermark_)
+        return invalid("atomic write arrived behind completed transport watermark");
+      atomic->new_data = event.data;
+      atomic->write_seen = true;
+      observe_write(event.timestamp, hart, event.addr, mask_bytes(event.mask, 8));
+      auto inserted = events_.emplace(EventKey{event.timestamp, 3, atomic->id.uid, hart},
+                                      [this, hart, atomic](ObservationTime time) {
+                                        return observe_atomic(hart, atomic, time);
+                                      });
+      if (!inserted.second)
+        return invalid("duplicate atomic write observation key");
+    } else if (event.phase == 6) {
+      if (atomic->response_seen)
+        return invalid("duplicate atomic cache response");
+      if (!event.success)
+        return unsupported("failed SC or unsuccessful atomic operation is not covered");
+      if (!atomic->read_seen || event.data != atomic->old_data)
+        return {CheckStatus::Violation, 0, "AMO cache response differs from observed old word"};
+      atomic->response_seen = true;
+    } else if (event.phase == 7) {
+      if (!atomic->write_seen || !atomic->response_seen)
+        return unsupported("atomic lifecycle completed without an AMO write/response");
+      atomic->response = event.data;
+      atomic->finished = true;
+      h.atomic_inflight.reset();
+    } else if (event.phase == 8) {
+      return unsupported("cancelled atomic lifecycle requires explicit recovery support");
+    } else {
+      return invalid("unknown atomic observation phase");
+    }
+  }
+#else
+  (void)hart;
+  (void)state;
+#endif
+#ifdef CONFIG_DIFFTEST_ATOMICEVENT
+  state.atomic.valid = 0; // Legacy response event is not a global-memory writer.
+#endif
+  return {};
+}
+
 void Runtime::collect_released_stores() {
   for (const auto &id: checker_.take_released_stores()) {
     auto wire = store_uids_.find(id);
-    if (wire == store_uids_.end())
+    if (wire == store_uids_.end()) {
+      harts_.at(id.hart).atomics.erase(id);
       continue;
+    }
     auto &hart = harts_.at(id.hart);
     const uint64_t uid = wire->second;
     OperationId instruction = id;
@@ -238,6 +399,7 @@ void Runtime::collect_released_stores() {
 CheckResult Runtime::advance(uint64_t watermark) {
   transport_watermark_ = watermark;
   loads_by_cycle_.erase(loads_by_cycle_.begin(), loads_by_cycle_.upper_bound(watermark));
+  writes_by_cycle_.erase(writes_by_cycle_.begin(), writes_by_cycle_.upper_bound(watermark));
   ordering_pending_.clear();
   while (!events_.empty() && std::get<0>(events_.begin()->first) <= watermark) {
     auto &event = *events_.begin();
@@ -454,16 +616,7 @@ CheckResult Runtime::capture(const std::vector<DiffTestState *> &states) {
       group.mask = mask_bytes(event.mask, 64);
       group.writers.assign(event.byteWriterUid, event.byteWriterUid + 64);
       group.queued = true;
-      // Same-cycle cross-hart overlapping writes have no producer arbitration
-      // order. Do not turn a software iteration order into a DUT violation.
-      auto simultaneous = events_.lower_bound({group.cycle, 2, 0, 0});
-      for (; simultaneous != events_.end() && std::get<0>(simultaneous->first) == group.cycle &&
-             std::get<1>(simultaneous->first) == 2;
-           ++simultaneous) {
-        const auto &other = groups_.at({std::get<3>(simultaneous->first), std::get<2>(simultaneous->first)});
-        if (other.hart != hart && overlap(group.address, group.mask, other.address, other.mask))
-          unsupported("INCOMPLETE_ORDER: simultaneous cross-hart writes lack arbitration order");
-      }
+      observe_write(group.cycle, hart, group.address, group.mask);
       auto key = std::make_pair(hart, event.groupId);
       auto inserted =
           events_.emplace(EventKey{event.timestamp, 2, event.groupId, hart},
@@ -471,10 +624,9 @@ CheckResult Runtime::capture(const std::vector<DiffTestState *> &states) {
       if (!inserted.second)
         return invalid("duplicate global completion event ordering key");
     }
-#ifdef CONFIG_DIFFTEST_ATOMICEVENT
-    if (state.atomic.valid)
-      return unsupported("atomic memory effect lacks qualified runtime observation support");
-#endif
+    auto atomic_result = capture_atomics(hart, state);
+    if (!atomic_result)
+      return atomic_result;
   }
   // Audit after collecting every hart: the result must not depend on which
   // hart's packet happened to be visited first in this capture.
@@ -482,18 +634,17 @@ CheckResult Runtime::capture(const std::vector<DiffTestState *> &states) {
     auto loads = loads_by_cycle_.find(cycle);
     if (loads == loads_by_cycle_.end())
       continue;
-    auto global = events_.lower_bound({cycle, 2, 0, 0});
-    for (; global != events_.end() && std::get<0>(global->first) == cycle && std::get<1>(global->first) == 2;
-         ++global) {
-      const auto &group = groups_.at({std::get<3>(global->first), std::get<2>(global->first)});
-      for (const auto &weak: loads->second) {
+    auto writes = writes_by_cycle_.find(cycle);
+    if (writes == writes_by_cycle_.end())
+      continue;
+    for (const auto &write : writes->second)
+      for (const auto &weak : loads->second) {
         auto load = weak.lock();
-        if (load && load->operation.id.hart != group.hart && !load->cancelled &&
-            overlap(group.address, group.mask, load->operation.address, load->operation.byte_mask))
+        if (load && load->operation.id.hart != write.hart && !load->cancelled &&
+            overlap(write.address, write.mask, load->operation.address, load->operation.byte_mask))
           load->coverage_reason =
               "INCOMPLETE_ORDER: simultaneous cross-hart read/write needs a qualified observation phase";
       }
-    }
   }
   if (!covered())
     return coverage_;
@@ -523,8 +674,10 @@ CheckResult Runtime::before_commit(unsigned hart, unsigned port, DiffTestState &
   const auto &commit = state.commit[port];
   if (h.active)
     return invalid("previous reference instruction has not completed");
-  if ((commit.instr & 0x7f) == 0x2f)
-    return unsupported("atomic retirement is outside current runtime coverage");
+  const bool is_atomic = (commit.instr & 0x7f) == 0x2f;
+  const unsigned atomic_function = commit.instr >> 27;
+  if (is_atomic && (atomic_function == 2 || atomic_function == 3))
+    return unsupported("LR/SC does not have the ordinary AMO write-point contract");
   auto allocation = h.allocations.find(commit.tlbId);
   if (allocation == h.allocations.end())
     return unsupported("retirement lacks complete allocation identity stream");
@@ -565,6 +718,54 @@ CheckResult Runtime::before_commit(unsigned hart, unsigned port, DiffTestState &
       dependencies.fence_predecessor = 3;
       dependencies.fence_successor = 3;
     }
+  }
+  if (is_atomic) {
+    if (!reference.supports_atomic_store())
+      return unsupported("reference lacks independent atomic store-log support");
+    const unsigned width = (commit.instr >> 12) & 7;
+    if (width != 2 && width != 3)
+      return unsupported("atomic width is outside AMO.W/AMO.D coverage");
+    switch (atomic_function) {
+      case 0: case 1: case 4: case 8: case 12: case 16: case 20: case 24: case 28: break;
+      default: return unsupported("atomic opcode is outside ordinary AMO coverage");
+    }
+    auto found = h.atomics.find(allocation->second);
+    if (found == h.atomics.end() || !found->second->observed || !found->second->finished)
+      return pending("AMO retirement awaits its ordered write-point sample and response");
+    auto atomic = found->second;
+    const size_t size = width == 2 ? 4 : 8;
+    const size_t offset = atomic->mask == 0xf0 ? 4 : 0;
+    if ((size == 8 && atomic->mask != 0xff) || (size == 4 && atomic->mask == 0xff))
+      return invalid("AMO observation width differs from encoded instruction");
+    const uint64_t old = atomic->old_data >> (offset * 8);
+    const uint64_t response = size == 4 ? uint64_t(int64_t(int32_t(old))) : old;
+    if (atomic->response != response)
+      return {CheckStatus::Violation, 0, "AMO response differs from its observed old value"};
+    std::vector<uint8_t> candidate;
+    auto result = checker_.get_reference_candidate_load(atomic->id, atomic->attempt, candidate);
+    if (!result)
+      return result;
+    result = h.reader.begin({ReferenceAccess{atomic->address + offset,
+                                           {candidate.begin() + offset, candidate.begin() + offset + size}}});
+    if (!result)
+      return result;
+    if (!reference.set_load_reader(&ReferenceRead::read, &h.reader)) {
+      h.reader.finish();
+      return unsupported("reference lacks AMO memory-read callback");
+    }
+    auto operation = atomic->load->operation;
+    operation.acquire = bool(commit.instr & (1u << 26));
+    operation.release = bool(commit.instr & (1u << 25));
+    operation.rcsc = operation.acquire || operation.release;
+    active.reader = true;
+    active.atomic = atomic;
+    active.load = atomic->load;
+    active.instruction.memory.push_back(operation);
+    active.instruction_count = 1;
+    if (commit.skip || commit.nFused || commit.special)
+      return unsupported("AMO retirement cannot skip or fuse reference execution");
+    h.active = std::move(active);
+    return {};
   }
   const auto access = scalar_access(commit.instr);
   if (bool(commit.isLoad) != (access == ScalarAccess::Read) || bool(commit.isStore) != (access == ScalarAccess::Write))
@@ -683,6 +884,35 @@ CheckResult Runtime::after_commit(unsigned hart, RefProxy &reference) {
     if (!result)
       return result;
   }
+  if (active.atomic) {
+    auto atomic = active.atomic;
+    uint64_t address = atomic->address;
+    uint64_t data = atomic->new_data;
+    uint8_t mask = atomic->mask;
+    // Compare only written bytes: MainPipe supplies the merged 64-bit word.
+    uint64_t enabled = 0;
+    for (unsigned byte = 0; byte < 8; ++byte)
+      if ((mask >> byte) & 1)
+        enabled |= UINT64_C(255) << (byte * 8);
+    data &= enabled;
+    if (reference.atomic_commit(&address, &data, &mask)) {
+      std::ostringstream message;
+      message << "REF AMO write differs from observed atomic write: hart=" << hart << std::hex
+              << " pc=0x" << active.instruction.pc << " observed-address=0x" << atomic->address
+              << " observed-data=0x" << (atomic->new_data & enabled) << " observed-mask=0x" << unsigned(atomic->mask)
+              << " reference-address=0x" << address << " reference-data=0x" << data
+              << " reference-mask=0x" << unsigned(mask);
+      return {CheckStatus::Violation, 0, message.str()};
+    }
+    auto reference_store = atomic->store;
+    for (unsigned byte = 0; byte < 8; ++byte)
+      if (reference_store.mask[byte])
+        reference_store.bytes[byte] = data >> (byte * 8);
+    auto result = checker_.verify_store(atomic->id, reference_store);
+    if (!accepted(result))
+      return result;
+    atomic->verified = true;
+  }
   std::vector<RetiredLoad> loads;
   if (active.load) {
     active.load->retired = true;
@@ -781,6 +1011,13 @@ CheckResult Runtime::finish() {
   // Allow all fixed-delay probe packets to arrive after the last relevant event.
   if (capture_tick_ <= std::max(all_done_tick_, last_event_tick_) + 4)
     return pending("INCOMPLETE_RUN: observation transport has not drained");
+  for (const auto &h : harts_) {
+    if (h.atomic_inflight)
+      return pending("INCOMPLETE_RUN: atomic lifecycle has not finished");
+    for (const auto &entry : h.atomics)
+      if (!entry.second->verified || entry.first.uid > h.end_uid)
+        return pending("INCOMPLETE_RUN: atomic reference audit is incomplete");
+  }
   for (const auto &h: harts_)
     for (const auto &entry: h.stores)
       if (entry.second.recorded && entry.second.id.uid > h.end_uid)

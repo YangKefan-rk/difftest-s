@@ -1082,7 +1082,7 @@ int Difftest::do_load_check(int i) {
   auto &load = dut->load[i];
   if (!load.valid)
     return 0;
-  if (!multicore_runtime().covered() || !load.isLoad || load.isAtomic || load.isVLoad) {
+  if (!multicore_runtime().covered() || (!load.isLoad && !load.isAtomic) || load.isVLoad) {
     Info("RVWMO UNSUPPORTED: load lacks a validated runtime path on core %d\n", id);
     return 1;
   }
