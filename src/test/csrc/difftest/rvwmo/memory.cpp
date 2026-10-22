@@ -30,6 +30,25 @@ Memory::Memory(ReadGlobal read, WriteGlobal write) : read_(std::move(read)), wri
     throw std::invalid_argument("GlobalMem callbacks are required");
 }
 
+bool Memory::read_local(uint32_t hart, uint64_t before_po, uint64_t address, uint8_t &byte) const {
+  auto local = local_.find(hart);
+  if (local == local_.end())
+    return false;
+  auto versions = local->second.find(address);
+  if (versions == local->second.end())
+    return false;
+  const MemoryStore *selected = nullptr;
+  for (const auto &writer : versions->second) {
+    const auto &store = stores_.at(writer).store;
+    if (store.po < before_po && (!selected || store.po > selected->po))
+      selected = &store;
+  }
+  if (!selected)
+    return false;
+  byte = selected->bytes.at(address - selected->address);
+  return true;
+}
+
 std::string Memory::commit_local(const MemoryStore &store) {
   auto error = check_range(store.address, store.bytes.size());
   if (!error.empty())
