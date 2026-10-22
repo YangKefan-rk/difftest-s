@@ -2,6 +2,7 @@
 #define DIFFTEST_RVWMO_CHECKER_H
 
 #include "memory.h"
+#include "lrsc.h"
 #include "ppo.h"
 #include <deque>
 #include <set>
@@ -79,6 +80,9 @@ private:
   using LoadKey = std::pair<OperationId, uint32_t>;
   Memory &memory_;
   PpoChecker ppo_;
+  LrScChecker lrsc_;
+  std::map<OperationId, StoreConditionalEvidence> sc_evidence_;
+  std::map<uint32_t, OperationId> reserved_lr_;
   std::map<MemoryWriter, OperationId> writers_;
   std::map<OperationId, MemoryWriter> operation_writers_;
   std::map<uint32_t, uint64_t> next_writer_uid_;

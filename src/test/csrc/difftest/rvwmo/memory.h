@@ -33,6 +33,8 @@ struct MemoryByte {
   bool deferred = false;
   bool local_forward = false;
   std::optional<uint64_t> sampled_local_po;
+  // Retained with the final witness for LR/SC atomicity, independent of GC.
+  std::optional<uint64_t> writer_time;
 };
 
 struct MemorySnapshot {

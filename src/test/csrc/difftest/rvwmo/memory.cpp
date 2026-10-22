@@ -242,6 +242,7 @@ std::string Memory::sample(uint32_t hart, uint64_t po, uint64_t time, uint64_t a
         record.global_times[i] = rank->second;
     } else
       record.global_times[i] = 0;
+    byte.writer_time = record.global_times[i];
     record.global_bytes[i] = byte;
     if (byte.writer)
       ++references_[*byte.writer];
@@ -263,6 +264,7 @@ std::string Memory::sample(uint32_t hart, uint64_t po, uint64_t time, uint64_t a
     if (newest) {
       byte.value = newest->bytes[at - newest->address];
       byte.writer = newest->writer;
+      byte.writer_time = stores_.at(newest->writer).global_time;
       record.latest_local_po[i] = newest->po;
       byte.sampled_local_po = newest->po;
     }
@@ -293,6 +295,12 @@ std::string Memory::resolve(MemorySnapshot &snapshot) const {
       auto latest = active->second.latest_local_po[i];
       if (latest && (!byte.sampled_local_po || *latest > *byte.sampled_local_po))
         return byte_error("older store retired after sampling; forwarding identity required", snapshot.address + i);
+      if (byte.writer && byte.sampled_local_po) {
+        auto source = stores_.find(*byte.writer);
+        if (source == stores_.end())
+          return "forwarded source store has not locally committed";
+        byte.writer_time = source->second.global_time;
+      }
       continue;
     }
     if (!byte.writer)
@@ -311,6 +319,7 @@ std::string Memory::resolve(MemorySnapshot &snapshot) const {
       return byte_error("forwarding source does not write load byte", at);
     byte.value = store.bytes[at - store.address];
     byte.deferred = false;
+    byte.writer_time = found->second.global_time;
   }
   return {};
 }
@@ -357,6 +366,8 @@ std::string Memory::resolve_modeled(MemorySnapshot &snapshot) const {
       }
     }
   }
+  for (size_t i = 0; i < resolved.size(); ++i)
+    resolved[i].writer_time = latest[i];
   snapshot.bytes = std::move(resolved);
   return {};
 }
@@ -405,9 +416,12 @@ std::string Memory::resolve_candidate(MemorySnapshot &snapshot) const {
     if (candidate && !candidate->global_time) {
       provisional[i].value = candidate->store.bytes[snapshot.address + i - candidate->store.address];
       provisional[i].writer = candidate->store.writer;
+      latest[i].reset();
     } else if (!latest[i])
       return "candidate read awaits global baseline timestamp";
   }
+  for (size_t i = 0; i < provisional.size(); ++i)
+    provisional[i].writer_time = latest[i];
   snapshot.bytes = std::move(provisional);
   return {};
 }

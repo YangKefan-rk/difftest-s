@@ -144,6 +144,14 @@ CheckResult PpoChecker::retire(const RetiredInstruction &instruction) {
   }
   if (!metadata.complete)
     return {CheckStatus::Unsupported, 0, "incomplete external dependency metadata"};
+  if (instruction.failed_sc) {
+    if (!instruction.memory.empty())
+      return {CheckStatus::Invalid, 0, "failed SC must not contain a memory operation"};
+    // RVWMO defines SC's syntactic destination only on success. REF still writes
+    // architectural rd on failure, but that does not kill its dependency carrier.
+    metadata.destinations.clear();
+    metadata.destination_sources.clear();
+  }
   if (!metadata.destination_sources.empty() && metadata.destination_sources.size() != metadata.destinations.size())
     return {CheckStatus::Invalid, 0, "dependency destination carrier count mismatch"};
   for (const auto &op: instruction.memory) {

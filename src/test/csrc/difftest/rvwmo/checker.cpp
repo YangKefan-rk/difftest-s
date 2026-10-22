@@ -1,5 +1,6 @@
 #include "checker.h"
 #include <limits>
+#include <algorithm>
 
 namespace rvwmo {
 namespace {
@@ -9,6 +10,18 @@ CheckResult invalid(const std::string &message) {
 CheckResult pending(const std::string &message) {
   return {CheckStatus::Pending, 0, message};
 }
+MemoryOperation lrsc_operand(const MemoryOperation &operation) {
+  auto operand = operation;
+  auto first = std::find_if(operand.byte_mask.begin(), operand.byte_mask.end(), [](uint8_t byte) { return byte != 0; });
+  auto last = std::find_if(operand.byte_mask.rbegin(), operand.byte_mask.rend(), [](uint8_t byte) { return byte != 0; });
+  if (first == operand.byte_mask.end())
+    return operand;
+  const size_t offset = first - operand.byte_mask.begin();
+  operand.address += offset;
+  operand.byte_mask = std::vector<uint8_t>(first, last.base());
+  return operand;
+}
+
 CheckResult accepted_event(CheckResult result) {
   return result.status == CheckStatus::Pending ? CheckResult{} : result;
 }
@@ -191,6 +204,26 @@ CheckResult Checker::observe_global(uint64_t address, const std::vector<uint8_t>
     stores_.at(operation).write_time = completion_times[i];
     completed_stores_.insert(operation);
   }
+  std::vector<size_t> ordered(completed.size());
+  for (size_t i = 0; i < ordered.size(); ++i)
+    ordered[i] = i;
+  std::sort(ordered.begin(), ordered.end(), [&](size_t a, size_t b) {
+    return completion_times[a].rank < completion_times[b].rank;
+  });
+  for (size_t i : ordered) {
+    const auto &operation = stores_.at(writers_.at(completed[i]));
+    if (operation.sc) {
+      StoreConditionalEvidence evidence;
+      auto result = lrsc_.capture_sc(lrsc_operand(operation), evidence);
+      if (!result)
+        return remember_failure(result);
+      if (!sc_evidence_.emplace(operation.id, std::move(evidence)).second)
+        return remember_failure(invalid("duplicate successful-SC evidence"));
+    }
+    auto result = lrsc_.observe_store(operation);
+    if (!result)
+      return remember_failure(result);
+  }
   return accepted_event(poll());
 }
 
@@ -352,6 +385,10 @@ CheckResult Checker::prepare(Retirement &retirement) {
     auto verified = require_verified_sources(load->second.snapshot);
     if (!verified)
       return verified;
+    if (operation.lr)
+      for (size_t byte = 0; byte < operation.byte_mask.size(); ++byte)
+        if (operation.byte_mask[byte] && !load->second.snapshot.bytes[byte].writer_time)
+          return pending("LR source awaits its global write rank");
     if (operation.source_kind == ReadSourceKind::Observed) {
       operation.read_sources = observed.read_sources;
       if (operation.read_sources.size() != operation.byte_mask.size())
@@ -391,6 +428,43 @@ CheckResult Checker::drain(uint32_t hart) {
     auto result = prepare(front);
     if (!result)
       return remember_failure(result);
+    // Bind the most recent LR in architectural order. SC evidence was captured
+    // at the write point, so unrelated later writes cannot alter this decision.
+    for (auto &operation : front.instruction.memory) {
+      if (operation.lr) {
+        const auto operand = lrsc_operand(operation);
+        std::vector<uint64_t> sources(operand.byte_mask.size());
+        const auto &snapshot = loads_.at({operation.id, operation.attempt}).snapshot;
+        const size_t offset = operand.address - operation.address;
+        for (size_t byte = 0; byte < sources.size(); ++byte)
+          if (operand.byte_mask[byte])
+            sources[byte] = *snapshot.bytes[offset + byte].writer_time;
+        result = lrsc_.retire_lr(operand, sources);
+        if (!result)
+          return remember_failure(result);
+        auto previous = reserved_lr_.find(operation.id.hart);
+        if (previous != reserved_lr_.end())
+          ppo_.release_writer(previous->second);
+        reserved_lr_[operation.id.hart] = operation.id;
+      }
+      if (operation.sc) {
+        auto evidence = sc_evidence_.find(operation.id);
+        result = lrsc_.retire_sc(lrsc_operand(operation), evidence == sc_evidence_.end() ? nullptr : &evidence->second,
+                                  true, operation.paired_lr);
+        if (!result)
+          return remember_failure(result);
+        operation.has_paired_lr = true;
+      }
+    }
+    if (front.instruction.failed_sc) {
+      MemoryOperation failed;
+      failed.id = {front.instruction.hart, front.instruction.epoch, front.instruction.uid, 0};
+      failed.sc = true;
+      OperationId ignored;
+      result = lrsc_.retire_sc(failed, nullptr, false, ignored);
+      if (!result)
+        return remember_failure(result);
+    }
     // PPO must succeed before any value comparison. A value failure is terminal;
     // retry never applies already accepted PPO state a second time.
     result = ppo_.retire(front.instruction);
@@ -432,6 +506,19 @@ CheckResult Checker::drain(uint32_t hart) {
     for (const auto &operation: front.instruction.memory)
       if (operation.store)
         checked_stores_.insert(operation.id);
+    bool consumed_reservation = front.instruction.failed_sc;
+    for (const auto &operation : front.instruction.memory)
+      if (operation.sc) {
+        sc_evidence_.erase(operation.id);
+        consumed_reservation = true;
+      }
+    if (consumed_reservation) {
+      auto prior = reserved_lr_.find(front.instruction.hart);
+      if (prior != reserved_lr_.end()) {
+        ppo_.release_writer(prior->second);
+        reserved_lr_.erase(prior);
+      }
+    }
     queue.pop_front();
   }
   return {};
@@ -489,6 +576,8 @@ CheckResult Checker::finalize() {
   auto result = poll();
   if (!result)
     return result;
+  if (!sc_evidence_.empty())
+    return pending("successful SC evidence awaits architectural retirement");
   if (!unverified_stores_.empty())
     return pending("provisional stores remain unverified by REF");
   if (checked_stores_.size() != stores_.size())
