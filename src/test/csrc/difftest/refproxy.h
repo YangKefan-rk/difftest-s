@@ -177,6 +177,7 @@ public:
   f(ref_read_pte, difftest_read_pte, bool, uint64_t, uint64_t*)                                             \
   f(ref_write_pte, difftest_write_pte, bool, uint64_t, uint64_t)                                             \
   f(ref_set_tlb_check, difftest_set_tlb_check, void, void*, bool (*)(void*, uint64_t, bool))                  \
+  f(ref_set_sc_result, difftest_set_sc_result, bool, uint64_t, uint64_t)                                \
   f(ref_atomic_commit, difftest_atomic_commit, int, uint64_t*, uint64_t*, uint8_t*)                       \
   f(ref_set_load_reader, difftest_set_load_reader, void, bool (*)(void*, uint64_t, size_t, uint8_t*), void*) \
   f(ref_set_instruction_observer, difftest_set_instruction_observer, void, void (*)(void*, uint64_t, uint32_t), void*) \
@@ -260,6 +261,10 @@ public:
     return regs_vec.value + src;
   }
 #endif // CONFIG_DIFFTEST_ARCHVECREGSTATE
+  bool set_sc_result(uint64_t pc, uint64_t status) {
+    return ref_set_sc_result && ref_set_sc_result(pc, status);
+  }
+
   bool supports_atomic_store() const { return ref_atomic_commit != nullptr; }
   int atomic_commit(uint64_t *address, uint64_t *bytes, uint8_t *mask) {
     return ref_atomic_commit ? ref_atomic_commit(address, bytes, mask) : -1;

@@ -68,11 +68,15 @@ private:
     std::set<uint64_t> members;
     bool queued = false;
   };
+  enum class AtomicKind { Rmw, LoadReserved, StoreConditional };
   struct Atomic {
+    AtomicKind kind = AtomicKind::Rmw;
     OperationId id;
     uint32_t attempt = 0;
     uint64_t address = 0;
     uint64_t old_data = 0;
+    uint64_t cache_response = 0;
+    bool success = false;
     uint64_t new_data = 0;
     uint64_t response = 0;
     uint8_t mask = 0;
@@ -84,6 +88,7 @@ private:
     bool finished = false;
     bool observed = false;
     bool verified = false;
+    std::string coverage_reason;
     MemoryStore store;
     std::shared_ptr<Load> load;
   };
@@ -123,6 +128,7 @@ private:
   // Overlapping cross-hart writes still require qualified hardware arbitration.
   using EventKey = std::tuple<uint64_t, unsigned, uint64_t, unsigned>;
   std::vector<Hart> harts_;
+  std::map<uint64_t, std::vector<std::weak_ptr<Atomic>>> reserved_reads_by_cycle_;
   std::map<uint64_t, std::vector<WriteObservation>> writes_by_cycle_;
   Memory memory_;
   Checker checker_;

@@ -224,48 +224,62 @@ void Runtime::observe_write(uint64_t cycle, unsigned hart, uint64_t address, con
 }
 
 CheckResult Runtime::observe_atomic(unsigned hart, const std::shared_ptr<Atomic> &atomic, ObservationTime time) {
-  if (!atomic->read_seen)
-    return pending("AMO write awaits its old-value observation");
-  for (unsigned byte = 0; byte < 8; ++byte) {
-    uint8_t pending_byte = 0;
-    if (((atomic->mask >> byte) & 1) && memory_.read_local(hart, atomic->id.uid, atomic->address + byte, pending_byte))
-      return {CheckStatus::Violation, 1, "AMO write point precedes an older same-address pending store"};
+  const bool sc = atomic->kind == AtomicKind::StoreConditional;
+  const bool lr = atomic->kind == AtomicKind::LoadReserved;
+  if (!sc && !atomic->read_seen)
+    return pending("atomic read observation has not arrived");
+  if (!lr)
+    for (unsigned byte = 0; byte < 8; ++byte) {
+      uint8_t local = 0;
+      if (((atomic->mask >> byte) & 1) && memory_.read_local(hart, atomic->id.uid, atomic->address + byte, local))
+        return {CheckStatus::Violation, 1, "atomic write precedes an older same-address pending store"};
+    }
+  MemoryOperation operation;
+  operation.id = atomic->id;
+  operation.attempt = atomic->attempt;
+  operation.address = atomic->address;
+  operation.byte_mask = mask_bytes(atomic->mask, 8);
+  operation.load = !sc;
+  operation.store = !lr;
+  operation.atomic = !lr && !sc;
+  operation.lr = lr;
+  operation.sc = sc;
+  if (!sc)
+    operation.read_time = time;
+  if (!lr)
+    operation.write_time = time;
+  operation.source_kind = ReadSourceKind::ModeledWitness;
+  if (!sc) {
+    auto load = std::make_shared<Load>();
+    load->operation = operation;
+    for (unsigned byte = 0; byte < 8; ++byte)
+      load->actual.push_back(atomic->old_data >> (8 * byte));
+    auto result = checker_.observe_load(operation, atomic->id.uid, {});
+    if (!result)
+      return result;
+    load->observed = true;
+    atomic->load = load;
+    harts_[hart].loads[atomic->id] = load;
   }
-  // AtomicsUnit drains the Sbuffer before issuing. Sample before registering the
-  // AMO writer, then publish its write at this same single architectural rank.
-  auto load = std::make_shared<Load>();
-  load->operation.id = atomic->id;
-  load->operation.attempt = atomic->attempt;
-  load->operation.address = atomic->address;
-  load->operation.byte_mask = mask_bytes(atomic->mask, 8);
-  load->operation.load = load->operation.store = load->operation.atomic = true;
-  load->operation.read_time = load->operation.write_time = time;
-  load->operation.source_kind = ReadSourceKind::ModeledWitness;
-  for (unsigned byte = 0; byte < 8; ++byte)
-    load->actual.push_back(atomic->old_data >> (8 * byte));
-  auto result = checker_.observe_load(load->operation, atomic->id.uid, {});
-  if (!result)
-    return result;
-  atomic->store.po = atomic->id.uid;
-  atomic->store.address = atomic->address;
-  atomic->store.mask = load->operation.byte_mask;
-  for (unsigned byte = 0; byte < 8; ++byte)
-    atomic->store.bytes.push_back(atomic->new_data >> (8 * byte));
-  result = checker_.memory_writer(atomic->id, atomic->store.writer);
-  if (!result)
-    return result;
-  result = checker_.record_store(atomic->store, load->operation, StoreVerification::Provisional);
-  if (!result)
-    return result;
-  const auto writers = std::vector<MemoryWriter>(8, atomic->store.writer);
-  result = checker_.observe_global(atomic->address, atomic->store.bytes, atomic->store.mask,
-                                   writers, {atomic->store.writer}, time);
-  if (!result)
-    return result;
-  load->observed = true;
-  atomic->load = load;
+  if (!lr) {
+    // Snapshot an RMW before registering its writer. SC has no read effect.
+    atomic->store.po = atomic->id.uid;
+    atomic->store.address = atomic->address;
+    atomic->store.mask = operation.byte_mask;
+    for (unsigned byte = 0; byte < 8; ++byte)
+      atomic->store.bytes.push_back(atomic->new_data >> (8 * byte));
+    auto result = checker_.memory_writer(atomic->id, atomic->store.writer);
+    if (!result)
+      return result;
+    result = checker_.record_store(atomic->store, operation, StoreVerification::Provisional);
+    if (!result)
+      return result;
+    result = checker_.observe_global(atomic->address, atomic->store.bytes, atomic->store.mask,
+                                     std::vector<MemoryWriter>(8, atomic->store.writer), {atomic->store.writer}, time);
+    if (!result)
+      return result;
+  }
   atomic->observed = true;
-  harts_[hart].loads[atomic->id] = load;
   return {};
 }
 
@@ -293,6 +307,10 @@ CheckResult Runtime::capture_atomics(unsigned hart, DiffTestState &state) {
         return invalid("atomic begin lacks ROB generation");
       auto atomic = std::make_shared<Atomic>();
       atomic->id = allocation->second;
+      if (event.fuop == 2 || event.fuop == 3)
+        atomic->kind = AtomicKind::LoadReserved;
+      if (event.fuop == 6 || event.fuop == 7)
+        atomic->kind = AtomicKind::StoreConditional;
       h.atomics[atomic->id] = atomic;
       h.atomic_inflight = atomic;
       continue;
@@ -311,24 +329,42 @@ CheckResult Runtime::capture_atomics(unsigned hart, DiffTestState &state) {
       if ((!atomic->request_seen && event.attempt != 0) ||
           (atomic->request_seen && (!atomic->awaiting_retry || event.attempt != atomic->attempt + 1)))
         return invalid("atomic request attempt is duplicated or skips its replay lifecycle");
+      if ((event.mask != 0x0f && event.mask != 0xf0 && event.mask != 0xff) ||
+          !global_memory().contains(event.addr & ~UINT64_C(7), 8))
+        return unsupported("atomic operand range or width is not supported");
+      atomic->address = event.addr & ~UINT64_C(7);
+      atomic->mask = event.mask;
       atomic->attempt = event.attempt;
       atomic->request_seen = true;
       atomic->awaiting_retry = false;
     } else if (event.phase == 5) {
-      if (!atomic->request_seen || atomic->awaiting_retry || atomic->write_seen || atomic->response_seen)
-        return invalid("atomic replay does not follow an outstanding request");
+      if (!atomic->request_seen || atomic->awaiting_retry || atomic->read_seen || atomic->write_seen || atomic->response_seen)
+        return invalid("atomic replay does not follow an outstanding request without accepted effects");
       atomic->read_seen = false;
       atomic->awaiting_retry = true;
     } else if (event.phase == 1) {
       if (!atomic->request_seen || atomic->awaiting_retry || atomic->read_seen || atomic->write_seen)
         return invalid("atomic read effect is duplicated or lacks an outstanding request");
-      atomic->address = event.addr;
+      if (atomic->kind == AtomicKind::StoreConditional || atomic->address != event.addr || atomic->mask != event.mask)
+        return invalid("atomic read operand differs from its request");
       atomic->old_data = event.data;
-      atomic->mask = event.mask;
       atomic->read_seen = true;
+      if (atomic->kind == AtomicKind::LoadReserved) {
+        if (transport_watermark_ && event.timestamp <= *transport_watermark_)
+          return invalid("LR sample arrived behind the completed watermark");
+        reserved_reads_by_cycle_[event.timestamp].push_back(atomic);
+        const auto key = EventKey{event.timestamp, 1, atomic->id.uid, hart};
+        auto inserted = events_.emplace(key, [this, hart, atomic](ObservationTime time) {
+          return observe_atomic(hart, atomic, time);
+        });
+        if (!inserted.second)
+          return invalid("duplicate LR read observation key");
+      }
     } else if (event.phase == 2) {
-      if (atomic->write_seen || !atomic->read_seen || atomic->address != event.addr || atomic->mask != event.mask)
-        return invalid("atomic write does not match its read effect");
+      if (!atomic->request_seen || atomic->awaiting_retry || atomic->kind == AtomicKind::LoadReserved || atomic->write_seen ||
+          (atomic->kind == AtomicKind::Rmw && !atomic->read_seen) ||
+          atomic->address != event.addr || atomic->mask != event.mask)
+        return invalid("atomic write does not match its request/read effect");
       if ((event.mask != 0x0f && event.mask != 0xf0 && event.mask != 0xff) || (event.addr & 7) ||
           !global_memory().contains(event.addr, 8))
         return unsupported("atomic write range or width is not supported");
@@ -344,16 +380,22 @@ CheckResult Runtime::capture_atomics(unsigned hart, DiffTestState &state) {
       if (!inserted.second)
         return invalid("duplicate atomic write observation key");
     } else if (event.phase == 6) {
-      if (atomic->response_seen)
-        return invalid("duplicate atomic cache response");
-      if (!event.success)
-        return unsupported("failed SC or unsuccessful atomic operation is not covered");
-      if (!atomic->read_seen || event.data != atomic->old_data)
-        return {CheckStatus::Violation, 0, "AMO cache response differs from observed old word"};
+      if (!atomic->request_seen || atomic->awaiting_retry || atomic->response_seen)
+        return invalid("atomic response is duplicated or lacks an outstanding request");
+      atomic->cache_response = event.data;
+      atomic->success = event.success;
+      if (atomic->kind == AtomicKind::StoreConditional) {
+        if (bool(event.success) != (event.data == 0) || bool(atomic->write_seen) != bool(event.success))
+          return {CheckStatus::Violation, 0, "SC status does not match its observed write effect"};
+      } else if (!event.success || !atomic->read_seen || event.data != atomic->old_data) {
+        return {CheckStatus::Violation, 0, "atomic cache response differs from observed old word"};
+      }
       atomic->response_seen = true;
     } else if (event.phase == 7) {
-      if (!atomic->write_seen || !atomic->response_seen)
-        return unsupported("atomic lifecycle completed without an AMO write/response");
+      if (!atomic->response_seen || (atomic->kind == AtomicKind::Rmw && !atomic->write_seen))
+        return invalid("atomic lifecycle finished without its data effects/response");
+      if (atomic->kind == AtomicKind::StoreConditional && event.data != atomic->cache_response)
+        return {CheckStatus::Violation, 0, "SC architectural status differs from cache response"};
       atomic->response = event.data;
       atomic->finished = true;
       h.atomic_inflight.reset();
@@ -400,6 +442,7 @@ CheckResult Runtime::advance(uint64_t watermark) {
   transport_watermark_ = watermark;
   loads_by_cycle_.erase(loads_by_cycle_.begin(), loads_by_cycle_.upper_bound(watermark));
   writes_by_cycle_.erase(writes_by_cycle_.begin(), writes_by_cycle_.upper_bound(watermark));
+  reserved_reads_by_cycle_.erase(reserved_reads_by_cycle_.begin(), reserved_reads_by_cycle_.upper_bound(watermark));
   ordering_pending_.clear();
   while (!events_.empty() && std::get<0>(events_.begin()->first) <= watermark) {
     auto &event = *events_.begin();
@@ -630,21 +673,28 @@ CheckResult Runtime::capture(const std::vector<DiffTestState *> &states) {
   }
   // Audit after collecting every hart: the result must not depend on which
   // hart's packet happened to be visited first in this capture.
-  for (uint64_t cycle: touched_cycles_) {
-    auto loads = loads_by_cycle_.find(cycle);
-    if (loads == loads_by_cycle_.end())
-      continue;
+  for (uint64_t cycle : touched_cycles_) {
     auto writes = writes_by_cycle_.find(cycle);
     if (writes == writes_by_cycle_.end())
       continue;
-    for (const auto &write : writes->second)
-      for (const auto &weak : loads->second) {
-        auto load = weak.lock();
-        if (load && load->operation.id.hart != write.hart && !load->cancelled &&
-            overlap(write.address, write.mask, load->operation.address, load->operation.byte_mask))
-          load->coverage_reason =
-              "INCOMPLETE_ORDER: simultaneous cross-hart read/write needs a qualified observation phase";
-      }
+    auto loads = loads_by_cycle_.find(cycle);
+    auto reserved = reserved_reads_by_cycle_.find(cycle);
+    for (const auto &write : writes->second) {
+      if (loads != loads_by_cycle_.end())
+        for (const auto &weak : loads->second) {
+          auto load = weak.lock();
+          if (load && load->operation.id.hart != write.hart && !load->cancelled &&
+              overlap(write.address, write.mask, load->operation.address, load->operation.byte_mask))
+            load->coverage_reason = "INCOMPLETE_ORDER: simultaneous cross-hart read/write lacks arbitration order";
+        }
+      if (reserved != reserved_reads_by_cycle_.end())
+        for (const auto &weak : reserved->second) {
+          auto atomic = weak.lock();
+          if (atomic && atomic->id.hart != write.hart &&
+              overlap(write.address, write.mask, atomic->address, mask_bytes(atomic->mask, 8)))
+            atomic->coverage_reason = "INCOMPLETE_ORDER: simultaneous LR/remote write lacks arbitration order";
+        }
+    }
   }
   if (!covered())
     return coverage_;
@@ -676,8 +726,7 @@ CheckResult Runtime::before_commit(unsigned hart, unsigned port, DiffTestState &
     return invalid("previous reference instruction has not completed");
   const bool is_atomic = (commit.instr & 0x7f) == 0x2f;
   const unsigned atomic_function = commit.instr >> 27;
-  if (is_atomic && (atomic_function == 2 || atomic_function == 3))
-    return unsupported("LR/SC does not have the ordinary AMO write-point contract");
+
   auto allocation = h.allocations.find(commit.tlbId);
   if (allocation == h.allocations.end())
     return unsupported("retirement lacks complete allocation identity stream");
@@ -720,50 +769,73 @@ CheckResult Runtime::before_commit(unsigned hart, unsigned port, DiffTestState &
     }
   }
   if (is_atomic) {
-    if (!reference.supports_atomic_store())
+    const bool lr = atomic_function == 2;
+    const bool sc = atomic_function == 3;
+    if (!lr && !reference.supports_atomic_store())
       return unsupported("reference lacks independent atomic store-log support");
     const unsigned width = (commit.instr >> 12) & 7;
     if (width != 2 && width != 3)
-      return unsupported("atomic width is outside AMO.W/AMO.D coverage");
+      return unsupported("atomic width is outside W/D coverage");
     switch (atomic_function) {
-      case 0: case 1: case 4: case 8: case 12: case 16: case 20: case 24: case 28: break;
-      default: return unsupported("atomic opcode is outside ordinary AMO coverage");
+      case 0: case 1: case 2: case 3: case 4: case 8: case 12: case 16: case 20: case 24: case 28: break;
+      default: return unsupported("atomic opcode is not covered");
     }
     auto found = h.atomics.find(allocation->second);
-    if (found == h.atomics.end() || !found->second->observed || !found->second->finished)
-      return pending("AMO retirement awaits its ordered write-point sample and response");
+    if (found == h.atomics.end() || !found->second->finished ||
+        ((!sc || found->second->success) && !found->second->observed))
+      return pending("atomic retirement awaits its ordered effect and completed response");
     auto atomic = found->second;
+    if (!atomic->coverage_reason.empty())
+      return unsupported(atomic->coverage_reason);
+    const auto kind = lr ? AtomicKind::LoadReserved : sc ? AtomicKind::StoreConditional : AtomicKind::Rmw;
+    if (atomic->kind != kind)
+      return invalid("atomic lifecycle kind differs from encoded instruction");
     const size_t size = width == 2 ? 4 : 8;
     const size_t offset = atomic->mask == 0xf0 ? 4 : 0;
     if ((size == 8 && atomic->mask != 0xff) || (size == 4 && atomic->mask == 0xff))
-      return invalid("AMO observation width differs from encoded instruction");
-    const uint64_t old = atomic->old_data >> (offset * 8);
-    const uint64_t response = size == 4 ? uint64_t(int64_t(int32_t(old))) : old;
-    if (atomic->response != response)
-      return {CheckStatus::Violation, 0, "AMO response differs from its observed old value"};
-    std::vector<uint8_t> candidate;
-    auto result = checker_.get_reference_candidate_load(atomic->id, atomic->attempt, candidate);
-    if (!result)
-      return result;
-    result = h.reader.begin({ReferenceAccess{atomic->address + offset,
-                                           {candidate.begin() + offset, candidate.begin() + offset + size}}});
-    if (!result)
-      return result;
-    if (!reference.set_load_reader(&ReferenceRead::read, &h.reader)) {
-      h.reader.finish();
-      return unsupported("reference lacks AMO memory-read callback");
+      return invalid("atomic observation width differs from encoded instruction");
+    const bool aq = bool(commit.instr & (1u << 26));
+    const bool rl = bool(commit.instr & (1u << 25));
+    MemoryOperation operation;
+    if (sc) {
+      if (!reference.set_sc_result(commit.pc, atomic->response))
+        return unsupported("reference cannot consume the selected SC result");
+      active.instruction.failed_sc = !atomic->success;
+      if (atomic->success) {
+        operation.id = atomic->id;
+        operation.address = atomic->address;
+        operation.byte_mask = mask_bytes(atomic->mask, 8);
+        operation.store = operation.sc = true;
+      }
+    } else {
+      const uint64_t old = atomic->old_data >> (offset * 8);
+      const uint64_t response = size == 4 ? uint64_t(int64_t(int32_t(old))) : old;
+      if (atomic->response != response)
+        return {CheckStatus::Violation, 0, "atomic response differs from observed old value"};
+      std::vector<uint8_t> candidate;
+      auto result = checker_.get_reference_candidate_load(atomic->id, atomic->attempt, candidate);
+      if (!result)
+        return result;
+      result = h.reader.begin({ReferenceAccess{atomic->address + offset,
+                                             {candidate.begin() + offset, candidate.begin() + offset + size}}});
+      if (!result)
+        return result;
+      if (!reference.set_load_reader(&ReferenceRead::read, &h.reader)) {
+        h.reader.finish();
+        return unsupported("reference lacks atomic memory-read callback");
+      }
+      operation = atomic->load->operation;
+      active.reader = true;
+      active.load = atomic->load;
     }
-    auto operation = atomic->load->operation;
-    operation.acquire = bool(commit.instr & (1u << 26));
-    operation.release = bool(commit.instr & (1u << 25));
+    // LR.rl alone and SC.aq alone do not establish release/acquire annotations.
+    operation.acquire = sc ? (aq && rl) : aq;
+    operation.release = lr ? (aq && rl) : rl;
     operation.rcsc = operation.acquire || operation.release;
-    active.reader = true;
+    if (!sc || atomic->success)
+      active.instruction.memory.push_back(operation);
     active.atomic = atomic;
-    active.load = atomic->load;
-    active.instruction.memory.push_back(operation);
     active.instruction_count = 1;
-    if (commit.skip || commit.nFused || commit.special)
-      return unsupported("AMO retirement cannot skip or fuse reference execution");
     h.active = std::move(active);
     return {};
   }
@@ -884,7 +956,7 @@ CheckResult Runtime::after_commit(unsigned hart, RefProxy &reference) {
     if (!result)
       return result;
   }
-  if (active.atomic) {
+  if (active.atomic && active.atomic->write_seen) {
     auto atomic = active.atomic;
     uint64_t address = atomic->address;
     uint64_t data = atomic->new_data;
@@ -949,6 +1021,8 @@ CheckResult Runtime::after_commit(unsigned hart, RefProxy &reference) {
     h.loads.erase(active.load->operation.id);
     h.attempts.erase(active.load->operation.id);
   }
+  if (active.atomic && !active.atomic->write_seen)
+    h.atomics.erase(active.atomic->id);
   collect_released_stores();
   return {};
 }
