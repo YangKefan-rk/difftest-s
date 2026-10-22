@@ -410,6 +410,7 @@ uint64_t &MmapMemoryWithFootprints::at(uint64_t index) {
 
 FootprintsMemory::FootprintsMemory(const char *footprints_name, uint64_t n_bytes)
     : SimMemory(n_bytes), reader(createInputReader(footprints_name)), n_accessed(0) {
+  clearElfSparseMemory();
   printf("The image is %s\n", footprints_name);
   add_callback([this](uint64_t, uint64_t) { this->on_access(this->n_accessed / sizeof(uint64_t)); });
 }

@@ -228,3 +228,8 @@ bool writeToElfSparseMemory(uint64_t paddr, const void *src, size_t len) {
   storeSparse(paddr, in, len, false);
   return true;
 }
+
+void cloneElfSparseMemory(const std::function<void(uint64_t, const void *, size_t)> &copy) {
+  for (const auto &page : sparse_elf_memory)
+    copy(page.first * SPARSE_PAGE_SIZE, page.second.data(), page.second.size());
+}

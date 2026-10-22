@@ -20,6 +20,7 @@
 #include <assert.h>
 #include <cstring>
 #include <fcntl.h>
+#include <functional>
 #include <iostream>
 #include <map>
 #include <stdint.h>
@@ -193,5 +194,6 @@ long readFromElf(void *ptr, const char *file_name, long buf_size);
 bool readFromElfSparseMemory(uint64_t paddr, void *dst, size_t len);
 bool writeToElfSparseMemory(uint64_t paddr, const void *src, size_t len);
 void clearElfSparseMemory();
+void cloneElfSparseMemory(const std::function<void(uint64_t, const void *, size_t)> &copy);
 
 #endif // __ELFLOADER_H
