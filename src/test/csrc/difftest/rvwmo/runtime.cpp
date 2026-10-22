@@ -369,19 +369,13 @@ CheckResult Runtime::capture(const std::vector<DiffTestState *> &states) {
       store.operation.store = true;
       store.operation.address = store.memory.address;
       store.operation.byte_mask = store.memory.mask;
-      const uint64_t uid = event.storeUid;
-      auto inserted =
-          events_.emplace(EventKey{event.timestamp, 0, store.id.uid, hart}, [this, hart, uid](ObservationTime) {
-            auto &record = harts_[hart].stores.at(uid);
-            auto result = checker_.record_store(record.memory, record.operation, StoreVerification::Provisional);
-            if (accepted(result)) {
-              record.recorded = true;
-              return CheckResult{};
-            }
-            return result;
-          });
-      if (!inserted.second)
-        return invalid("duplicate local commit event ordering key");
+      // Local commit has no GMO rank. Register its identity immediately so REF
+      // may audit retired stores while source-time reads await queue closure.
+      // Snapshot resolution already handles older local stores arriving late.
+      result = checker_.record_store(store.memory, store.operation, StoreVerification::Provisional);
+      if (!accepted(result))
+        return result;
+      store.recorded = true;
     }
     for (unsigned port = 0; port < CONFIG_DIFF_STORE_WIDTH; ++port) {
       const auto &event = state.store[port];
@@ -506,8 +500,9 @@ CheckResult Runtime::capture(const std::vector<DiffTestState *> &states) {
   if (latest_cycle_ == 0)
     return {};
   // Memory probes are captured at their source edge, including global writes.
-  // Keep the current source cycle open for same-cycle cross-hart arbitration.
-  auto result = advance(latest_cycle_ - 1);
+  // Load samples carry their SRAM/forwarding source time from s1 but arrive
+  // after s3. Keep three source cycles open before replaying any global writes.
+  auto result = advance(latest_cycle_ > 3 ? latest_cycle_ - 3 : 0);
   return result.status == CheckStatus::Pending ? CheckResult{} : result;
 #else
   (void)states;
@@ -804,7 +799,7 @@ CheckResult Runtime::finish() {
     }
   // Hart retirement does not end memory execution: cache misses may still
   // complete later. Never close future source cycles while stores are pending.
-  auto result = advance(latest_cycle_ ? latest_cycle_ - 1 : 0);
+  auto result = advance(latest_cycle_ > 3 ? latest_cycle_ - 3 : 0);
   if (!result)
     return result;
   if (!events_.empty())
