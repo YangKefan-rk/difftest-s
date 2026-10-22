@@ -169,12 +169,14 @@ public:
   f(ref_close, difftest_close, void, )                                                                      \
   f(ref_set_ramsize, difftest_set_ramsize, void, size_t)                                                    \
   f(ref_set_mhartid, difftest_set_mhartid, void, int)                                                       \
+  f(ref_set_physical_memory, difftest_set_physical_memory, bool, void*, bool (*)(void*, uint64_t, size_t), \
+    bool (*)(void*, uint64_t, size_t, uint8_t*), bool (*)(void*, uint64_t, size_t, const uint8_t*))          \
+  f(ref_private_memory_bytes, difftest_private_memory_bytes, uint64_t, )                                  \
   f(ref_set_ad_policy, difftest_set_ad_policy, bool, uint32_t)                                             \
   f(ref_flush_tlb, difftest_flush_tlb, void, )                                                              \
   f(ref_read_pte, difftest_read_pte, bool, uint64_t, uint64_t*)                                             \
   f(ref_write_pte, difftest_write_pte, bool, uint64_t, uint64_t)                                             \
   f(ref_set_tlb_check, difftest_set_tlb_check, void, void*, bool (*)(void*, uint64_t, bool))                  \
-  f(ref_put_gmaddr, difftest_put_gmaddr, void, void *)                                                      \
   f(ref_set_load_reader, difftest_set_load_reader, void, bool (*)(void*, uint64_t, size_t, uint8_t*), void*) \
   f(ref_set_instruction_observer, difftest_set_instruction_observer, void, void (*)(void*, uint64_t, uint32_t), void*) \
   f(ref_skip_one, difftest_skip_one, void, bool, bool, uint32_t, uint64_t)                                  \
@@ -192,10 +194,7 @@ public:
   f(ref_get_store_event_other_info, difftest_get_store_event_other_info, void, void*)                       \
   f(ref_sync_aia, difftest_sync_aia, void, void*)                                                           \
   f(ref_sync_custom_mflushpwr, difftest_sync_custom_mflushpwr, void, bool)                                  \
-  f(ref_vec_fof_sync, difftest_vec_fof_sync, void, void*)                                                   \
-  f(ref_get_vec_load_vdNum, difftest_get_vec_load_vdNum, int, )                                             \
-  f(ref_get_vec_load_dual_goldenmem_reg, difftest_get_vec_load_dual_goldenmem_reg, void*, )                 \
-  f(ref_update_vec_load_goldenmen, difftest_update_vec_load_pmem, void, )
+  f(ref_vec_fof_sync, difftest_vec_fof_sync, void, void*)
 #define RefFunc(func, ret, ...) ret func(__VA_ARGS__)
 #define DeclRefFunc(this_func, dummy, ret, ...) RefFunc((*this_func), ret, __VA_ARGS__);
 /* clang-format on */
@@ -212,6 +211,7 @@ protected:
   REF_OPTIONAL(DeclRefFunc)
 
 private:
+  const unsigned memory_hart;
   void *const handler;
   void *load_handler(const char *env, const char *file_path);
   template <typename T> T load_function(const char *func_name);
@@ -369,31 +369,6 @@ public:
   inline void vec_fof_sync(void *info) {
     if (ref_vec_fof_sync) {
       ref_vec_fof_sync(info);
-    }
-  }
-
-  inline bool check_ref_vec_load_goldenmem() {
-    return ref_get_vec_load_vdNum && ref_get_vec_load_dual_goldenmem_reg && ref_update_vec_load_goldenmen;
-  }
-
-  inline int get_ref_vdNum() {
-    if (ref_get_vec_load_vdNum) {
-      return ref_get_vec_load_vdNum();
-    } else {
-      Info("Does not support the get vec load vd num.\n");
-      return 0;
-    }
-  }
-
-  inline VecLoadGoldenPacket *get_vec_goldenmem_packet() {
-    return ref_get_vec_load_dual_goldenmem_reg ? (VecLoadGoldenPacket *)ref_get_vec_load_dual_goldenmem_reg() : nullptr;
-  }
-
-  inline void vec_update_goldenmem() {
-    if (ref_update_vec_load_goldenmen) {
-      ref_update_vec_load_goldenmen();
-    } else {
-      Info("Does not support the get vec update goldenmem.\n");
     }
   }
 
@@ -580,6 +555,5 @@ struct InterruptDelegate {
 };
 
 extern const char *difftest_ref_so;
-extern uint8_t *ref_golden_mem;
 
 #endif

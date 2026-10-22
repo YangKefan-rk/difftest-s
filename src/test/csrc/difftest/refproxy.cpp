@@ -15,13 +15,14 @@
 ***************************************************************************************/
 
 #include "refproxy.h"
+#include "globalmem.h"
+#include "difftest.h"
 #include <dlfcn.h>
 #include <fstream>
 #include <iostream>
 #include <unistd.h>
 #include <vector>
 
-uint8_t *ref_golden_mem = NULL;
 const char *difftest_ref_so = NULL;
 
 #define check_and_assert(func)                             \
@@ -52,7 +53,7 @@ REF_OPTIONAL(DeclWeakExtRefFunc)
 #endif
 
 AbstractRefProxy::AbstractRefProxy(int coreid, size_t ram_size, const char *env, const char *file_path)
-    : handler(load_handler(env, file_path)) {
+    : memory_hart(coreid), handler(load_handler(env, file_path)) {
 #ifdef LINKED_REFPROXY_LIB
 #define GetRefFunc(dummy, ref_func, ret, ...) ref_func
 #else
@@ -69,9 +70,26 @@ AbstractRefProxy::AbstractRefProxy(int coreid, size_t ram_size, const char *env,
     check_and_assert(ref_set_mhartid);
     ref_set_mhartid(coreid);
 
-    check_and_assert(ref_put_gmaddr);
-    check_and_assert(ref_golden_mem);
-    ref_put_gmaddr(ref_golden_mem);
+    check_and_assert(ref_set_physical_memory);
+    const bool configured = ref_set_physical_memory(
+        this,
+        [](void *context, uint64_t address, size_t size) {
+          (void)context;
+          return global_memory().contains(address, size);
+        },
+        [](void *context, uint64_t address, size_t size, uint8_t *bytes) {
+          return difftest_read_reference_memory(static_cast<AbstractRefProxy *>(context)->memory_hart,
+                                                address, size, bytes);
+        },
+        [](void *context, uint64_t address, size_t size, const uint8_t *bytes) {
+          (void)context;
+          return global_memory().write(address, bytes, size);
+        });
+    if (!configured) {
+      fprintf(stderr, "Core %d: reference rejected external physical memory\n", coreid);
+      fflush(stderr);
+      abort();
+    }
   }
 
   // set ram_size before ref_init()
@@ -86,6 +104,12 @@ AbstractRefProxy::AbstractRefProxy(int coreid, size_t ram_size, const char *env,
 #endif // ENABLE_STORE_LOG
 
   ref_init();
+  if (NUM_CORES > 1) {
+    check_and_assert(ref_private_memory_bytes);
+    if (ref_private_memory_bytes() != 0)
+      panic("Core %d: external-memory reference allocated private RAM", coreid);
+    Info("Core %d reference: external memory, private RAM bytes=0\n", coreid);
+  }
 }
 
 AbstractRefProxy::~AbstractRefProxy() {

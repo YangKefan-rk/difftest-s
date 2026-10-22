@@ -28,7 +28,7 @@
 #include <sys/resource.h>
 #ifndef CONFIG_NO_DIFFTEST
 #include "difftest.h"
-#include "goldenmem.h"
+#include "globalmem.h"
 #include "refproxy.h"
 #endif // CONFIG_NO_DIFFTEST
 #ifdef ENABLE_RUNHEAD
@@ -454,6 +454,13 @@ Emulator::Emulator(int argc, const char *argv[])
 #endif
 
 #ifdef VM_SAVABLE
+#if NUM_CORES > 1
+  if (args.snapshot_path != nullptr) {
+    Info("Multicore RVWMO does not support serialized snapshot restore\n");
+    std::abort();
+  }
+  args.enable_snapshot = false;
+#endif
   snapshot_slot = new VerilatedSaveMem[2];
   if (args.snapshot_path != NULL) {
     Info("loading from snapshot `%s`...\n", args.snapshot_path);
@@ -489,7 +496,7 @@ Emulator::Emulator(int argc, const char *argv[])
 
 #ifndef CONFIG_NO_DIFFTEST
   if (args.enable_diff) {
-    init_goldenmem();
+    init_globalmem();
     size_t ref_ramsize = args.ram_size ? simMemory->get_size() : 0;
     init_nemuproxy(ref_ramsize);
   }
@@ -594,7 +601,7 @@ Emulator::~Emulator() {
 
 #ifndef CONFIG_NO_DIFFTEST
   if (args.enable_diff) {
-    goldenmem_finish();
+    globalmem_finish();
   }
 #endif // CONFIG_NO_DIFFTEST
   flash_finish();
@@ -1198,6 +1205,11 @@ void Emulator::display_trapinfo() {
 
 #ifdef VM_SAVABLE
 void Emulator::snapshot_save(const char *filename) {
+#if NUM_CORES > 1
+  (void)filename;
+  Info("Multicore RVWMO does not support serialized snapshots\n");
+  std::abort();
+#else
   static int last_slot = 0;
   VerilatedSaveMem &stream = snapshot_slot[last_slot];
   last_slot = !last_slot;
@@ -1243,9 +1255,15 @@ void Emulator::snapshot_save(const char *filename) {
   stream.unbuf_write(&sdcard_offset, sizeof(sdcard_offset));
 
   // actually write to file in snapshot_finalize()
+#endif
 }
 
 void Emulator::snapshot_load(const char *filename) {
+#if NUM_CORES > 1
+  (void)filename;
+  Info("Multicore RVWMO does not support serialized snapshot restore\n");
+  std::abort();
+#else
   VerilatedRestoreMem stream;
   stream.open(filename);
   stream >> *dut_ptr;
@@ -1289,6 +1307,7 @@ void Emulator::snapshot_load(const char *filename) {
 
   // No one uses snapshot when !has_commit, isn't it?
   diff->has_commit = 1;
+#endif
 }
 #endif
 

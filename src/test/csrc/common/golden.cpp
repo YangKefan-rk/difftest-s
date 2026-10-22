@@ -17,7 +17,7 @@
 #include "golden.h"
 #include "ram.h"
 #ifndef CONFIG_NO_DIFFTEST
-#include <goldenmem.h>
+#include <globalmem.h>
 #endif // CONFIG_NO_DIFFTEST
 #ifdef CONFIG_DIFFTEST_PERFCNT
 #include "perf.h"
@@ -35,7 +35,7 @@ uint8_t pte_helper(uint64_t satp, uint64_t vpn, uint64_t *pte, uint8_t *level) {
 #ifdef CONFIG_NO_DIFFTEST
     pte_p->val = pmem_read(pte_addr);
 #else
-    read_goldenmem(pte_addr, &pte_p->val, 8);
+    read_globalmem(pte_addr, &pte_p->val, 8);
 #endif // CONFIG_NO_DIFFTEST
     pg_base = pte_p->ppn << 12;
     // pf

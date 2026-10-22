@@ -58,11 +58,6 @@ void update_globalmem(uint64_t address, const void *source, uint64_t mask, int s
 void read_globalmem(uint64_t address, void *destination, uint64_t size);
 bool in_pmem(uint64_t address);
 
-#ifdef CONFIG_DIFFTEST_CMOINVALEVENT
-void globalmem_cmo_inval(uint64_t address);
-bool globalmem_check_cmo_refill(uint64_t address, const void *source);
-void globalmem_clear_cmo_inval(uint64_t address);
-#endif
 #ifdef ENABLE_STORE_LOG
 void globalmem_set_store_log(bool enabled);
 void globalmem_store_log_reset();

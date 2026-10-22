@@ -312,10 +312,6 @@ public:
     return dut;
   }
 
-#ifdef CONFIG_DIFFTEST_LOADSNAPSHOTEVENT
-  void load_snapshot_record();
-#endif
-
 #ifdef DEBUG_REFILL
   void save_track_instr(uint64_t instr) {
     track_instr = instr;
@@ -414,23 +410,9 @@ protected:
 #endif
 
 #ifdef CONFIG_DIFFTEST_CMOINVALEVENT
-  void cmo_inval_event_record();
+  int cmo_inval_event_record();
 #endif
 
-#ifdef CONFIG_DIFFTEST_LOADSNAPSHOTEVENT
-  static const size_t load_snapshot_entries = 1 << 10;
-  static const size_t load_snapshot_bytes = 16;
-  struct LoadGoldenMemSnapshot {
-    uint64_t paddr = 0;
-    uint16_t mask = 0;
-    uint8_t data[load_snapshot_bytes] = {};
-  };
-  std::vector<LoadGoldenMemSnapshot> load_snapshots[load_snapshot_entries];
-  bool load_snapshot_matches(uint16_t robidx, uint64_t paddr, const void *data, size_t len,
-                             std::vector<uint16_t> *consumed_masks = nullptr) const;
-  void clear_load_snapshot(uint16_t robidx);
-  void clear_all_load_snapshots();
-#endif
 
 #if NUM_CORES > 1 && defined(CONFIG_DIFFTEST_TLBEVENT) && !defined(CONFIG_DIFFTEST_SQUASH)
   // Cleared on allocation, including ROB/FTQ reuse after a redirect.
@@ -453,12 +435,6 @@ protected:
   void do_interrupt();
   void do_exception();
   int do_instr_commit(int index);
-#if defined(CONFIG_DIFFTEST_LOADEVENT) && defined(CONFIG_DIFFTEST_ARCHVECREGSTATE)
-  void do_vec_load_check(int index, DifftestLoadEvent load_event);
-#if NUM_CORES > 1
-  bool do_vec_load_exception_check();
-#endif
-#endif // CONFIG_DIFFTEST_LOADEVENT && CONFIG_DIFFTEST_ARCHVECREGSTATE
   int do_load_check(int index);
   int do_store_check();
   int do_refill_check(int cacheid);
@@ -467,7 +443,7 @@ protected:
   int do_ptwrefill_check();
   int do_l1tlb_check();
   int do_l2tlb_check();
-  int do_golden_memory_update();
+  int do_global_memory_update();
 
   inline uint64_t get_commit_data(int i) {
 #ifdef CONFIG_DIFFTEST_COMMITDATA
@@ -581,6 +557,7 @@ protected:
 extern Difftest **difftest;
 void difftest_set_external_fetch_af(bool enable);
 int difftest_init();
+bool difftest_read_reference_memory(unsigned hart, uint64_t address, size_t size, uint8_t *bytes);
 
 int difftest_nstep(int step, bool enable_diff);
 void difftest_switch_zone();

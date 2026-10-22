@@ -109,8 +109,11 @@ extern unsigned long EMU_FLASH_SIZE;
 // Memory difftest config
 // -----------------------------------------------------------------------
 
-// whether to check memory coherence during refilling
+// Untimed refill data is not an architectural read-value observation.
+// Multicore data loads are checked against execution-time Runtime snapshots.
+#if NUM_CORES == 1
 #define DEBUG_REFILL
+#endif
 
 // whether to check l1tlb response
 #define DEBUG_L1TLB
@@ -118,7 +121,7 @@ extern unsigned long EMU_FLASH_SIZE;
 // whether to check l2tlb response
 // #define DEBUG_L2TLB
 
-// whether to enable REF/GoldenMemory record origin data of memory and restore
+// whether to enable REF/GlobalMem record origin data of memory and restore
 #ifdef CONFIG_DIFFTEST_REPLAY
 #define ENABLE_STORE_LOG
 #endif // CONFIG_DIFFTEST_REPLAY
@@ -174,13 +177,13 @@ extern unsigned long EMU_FLASH_SIZE;
 // set WITH_IPC=1 when make to enable drawing ipc curve in verilator simulation
 // #define ENABLE_IPC
 
-// whether to maintain goldenmem
+// whether to maintain GlobalMem
 #if NUM_CORES>1
-#define DEBUG_GOLDENMEM
+#define DEBUG_GLOBALMEM
 #endif
 
 #ifdef DEBUG_REFILL
-#define DEBUG_GOLDENMEM
+#define DEBUG_GLOBALMEM
 #endif
 
 #define RUNAHEAD_UNIT_TEST
@@ -188,6 +191,10 @@ extern unsigned long EMU_FLASH_SIZE;
 #ifdef ENABLE_RUNAHEAD
 #define TRACE_INFLIGHT_MEM_INST
 #define QUERY_MEM_ACCESS
+#endif
+
+#if NUM_CORES > 1 && defined(CONFIG_DIFFTEST_REPLAY)
+#error "Multicore RVWMO state cannot be restored by DiffTest trace replay"
 #endif
 
 #endif

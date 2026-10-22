@@ -1,6 +1,6 @@
 #include "runtime.h"
 #include "dependency.h"
-#include "goldenmem.h"
+#include "globalmem.h"
 #include <algorithm>
 #include <limits>
 #include <utility>
@@ -66,17 +66,28 @@ bool overlap(uint64_t a, const std::vector<uint8_t> &am, uint64_t b, const std::
 
 Runtime::Runtime(unsigned harts)
     : harts_(harts), memory_(
-                         [](uint64_t address) {
-                           uint64_t word = 0;
-                           if (in_pmem(address))
-                             read_goldenmem(address, &word, 1);
-                           return uint8_t(word);
-                         },
-                         [](uint64_t address, uint8_t byte) {
-                           if (in_pmem(address))
-                             update_goldenmem(address, &byte, 1, 1);
-                         }),
+          [](uint64_t address) {
+            uint8_t byte = 0;
+            read_globalmem(address, &byte, 1);
+            return byte;
+          },
+          [](uint64_t address, uint8_t byte) { update_globalmem(address, &byte, 1, 1); }),
       checker_(memory_) {}
+
+bool Runtime::read_reference_memory(unsigned hart, uint64_t address, size_t size, uint8_t *bytes) const {
+  if (hart >= harts_.size() || !bytes || !global_memory().contains(address, size))
+    return false;
+  const auto &h = harts_[hart];
+  // The active UID excludes younger stores already observed in the DUT stream.
+  // These are provisional translation/fetch inputs; all stores still need REF audit.
+  const uint64_t before_po = h.active ? h.active->instruction.uid
+                                     : h.last_retired_uid + (h.last_retired_uid != UINT64_MAX);
+  for (size_t byte = 0; byte < size; ++byte)
+    if (!memory_.read_local(hart, before_po, address + byte, bytes[byte]) &&
+        !global_memory().read(address + byte, bytes + byte, 1))
+      return false;
+  return true;
+}
 
 CheckResult Runtime::unsupported(const std::string &reason) {
   if (coverage_)

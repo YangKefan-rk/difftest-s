@@ -18,7 +18,7 @@
 #include "diffstate.h"
 #include "difftest.h"
 #include "flash.h"
-#include "goldenmem.h"
+#include "globalmem.h"
 #include "mpool.h"
 #include "ram.h"
 #include "refproxy.h"
@@ -89,7 +89,7 @@ void fpga_init() {
   difftest_init();
 
   init_device();
-  init_goldenmem();
+  init_globalmem();
   init_nemuproxy(DEFAULT_EMU_RAM_SIZE);
   xdma_device->ddr_load_workload(work_load);
 }
@@ -99,7 +99,7 @@ void fpga_finish() {
   common_finish();
 
   difftest_finish();
-  goldenmem_finish();
+  globalmem_finish();
   finish_device();
 
   delete simMemory;

@@ -24,6 +24,7 @@ public:
   CheckResult verify_store(unsigned hart, uint64_t store_uid, uint64_t address, uint64_t data, uint8_t mask);
   CheckResult note_done(unsigned hart, int code);
   CheckResult finish();
+  bool read_reference_memory(unsigned hart, uint64_t address, size_t size, uint8_t *bytes) const;
   bool covered() const {
     return bool(coverage_);
   }

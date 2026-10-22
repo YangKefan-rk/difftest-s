@@ -20,7 +20,7 @@
 #endif // CONFIG_NO_DIFFTEST
 #include "flash.h"
 #ifndef CONFIG_NO_DIFFTEST
-#include "goldenmem.h"
+#include "globalmem.h"
 #endif // CONFIG_NO_DIFFTEST
 #include "ram.h"
 #ifndef CONFIG_NO_DIFFTEST
@@ -223,7 +223,7 @@ extern "C" uint8_t simv_init() {
 
 #ifndef CONFIG_NO_DIFFTEST
   if (enable_difftest) {
-    init_goldenmem();
+    init_globalmem();
     init_nemuproxy(ram_size);
   }
 #endif // CONFIG_NO_DIFFTEST
@@ -354,7 +354,7 @@ void simv_finish() {
 #ifndef CONFIG_NO_DIFFTEST
   difftest_finish();
   if (enable_difftest) {
-    goldenmem_finish();
+    globalmem_finish();
   }
 #endif // CONFIG_NO_DIFFTEST
 
