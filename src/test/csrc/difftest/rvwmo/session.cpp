@@ -64,7 +64,8 @@ ObservationSession::ObservationSession(StreamContract contract, std::vector<Prod
                                        Memory::ReadGlobal read_global, Memory::WriteGlobal write_global,
                                        ReferenceStepper reference_stepper,
                                        size_t max_live_instructions, size_t max_pending_retirements)
-    : max_pending_events_(contract.max_pending_events), stream_(std::move(contract), producers),
+    : max_pending_events_(contract.max_pending_events), max_architectural_retirements_(max_pending_retirements),
+      stream_(std::move(contract), producers),
       consumer_(std::move(read_global), std::move(write_global),
                 [this](const RuntimeEvent &event) { return resolve_current_rank(event); },
                 max_live_instructions, max_pending_retirements),
@@ -284,6 +285,14 @@ SessionSubmitResult ObservationSession::submit(const EventBatch &batch,
   if (finalized_) {
     result.transport = {EventValidationStatus::Invalid, "event submitted after session finalization"};
     result.check = remember_failure(invalid("event submitted after session finalization"));
+    result.pending_events = pending_events_.size();
+    return result;
+  }
+
+  if (retirements.size() > max_architectural_retirements_ - architectural_retirements_.size()) {
+    result.transport = {EventValidationStatus::Pending,
+                        "architectural retirement snapshot queue is full; retry after matching retirements"};
+    result.check = pending(result.transport.message.c_str());
     result.pending_events = pending_events_.size();
     return result;
   }
