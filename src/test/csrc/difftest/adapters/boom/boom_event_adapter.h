@@ -119,6 +119,7 @@ struct AdapterLimits {
   size_t live_instructions = 4096;
   size_t attempts_per_load = 64;
   size_t queued_events = 65536;
+  size_t open_source_sequences = 65536;
   size_t producers = 64;
 };
 
@@ -127,7 +128,7 @@ public:
   BoomEventAdapter(uint32_t hart, uint64_t epoch, AdapterLimits limits = {});
 
   CheckResult allocate(const InstructionAllocation &record);
-  CheckResult begin_load_attempt(const LoadAttempt &record);
+  CheckResult begin_load_attempt(const LoadAttempt &record, const EventSource &source_lower_bound);
   CheckResult sample_load(const LoadObservation &record);
   CheckResult cancel_load_attempt(const LoadAttempt &record, const EventSource &source);
   CheckResult commit_store(const StoreCommit &record);
@@ -138,9 +139,8 @@ public:
   CheckResult retire(const Retirement &record);
   CheckResult audit_reference_store(CheckerEventConsumer &consumer, const ReferenceStoreAudit &record);
 
-  // Reclaims private slots but does not invent a public whole-instruction cancel
-  // event. Until that protocol exists, this makes completion Incomplete.
-  CheckResult squash(const OperationId &id, const SlotGeneration &rob);
+  // Whole-instruction discard is separate from cancellation of one attempt.
+  CheckResult squash(const OperationId &id, const SlotGeneration &rob, const EventSource &source);
   CheckResult close_prefix(const ProducerWatermark &watermark);
   EventBatch take_batch();
   // Private lifecycle completeness only; this is never an RVWMO verdict.
@@ -152,6 +152,7 @@ private:
   struct Attempt {
     AttemptState state = AttemptState::Executing;
     std::optional<MemoryOperation> operation;
+    EventSource source_lower_bound;
   };
   struct Instruction {
     InstructionAllocation allocation;
@@ -180,7 +181,8 @@ private:
   std::vector<SlotOwner> stq_;
   std::map<uint32_t, SourcePosition> watermarks_;
   EventBatch batch_;
-  bool missing_squash_protocol_ = false;
+  std::map<std::pair<uint32_t, uint64_t>, SourcePosition> seen_source_sequences_;
+  std::map<uint32_t, uint64_t> closed_source_sequences_;
 
   CheckResult validate_id(const OperationId &id) const;
   CheckResult validate_source(const EventSource &source) const;
