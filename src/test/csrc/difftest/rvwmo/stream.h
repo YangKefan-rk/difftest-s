@@ -64,6 +64,7 @@ public:
   StreamResult submit(const EventBatch &batch);
   DrainedEventBatch drain();
   std::optional<uint64_t> minimum_closed_cycle() const;
+  size_t buffered_events() const { return pending_events_.size(); }
 
 private:
   struct MemoryEffect {
