@@ -2,6 +2,7 @@
 #define DIFFTEST_ROCKET_EVENT_EMITTER_H
 
 #include "../../rvwmo/event.h"
+#include <deque>
 #include <map>
 #include <optional>
 
@@ -13,6 +14,7 @@ struct EmitterConfiguration {
   uint64_t epoch = 0;
   size_t capacity = 65536;
   uint16_t xlen = 64;
+  uint32_t publication_producer = 0; // Registered fabric channel; zero disables publication.
 };
 
 struct InstructionObservation {
@@ -20,6 +22,8 @@ struct InstructionObservation {
   uint64_t pc = 0;
   uint32_t instruction = 0;
   uint8_t length = 0;
+  bool memory = false;
+  uint8_t memory_command = 0;
   rvwmo::SourcePosition source;
 };
 
@@ -43,8 +47,8 @@ struct StoreObservation {
 // Private Rocket capture adapter, not a DPI ABI or an RVWMO verdict. Speculative
 // observations stay private until retirement and its final sample are known.
 // Native tokens must increase per session; physical slot indices are insufficient.
-// Watermarks cannot pass an unresolved
-// instruction, so squash never retracts an allocation already sent to the consumer.
+// Watermarks cannot pass an unresolved instruction, so squash never retracts
+// an allocation already sent to the consumer.
 class EventEmitter {
 public:
   explicit EventEmitter(EmitterConfiguration configuration);
@@ -55,6 +59,7 @@ public:
   rvwmo::CheckResult publish_store(const StoreObservation &store, uint64_t transaction);
   rvwmo::CheckResult retire(uint64_t token, rvwmo::SourcePosition source);
   rvwmo::CheckResult squash(uint64_t token);
+  // Closes only this hart channel. The shared session closes the fabric channel.
   rvwmo::CheckResult close_through(uint64_t source_cycle);
   rvwmo::EventBatch take_batch();
   rvwmo::CheckResult finalize() const;
@@ -77,10 +82,14 @@ private:
   std::optional<uint64_t> last_token_;
   std::optional<uint64_t> closed_cycle_;
   uint64_t next_uid_ = 1;
+  // Scalar EX/MEM/WB may repeat a termination over three source-ordered stages.
+  static constexpr size_t pipeline_kill_history = 32;
+  std::deque<uint64_t> terminated_tokens_;
   rvwmo::EventBatch batch_;
   rvwmo::CheckResult failure_;
 
   static MemoryKind memory_kind(uint32_t instruction, uint8_t length);
+  static size_t memory_width(uint32_t instruction, uint8_t length);
   rvwmo::CheckResult reject(rvwmo::CheckStatus status, const char *message);
   rvwmo::CheckResult validate_source(const rvwmo::SourcePosition &source);
   rvwmo::CheckResult validate_access(uint64_t address, const std::vector<uint8_t> &bytes,
