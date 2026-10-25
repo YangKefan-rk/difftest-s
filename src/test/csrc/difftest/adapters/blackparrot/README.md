@@ -43,10 +43,11 @@ these facts must be retained rather than assigning the response timestamp to
 all bytes. Early architectural retirement followed by a late miss sample also
 retains both times and exposes the current shared consumer limitation.
 
-The shared scalar consumer does not yet support every native atomic, trap,
-cache-block or FP lifecycle. Such facts and whole-instruction squash remain
-explicit gaps. Heartbeats and local idle are diagnostics, not watermarks or
-all-hart completion. An upstream native `[BSG-PASS]` is not a Difftest-S pass.
+The adapter emits the schema-v2 whole-instruction squash event. The shared
+consumer still does not support every native atomic, trap/interrupt,
+cache-block or FP lifecycle. Those remain explicit gaps. Heartbeats and local
+idle are diagnostics, not watermarks or all-hart completion. An upstream
+native `[BSG-PASS]` is not a Difftest-S pass.
 
 ## Resource bounds
 
