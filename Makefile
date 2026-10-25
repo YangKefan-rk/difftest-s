@@ -86,7 +86,24 @@ WITH_CHISELDB = 0
 WITH_CONSTANTIN = 0
 endif
 
-DIFFTEST_CXXFILES = $(shell find $(DIFFTEST_CSRC_DIR) -name "*.cpp")
+DIFFTEST_S_DUT ?= nanhu
+DIFFTEST_S_SUPPORTED_DUTS := nanhu rocket boom blackparrot
+ifeq ($(filter $(DIFFTEST_S_DUT),$(DIFFTEST_S_SUPPORTED_DUTS)),)
+$(error Unsupported DIFFTEST_S_DUT '$(DIFFTEST_S_DUT)'; choose one of $(DIFFTEST_S_SUPPORTED_DUTS))
+endif
+
+DIFFTEST_ADAPTER_DIR = $(DIFFTEST_CSRC_DIR)/adapters/$(DIFFTEST_S_DUT)
+DIFFTEST_COMMON_CXXFILES = $(shell find $(DIFFTEST_CSRC_DIR) -path "$(DIFFTEST_CSRC_DIR)/adapters" -prune -o -name "*.cpp" -print)
+DIFFTEST_ADAPTER_CXXFILES =
+ifneq ($(DIFFTEST_S_DUT),nanhu)
+DIFFTEST_ADAPTER_CXXFILES = $(shell find $(DIFFTEST_ADAPTER_DIR) -name "*.cpp" 2>/dev/null)
+ifeq ($(strip $(DIFFTEST_ADAPTER_CXXFILES)),)
+$(error DIFFTEST_S_DUT=$(DIFFTEST_S_DUT) selected, but $(DIFFTEST_ADAPTER_DIR) has no C++ adapter sources)
+endif
+SIM_CXXFLAGS += -DDIFFTEST_S_DUT=\"$(DIFFTEST_S_DUT)\"
+endif
+
+DIFFTEST_CXXFILES = $(DIFFTEST_COMMON_CXXFILES) $(DIFFTEST_ADAPTER_CXXFILES)
 ifeq ($(NO_DIFF), 1)
 SIM_CXXFLAGS += -DCONFIG_NO_DIFFTEST
 else
