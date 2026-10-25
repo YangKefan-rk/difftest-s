@@ -95,6 +95,36 @@ bool compose_dependencies(const DependencyMetadata &first, const DependencyMetad
 }
 
 namespace {
+constexpr unsigned csr_fflags = 0x001;
+constexpr unsigned csr_frm = 0x002;
+constexpr unsigned csr_fcsr = 0x003;
+constexpr unsigned csr_sstatus = 0x100;
+constexpr unsigned csr_sie = 0x104;
+constexpr unsigned csr_sip = 0x144;
+constexpr unsigned csr_mstatush = 0x310;
+constexpr unsigned fflags_dependency_base = 0x10000;
+constexpr unsigned frm_dependency = fflags_dependency_base + 5;
+
+const std::vector<unsigned> &fflags_dependency_units() {
+  static const std::vector<unsigned> units{fflags_dependency_base, fflags_dependency_base + 1,
+                                           fflags_dependency_base + 2, fflags_dependency_base + 3,
+                                           fflags_dependency_base + 4};
+  return units;
+}
+
+std::vector<unsigned> csr_dependency_units(unsigned csr) {
+  switch (csr) {
+    case csr_fflags: return fflags_dependency_units();
+    case csr_frm: return {frm_dependency};
+    case csr_fcsr: {
+      auto units = fflags_dependency_units();
+      units.push_back(frm_dependency);
+      return units;
+    }
+    default: return {64 + csr};
+  }
+}
+
 CheckResult decode_system(uint32_t instruction, DependencyMetadata &metadata) {
   const unsigned funct = (instruction >> 12) & 7;
   if (!funct) {
@@ -111,10 +141,10 @@ CheckResult decode_system(uint32_t instruction, DependencyMetadata &metadata) {
   if (funct == 4)
     return {CheckStatus::Unsupported, 0, "reserved system instruction"};
   const unsigned csr = instruction >> 20;
-  if (csr == 1 || csr == 2 || csr == 3 || csr == 0x100 || csr == 0x104 || csr == 0x144 || csr == 0x310)
+  if (csr == csr_sstatus || csr == csr_sie || csr == csr_sip || csr == csr_mstatush)
     return {CheckStatus::Unsupported, 0, "CSR alias or field dependency tracking requires explicit adapter metadata"};
   const unsigned rd = (instruction >> 7) & 31, rs1 = (instruction >> 15) & 31;
-  const unsigned csr_register = 64 + csr;
+  const auto csr_units = csr_dependency_units(csr);
   const bool immediate = funct & 4;
   const bool exchange = (funct & 3) == 1;
   const bool reads_csr = !exchange || rd != 0;
@@ -124,20 +154,21 @@ CheckResult decode_system(uint32_t instruction, DependencyMetadata &metadata) {
   if (!immediate && rs1)
     metadata.sources.push_back(rs1);
   if (reads_csr && !read_only)
-    metadata.sources.push_back(csr_register);
+    metadata.sources.insert(metadata.sources.end(), csr_units.begin(), csr_units.end());
   if (rd) {
     metadata.destinations.push_back(rd);
-    metadata.destination_sources.push_back(reads_csr && !read_only ? std::vector<unsigned>{csr_register}
-                                                                   : std::vector<unsigned>{});
+    metadata.destination_sources.push_back(reads_csr && !read_only ? csr_units : std::vector<unsigned>{});
   }
   if (writes_csr) {
-    metadata.destinations.push_back(csr_register);
-    std::vector<unsigned> carriers;
-    if (!exchange && !read_only)
-      carriers.push_back(csr_register);
-    if (!immediate && rs1)
-      carriers.push_back(rs1);
-    metadata.destination_sources.push_back(std::move(carriers));
+    for (auto unit: csr_units) {
+      metadata.destinations.push_back(unit);
+      std::vector<unsigned> carriers;
+      if (!exchange && !read_only)
+        carriers.push_back(unit);
+      if (!immediate && rs1)
+        carriers.push_back(rs1);
+      metadata.destination_sources.push_back(std::move(carriers));
+    }
   }
   return {};
 }
