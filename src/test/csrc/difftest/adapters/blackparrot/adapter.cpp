@@ -9,6 +9,7 @@ namespace blackparrot {
 namespace {
 ConversionResult invalid(const char *message) { return {ConversionStatus::Invalid, message}; }
 ConversionResult waiting(const char *message) { return {ConversionStatus::Waiting, message}; }
+ConversionResult incomplete(const char *message) { return {ConversionStatus::Incomplete, message}; }
 ConversionResult unsupported(const char *message) { return {ConversionStatus::Unsupported, message}; }
 
 rvwmo::OperationId parent_id(const rvwmo::OperationId &id) { return {id.hart, id.epoch, id.uid, 0}; }
@@ -68,6 +69,7 @@ struct Adapter::State {
   };
   struct Store {
     rvwmo::LocalStoreEvent local;
+    Origin local_origin;
     bool retired = false;
     bool published = false;
   };
@@ -358,7 +360,7 @@ ConversionResult Adapter::local_store(const Origin &origin, const rvwmo::LocalSt
     return invalid("LocalStore is duplicated or shares an ordinary load instruction identity");
   if (state.stores.size() >= state.options.max_live_instructions)
     return waiting("outstanding LocalStore limit reached; retain and retry after publication/retirement");
-  state.stores.emplace(record.id, State::Store{record, false, false});
+  state.stores.emplace(record.id, State::Store{record, origin, false, false});
   state.append(origin, rvwmo::RuntimeEventKind::LocalStore, record);
   return {};
 }
@@ -386,6 +388,21 @@ ConversionResult Adapter::publish_store(const Origin &origin, const rvwmo::Store
   auto store = state.stores.find(member.id);
   if (store == state.stores.end() || store->second.published)
     return invalid("publication has no unique unpublished LocalStore identity");
+  const auto &local_origin = store->second.local_origin;
+  if (local_origin.source.cycle > origin.source.cycle)
+    return invalid("StorePublish source time predates its LocalStore");
+  if (local_origin.source.cycle == origin.source.cycle) {
+    if (!local_origin.source.order_qualified || !origin.source.order_qualified)
+      return incomplete("same-cycle LocalStore and StorePublish lack a qualified source order");
+    if (local_origin.source.qualified_phase > origin.source.qualified_phase)
+      return invalid("StorePublish source phase predates its LocalStore phase");
+    if (local_origin.source.qualified_phase == origin.source.qualified_phase) {
+      if (local_origin.producer_id != origin.producer_id)
+        return incomplete("same-cycle LocalStore and StorePublish share a phase across unordered producers");
+      if (local_origin.source.producer_sequence >= origin.source.producer_sequence)
+        return invalid("StorePublish does not follow its LocalStore in their shared producer sequence");
+    }
+  }
   const auto &local = store->second.local;
   if (record.address != local.address || record.byte_mask != local.byte_mask ||
       record.bytes.size() != local.bytes.size())
@@ -587,11 +604,32 @@ ConversionResult Adapter::close_prefix(const rvwmo::ProducerWatermark &watermark
   return {};
 }
 
-ConversionResult Adapter::squash(const rvwmo::OperationId &id) {
-  const auto result = state_->validate_id(id);
+ConversionResult Adapter::squash(const Origin &origin, const rvwmo::OperationId &id) {
+  auto &state = *state_;
+  auto result = state.validate_id(id);
   if (!result)
     return result;
-  return unsupported("whole-instruction squash has no current generic event; use a caller-owned fresh session boundary");
+  if (id.subaccess != 0)
+    return unsupported("split instruction squash is not covered by this scalar adapter");
+  result = state.validate_origin(origin, state.channel(id, &HartChannels::memory));
+  if (!result)
+    return result;
+  const auto instruction = state.instructions.find(id);
+  if (instruction == state.instructions.end())
+    return invalid("instruction squash has no live allocation");
+  if (instruction->second.retirement)
+    return invalid("architecturally retired instruction cannot be squashed");
+  if (origin.source.cycle < instruction->second.allocated_at.source.cycle)
+    return invalid("instruction squash source time predates its allocation");
+  if (state.stores.count(id))
+    return invalid("instruction with a committed LocalStore cannot be squashed");
+  for (const auto &sample : instruction->second.sampled_at)
+    if (origin.source.cycle < sample.second.source.cycle)
+      return invalid("instruction squash source time predates a captured load sample");
+
+  state.append(origin, rvwmo::RuntimeEventKind::InstructionSquash, rvwmo::InstructionSquashEvent{id});
+  state.instructions.erase(instruction);
+  return {};
 }
 
 ConvertedOutput Adapter::take_output() {
@@ -617,7 +655,7 @@ PendingState Adapter::pending() const {
 std::vector<std::string> Adapter::consumer_gaps() {
   return {"generic atomic/AMO/LRSC lifecycle semantic consumption",
           "generic trap/interrupt and HartDone semantic consumption and memory-drain finalization",
-          "whole-instruction squash and epoch transition in an existing checker session",
+          "epoch transition in an existing checker session",
           "source-ordered retirement before a physically later load sample (BlackParrot refill miss)",
           "merged multi-store publication, split/vector memory effects and cache-block operations"};
 }

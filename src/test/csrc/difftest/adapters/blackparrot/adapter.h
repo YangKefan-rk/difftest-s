@@ -34,7 +34,7 @@ struct Configuration {
   size_t max_publication_transactions = 65536;
 };
 
-enum class ConversionStatus { Accepted, Waiting, Invalid, Unsupported };
+enum class ConversionStatus { Accepted, Waiting, Incomplete, Invalid, Unsupported };
 struct ConversionResult {
   ConversionStatus status = ConversionStatus::Accepted;
   std::string message;
@@ -128,8 +128,10 @@ public:
   // closure, take_output delivers the queued watermark before the next prefix;
   // intervening observations return Waiting without being consumed.
   ConversionResult close_prefix(const rvwmo::ProducerWatermark &watermark);
-  // Whole-instruction squash has no event in the current public contract.
-  ConversionResult squash(const rvwmo::OperationId &id);
+  // Emit v2 whole-instruction squash for a live, uncommitted instruction.
+  // The event source is supplied by the caller and must follow that identity's
+  // allocation and attempt observations.
+  ConversionResult squash(const Origin &origin, const rvwmo::OperationId &id);
 
   ConvertedOutput take_output();
   PendingState pending() const;
