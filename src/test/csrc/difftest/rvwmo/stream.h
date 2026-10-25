@@ -77,6 +77,7 @@ private:
   std::map<uint32_t, ProducerCapability> producers_;
   StreamContract contract_;
   std::map<uint32_t, SourcePosition> watermarks_;
+  std::map<uint32_t, uint64_t> closed_source_sequences_;
   std::vector<RuntimeEvent> pending_events_;
   StreamResult configuration_;
 

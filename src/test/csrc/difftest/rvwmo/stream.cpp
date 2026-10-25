@@ -1,6 +1,8 @@
 #include "stream.h"
 #include <algorithm>
+#include <iterator>
 #include <limits>
+#include <set>
 #include <tuple>
 
 namespace rvwmo {
@@ -11,6 +13,144 @@ StreamResult unsupported(const char *message) { return {EventValidationStatus::U
 
 bool has_kind(const ProducerCapability &producer, RuntimeEventKind kind) {
   return std::find(producer.event_kinds.begin(), producer.event_kinds.end(), kind) != producer.event_kinds.end();
+}
+
+std::optional<uint32_t> memory_hart(const RuntimeEvent &event) {
+  switch (event.kind) {
+  case RuntimeEventKind::LoadSample:
+    return std::get<LoadSampleEvent>(event.payload).operation.id.hart;
+  case RuntimeEventKind::StorePublish: {
+    const auto &members = std::get<StorePublishEvent>(event.payload).members;
+    if (members.empty())
+      return std::nullopt;
+    const auto hart = members.front().id.hart;
+    if (std::any_of(members.begin(), members.end(), [hart](const StorePublishMember &member) {
+          return member.id.hart != hart;
+        }))
+      return std::nullopt;
+    return hart;
+  }
+  case RuntimeEventKind::AtomicLifecycle:
+    return std::get<AtomicLifecycleEvent>(event.payload).id.hart;
+  default:
+    return std::nullopt;
+  }
+}
+
+struct OrderedNode {
+  const RuntimeEvent *event = nullptr;
+  uint16_t phase = 0;
+  uint32_t producer = 0;
+  uint64_t sequence = 0;
+  uint8_t tie_kind = 0;
+  size_t indegree = 0;
+  std::vector<size_t> successors;
+};
+
+void add_order_edge(std::vector<OrderedNode> &nodes, size_t before, size_t after) {
+  auto &successors = nodes[before].successors;
+  if (std::find(successors.begin(), successors.end(), after) != successors.end())
+    return;
+  successors.push_back(after);
+  ++nodes[after].indegree;
+}
+
+StreamResult order_same_cycle(const std::vector<const RuntimeEvent *> &events,
+                              std::vector<const RuntimeEvent *> &ordered) {
+  std::vector<OrderedNode> nodes;
+  nodes.reserve(events.size() * 3);
+  std::map<const RuntimeEvent *, size_t> event_nodes;
+  std::map<uint16_t, std::pair<size_t, size_t>> qualified_phases;
+  std::map<uint32_t, std::vector<size_t>> producer_events;
+
+  for (const auto *event : events) {
+    const size_t index = nodes.size();
+    nodes.push_back({event, event->source.qualified_phase, event->producer_id,
+                     event->source.producer_sequence, 1, 0, {}});
+    event_nodes.emplace(event, index);
+    producer_events[event->producer_id].push_back(index);
+    if (event->source.order_qualified && event->source.qualified_phase != SourcePosition::cycle_closed_phase)
+      qualified_phases.try_emplace(event->source.qualified_phase, std::make_pair(0, 0));
+  }
+
+  for (auto &producer : producer_events) {
+    auto &indices = producer.second;
+    std::sort(indices.begin(), indices.end(), [&](size_t lhs, size_t rhs) {
+      return nodes[lhs].sequence < nodes[rhs].sequence;
+    });
+    for (size_t index = 1; index < indices.size(); ++index)
+      add_order_edge(nodes, indices[index - 1], indices[index]);
+  }
+
+  for (auto &phase : qualified_phases) {
+    const size_t before = nodes.size();
+    nodes.push_back({nullptr, phase.first, 0, 0, 0, 0, {}});
+    const size_t after = nodes.size();
+    nodes.push_back({nullptr, phase.first, 0, 0, 2, 0, {}});
+    phase.second = {before, after};
+  }
+
+  for (const auto *event : events) {
+    if (!event->source.order_qualified)
+      continue;
+    const auto &barriers = qualified_phases.at(event->source.qualified_phase);
+    const size_t event_node = event_nodes.at(event);
+    add_order_edge(nodes, barriers.first, event_node);
+    add_order_edge(nodes, event_node, barriers.second);
+  }
+  for (auto phase = qualified_phases.begin(); phase != qualified_phases.end();) {
+    auto next = std::next(phase);
+    if (next == qualified_phases.end())
+      break;
+    add_order_edge(nodes, phase->second.second, next->second.first);
+    phase = next;
+  }
+
+  using ReadyKey = std::tuple<uint8_t, uint32_t, uint16_t, uint64_t, size_t>;
+  std::set<ReadyKey> ready;
+  auto ready_key = [&](size_t index) {
+    const auto &node = nodes[index];
+    return ReadyKey{node.tie_kind, node.producer, node.phase, node.sequence, index};
+  };
+  for (size_t index = 0; index < nodes.size(); ++index)
+    if (!nodes[index].indegree)
+      ready.insert(ready_key(index));
+
+  ordered.clear();
+  ordered.reserve(events.size());
+  size_t visited = 0;
+  while (!ready.empty()) {
+    const size_t index = std::get<4>(*ready.begin());
+    ready.erase(ready.begin());
+    ++visited;
+    if (nodes[index].event)
+      ordered.push_back(nodes[index].event);
+    for (const auto successor : nodes[index].successors)
+      if (--nodes[successor].indegree == 0)
+        ready.insert(ready_key(successor));
+  }
+
+  if (visited != nodes.size())
+    return incomplete("same-cycle producer sequence conflicts with qualified phase order");
+  return {EventValidationStatus::Accepted, {}};
+}
+
+StreamResult order_closed_events(const std::vector<const RuntimeEvent *> &ready,
+                                 std::vector<const RuntimeEvent *> &ordered) {
+  std::map<uint64_t, std::vector<const RuntimeEvent *>> cycles;
+  for (const auto *event : ready)
+    cycles[event->source.cycle].push_back(event);
+
+  ordered.clear();
+  ordered.reserve(ready.size());
+  for (const auto &cycle : cycles) {
+    std::vector<const RuntimeEvent *> cycle_events;
+    auto result = order_same_cycle(cycle.second, cycle_events);
+    if (!result)
+      return result;
+    ordered.insert(ordered.end(), cycle_events.begin(), cycle_events.end());
+  }
+  return {EventValidationStatus::Accepted, {}};
 }
 
 bool valid_range(uint64_t address, const std::vector<uint8_t> &bytes, const std::vector<uint8_t> &mask) {
@@ -26,19 +166,20 @@ SourceOrder compare_source_position(uint32_t lhs_producer, const SourcePosition 
     return SourceOrder::Before;
   if (lhs.cycle > rhs.cycle)
     return SourceOrder::After;
+  if (lhs_producer == rhs_producer) {
+    if (lhs.producer_sequence < rhs.producer_sequence)
+      return SourceOrder::Before;
+    if (lhs.producer_sequence > rhs.producer_sequence)
+      return SourceOrder::After;
+    return SourceOrder::Equal;
+  }
   if (!lhs.order_qualified || !rhs.order_qualified)
     return SourceOrder::Unordered;
   if (lhs.qualified_phase < rhs.qualified_phase)
     return SourceOrder::Before;
   if (lhs.qualified_phase > rhs.qualified_phase)
     return SourceOrder::After;
-  if (lhs_producer != rhs_producer)
-    return SourceOrder::Unordered;
-  if (lhs.producer_sequence < rhs.producer_sequence)
-    return SourceOrder::Before;
-  if (lhs.producer_sequence > rhs.producer_sequence)
-    return SourceOrder::After;
-  return SourceOrder::Equal;
+  return SourceOrder::Unordered;
 }
 
 ObservationStream::ObservationStream(StreamContract contract, std::vector<ProducerCapability> producers)
@@ -234,11 +375,10 @@ StreamResult ObservationStream::validate_transaction(const ObservationStream &st
   if (batch.abi_version != 2)
     return unsupported("unsupported event ABI version");
 
-  using SourceSequenceKey = std::tuple<uint32_t, uint64_t, uint16_t, uint64_t>;
+  using SourceSequenceKey = std::pair<uint32_t, uint64_t>;
   std::set<SourceSequenceKey> pending_sequences;
   for (const auto &pending : stream.pending_events_)
-    pending_sequences.emplace(pending.producer_id, pending.source.cycle, pending.source.qualified_phase,
-                              pending.source.producer_sequence);
+    pending_sequences.emplace(pending.producer_id, pending.source.producer_sequence);
   for (const auto &event : batch.events) {
     auto producer = stream.producers_.find(event.producer_id);
     if (producer == stream.producers_.end() || !has_kind(producer->second, event.kind))
@@ -247,6 +387,12 @@ StreamResult ObservationStream::validate_transaction(const ObservationStream &st
       return invalid("event payload kind or shape is invalid");
     if (event.source.producer_sequence == 0)
       return invalid("producer source sequence zero is reserved");
+    if (event.source.qualified_phase == SourcePosition::cycle_closed_phase)
+      return invalid("cycle-closed sentinel is reserved for producer watermarks");
+    auto closed_sequence = stream.closed_source_sequences_.find(event.producer_id);
+    if (closed_sequence != stream.closed_source_sequences_.end() &&
+        event.source.producer_sequence <= closed_sequence->second)
+      return invalid("producer source sequence did not advance beyond the closed prefix");
     auto watermark = stream.watermarks_.find(event.producer_id);
     if (watermark != stream.watermarks_.end()) {
       if (position_is_closed(event.producer_id, event.source, watermark->second))
@@ -256,8 +402,7 @@ StreamResult ObservationStream::validate_transaction(const ObservationStream &st
               SourceOrder::Unordered)
         return incomplete("same-cycle event cannot be classified against partial source watermark");
     }
-    if (!pending_sequences.emplace(event.producer_id, event.source.cycle, event.source.qualified_phase,
-                                   event.source.producer_sequence).second)
+    if (!pending_sequences.emplace(event.producer_id, event.source.producer_sequence).second)
       return invalid("producer source position sequence was reused in an open prefix");
 
     if (event.kind == RuntimeEventKind::StorePublish) {
@@ -375,30 +520,46 @@ DrainedEventBatch ObservationStream::drain() {
         continue;
       const auto lhs_effect = memory_effect(a);
       const auto rhs_effect = memory_effect(b);
-      if (lhs_effect && rhs_effect && effects_overlap(*lhs_effect, *rhs_effect) &&
+      if (lhs_effect && rhs_effect &&
           compare_source_position(a.producer_id, a.source, b.producer_id, b.source) == SourceOrder::Unordered) {
-        result.status = EventValidationStatus::Incomplete;
-        result.message = "closed same-cycle overlapping memory events lack qualified order";
-        return result;
+        if (effects_overlap(*lhs_effect, *rhs_effect)) {
+          result.status = EventValidationStatus::Incomplete;
+          result.message = "closed same-cycle overlapping memory events lack qualified order";
+          return result;
+        }
+        const auto lhs_hart = memory_hart(a);
+        const auto rhs_hart = memory_hart(b);
+        if (lhs_hart && rhs_hart && *lhs_hart == *rhs_hart) {
+          result.status = EventValidationStatus::Incomplete;
+          result.message = "same-hart memory events lack source order within a closed cycle";
+          return result;
+        }
       }
     }
   }
-  std::stable_sort(ready.begin(), ready.end(), [](const RuntimeEvent *lhs, const RuntimeEvent *rhs) {
-    if (lhs->source.cycle != rhs->source.cycle)
-      return lhs->source.cycle < rhs->source.cycle;
-    const auto order = compare_source_position(lhs->producer_id, lhs->source, rhs->producer_id, rhs->source);
-    if (order == SourceOrder::Before)
-      return true;
-    if (order == SourceOrder::After)
-      return false;
-    return lhs->producer_id < rhs->producer_id;
-  });
-  for (const auto *event : ready)
+  std::vector<const RuntimeEvent *> ordered;
+  const auto order_result = order_closed_events(ready, ordered);
+  if (!order_result) {
+    result.status = order_result.status;
+    result.message = order_result.message;
+    return result;
+  }
+  std::map<uint32_t, uint64_t> latest_sequences = closed_source_sequences_;
+  for (const auto *event : ordered) {
+    auto previous = latest_sequences.find(event->producer_id);
+    if (previous != latest_sequences.end() && event->source.producer_sequence <= previous->second) {
+      result.status = EventValidationStatus::Invalid;
+      result.message = "producer source sequence regressed in the closed source order";
+      return result;
+    }
+    latest_sequences[event->producer_id] = event->source.producer_sequence;
     result.events.push_back(*event);
+  }
   pending_events_.erase(std::remove_if(pending_events_.begin(), pending_events_.end(), [&](const RuntimeEvent &event) {
                           return event.source.cycle <= *result.closed_through_cycle;
                         }),
                         pending_events_.end());
+  closed_source_sequences_ = std::move(latest_sequences);
   return result;
 }
 
