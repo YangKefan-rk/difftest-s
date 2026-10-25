@@ -103,6 +103,7 @@ private:
     bool reader = false;
     std::shared_ptr<Atomic> atomic;
     unsigned instruction_count = 1;
+    bool is_rvc = false;
     std::vector<std::pair<uint64_t, uint32_t>> reference_instructions;
   };
   struct Hart {

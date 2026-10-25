@@ -48,6 +48,29 @@ bool scalar_alu(uint32_t instruction) {
     default: return false;
   }
 }
+// DUT retirement carries expanded instructions, while the reference observer
+// reports the original RVC encoding. Only normalize forms with known expansion.
+bool fused_arithmetic(uint32_t instruction, uint32_t &expanded) {
+  if ((instruction & 3) == 3) {
+    if (!scalar_alu(instruction)) return false;
+    expanded = instruction;
+    return true;
+  }
+  if (instruction >> 16 || (instruction & 3) != 1) return false;
+  const unsigned funct = (instruction >> 13) & 7;
+  const unsigned rd = (instruction >> 7) & 31;
+  const unsigned imm = ((instruction >> 12) & 1) << 5 | ((instruction >> 2) & 31);
+  const int32_t signed_imm = int32_t(imm) - (imm & 32 ? 64 : 0);
+  if (funct == 3 && rd != 0 && rd != 2 && imm != 0) { // C.LUI
+    expanded = ((uint32_t(signed_imm) & 0xfffff) << 12) | (rd << 7) | 0x37;
+    return true;
+  }
+  if (funct == 1 && rd != 0) { // C.ADDIW (RV64)
+    expanded = ((uint32_t(signed_imm) & 0xfff) << 20) | (rd << 15) | (rd << 7) | 0x1b;
+    return true;
+  }
+  return false;
+}
 bool accepted(const CheckResult &result) {
   return result || result.status == CheckStatus::Pending;
 }
@@ -899,6 +922,7 @@ CheckResult Runtime::before_commit(unsigned hart, unsigned port, DiffTestState &
     active.instruction.memory.push_back(store.operation);
   }
   active.instruction_count = unsigned(commit.nFused) + 1;
+  active.is_rvc = commit.isRVC;
   if (commit.nFused && !reference.set_instruction_observer(&Runtime::observe_reference_instruction, &h))
     return unsupported("fused retirement requires reference instruction observation");
   h.active = std::move(active);
@@ -931,11 +955,19 @@ CheckResult Runtime::after_commit(unsigned hart, RefProxy &reference) {
     uint64_t expected_pc = active.instruction.pc;
     for (unsigned index = 0; index < active.reference_instructions.size(); ++index) {
       const auto &observed = active.reference_instructions[index];
-      if (observed.first != expected_pc || !scalar_alu(observed.second))
-        return unsupported("fused packet contains nonsequential or non-ALU reference instructions");
+      uint32_t expanded = 0;
+      if (observed.first != expected_pc || !fused_arithmetic(observed.second, expanded))
+        return unsupported("fused packet contains nonsequential or unsupported arithmetic instructions");
       if (index == 0) {
-        if (observed.second != active.instruction.instruction)
+        const bool observed_rvc = (observed.second & 3) != 3;
+        if (observed_rvc != active.is_rvc || expanded != active.instruction.instruction)
           return {CheckStatus::Violation, 0, "first fused instruction differs from reference execution"};
+        if (observed_rvc) {
+          active.instruction.instruction = observed.second;
+          auto decoded = decode_dependencies(observed.second, active.instruction.dependencies);
+          if (!decoded)
+            return unsupported(decoded.message);
+        }
       } else {
         RetiredInstruction instruction;
         instruction.hart = hart;
@@ -947,7 +979,7 @@ CheckResult Runtime::after_commit(unsigned hart, RefProxy &reference) {
           return unsupported(decoded.message);
         fused_tail.push_back(std::move(instruction));
       }
-      expected_pc += 4;
+      expected_pc += (observed.second & 3) == 3 ? 4 : 2;
     }
   }
   if (active.reader) {
