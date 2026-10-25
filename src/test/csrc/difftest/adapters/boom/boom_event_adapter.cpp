@@ -30,6 +30,13 @@ bool selected_bytes_equal(const std::vector<uint8_t> &lhs, const std::vector<uin
   return true;
 }
 
+bool fence_instruction(uint32_t instruction) {
+  const unsigned opcode = instruction & 0x7f;
+  const unsigned function = (instruction >> 12) & 7;
+  return (opcode == 0x0f && (function == 0 || function == 1)) ||
+         (opcode == 0x73 && (instruction & 0xfe007fff) == 0x12000073);
+}
+
 bool same_position(const SourcePosition &lhs, const SourcePosition &rhs) {
   return lhs.cycle == rhs.cycle && lhs.qualified_phase == rhs.qualified_phase &&
          lhs.producer_sequence == rhs.producer_sequence && lhs.order_qualified == rhs.order_qualified;
@@ -134,7 +141,8 @@ CheckResult BoomEventAdapter::allocate(const InstructionAllocation &record) {
       (quadrant == 0 || quadrant == 2) && (compressed_function == 2 || compressed_function == 3);
   const bool store = record.length == 4 ? opcode == 0x23 :
       (quadrant == 0 || quadrant == 2) && (compressed_function == 6 || compressed_function == 7);
-  if (load != record.ldq.has_value() || store != record.stq.has_value())
+  if (load != record.ldq.has_value() ||
+      (store != record.stq.has_value() && !(record.stq && fence_instruction(record.instruction))))
     return invalid("BOOM raw scalar opcode does not match its LDQ/STQ allocation");
   if (record.length == 4 && ((record.instruction >> 2) & 7) == 7)
     return unsupported("BOOM extended-length instruction exceeds the scalar consumer decode width");
@@ -215,6 +223,11 @@ CheckResult BoomEventAdapter::sample_load(const LoadObservation &record) {
   if (!valid_bytes(record.address, record.bytes, record.byte_mask) ||
       (!record.forwarded_writers.empty() && record.forwarded_writers.size() != record.bytes.size()))
     return invalid("BOOM load sample has an invalid scalar byte range or forwarding shape");
+  if (!record.forwarded_writers.empty()) {
+    for (const auto &writer : record.forwarded_writers)
+      if (writer && (writer->hart != hart_ || writer->epoch != epoch_ || !writer->uid || writer->subaccess))
+        return invalid("BOOM forwarding metadata names an invalid local logical writer");
+  }
   if (record.sampling_point == LoadSamplingPoint::StoreForwarding && record.forwarded_writers.empty())
     return incomplete("BOOM forwarded load lacks byte writer evidence");
   MemoryOperation operation;
@@ -259,6 +272,8 @@ CheckResult BoomEventAdapter::commit_store(const StoreCommit &record) {
   auto found = instructions_.find(record.id);
   if (found == instructions_.end() || found->second.retired || !found->second.allocation.stq || found->second.store)
     return invalid("BOOM store commit has no matching live STQ instruction or is duplicated");
+  if (fence_instruction(found->second.allocation.instruction))
+    return invalid("BOOM fence STQ entry has no LocalStore memory effect");
   if (!record.architecturally_committed)
     return incomplete("BOOM STQ allocation/request is not an architectural LocalStore commit");
   if (!valid_bytes(record.address, record.bytes, record.byte_mask))
@@ -285,10 +300,12 @@ CheckResult BoomEventAdapter::release_store_slot(const OperationId &id, const Sl
   if (!result)
     return result;
   auto found = instructions_.find(id);
-  if (found == instructions_.end() || !found->second.store || found->second.stq_released)
-    return invalid("BOOM STQ release has no committed store or was already released");
+  if (found == instructions_.end() || found->second.stq_released ||
+      (!found->second.store && !fence_instruction(found->second.allocation.instruction)))
+    return invalid("BOOM STQ release has no committed store/fence or was already released");
   release_slot(stq_, stq);
   found->second.stq_released = true;
+  collect(id);
   return {};
 }
 
@@ -366,9 +383,10 @@ CheckResult BoomEventAdapter::retire(const Retirement &record) {
     return invalid("BOOM non-load retirement carries a load attempt/result");
   }
   if (state.allocation.stq) {
-    if (!state.store)
+    if (!state.store && !fence_instruction(record.instruction))
       return incomplete("BOOM store retirement lacks its architectural LocalStore");
-    retirement.instruction.memory.push_back(*state.store);
+    if (state.store)
+      retirement.instruction.memory.push_back(*state.store);
   }
   result = append(record.source, RuntimeEventKind::InstructionRetire, std::move(retirement));
   if (!result)
@@ -402,9 +420,14 @@ CheckResult BoomEventAdapter::audit_reference_store(CheckerEventConsumer &consum
 
 void BoomEventAdapter::collect(const OperationId &id) {
   auto found = instructions_.find(id);
-  if (found != instructions_.end() && found->second.retired &&
-      (!found->second.store || (found->second.published && found->second.audited)))
-    instructions_.erase(found);
+  if (found == instructions_.end() || !found->second.retired)
+    return;
+  const auto &instruction = found->second;
+  if (instruction.store && (!instruction.published || !instruction.audited))
+    return;
+  if (instruction.allocation.stq && !instruction.stq_released)
+    return;
+  instructions_.erase(found);
 }
 
 CheckResult BoomEventAdapter::squash(const OperationId &id, const SlotGeneration &rob) {
