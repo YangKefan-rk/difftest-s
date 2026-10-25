@@ -52,8 +52,18 @@ CheckResult CheckerEventConsumer::require_rank(const RuntimeEvent &event, Observ
 }
 
 CheckResult CheckerEventConsumer::consume_allocate(const InstructionAllocateEvent &event) {
-  if (!event.id.uid || event.id.subaccess != 0 || event.length < 2 || event.length > 8 || event.pc % 2)
+  if (!event.id.uid || event.id.subaccess != 0 || event.pc % 2)
     return remember_failure(invalid("invalid parent instruction allocation"));
+  if (event.length == 6 || event.length == 8)
+    return remember_failure(unsupported("extended-length instructions exceed this scalar consumer's decode width"));
+  if (event.length != 2 && event.length != 4)
+    return remember_failure(invalid("instruction length must be 2 or 4 bytes"));
+
+  const bool encoded_as_compressed = (event.instruction & 3) != 3;
+  if (encoded_as_compressed != (event.length == 2))
+    return remember_failure(invalid("allocated instruction length differs from its encoding"));
+  if (event.length == 4 && ((event.instruction >> 2) & 7) == 7)
+    return remember_failure(unsupported("instruction encoding declares an extended-length instruction"));
   if (allocations_.size() >= max_live_instructions_)
     return pending("live instruction limit reached; retain and retry the allocation event after retirement");
   auto hart = hart_epoch_and_uid_.find(event.id.hart);
