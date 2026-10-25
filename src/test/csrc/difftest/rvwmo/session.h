@@ -24,6 +24,22 @@ struct ReferenceLoadValue {
   std::vector<uint8_t> expected_bytes;
 };
 
+enum class ArchitecturalDestination : uint8_t { None, Integer, Unsupported };
+
+struct ArchitecturalRetirement {
+  OperationId id;
+  uint64_t pc = 0;
+  uint32_t instruction = 0;
+  ArchitecturalDestination destination = ArchitecturalDestination::None;
+  uint8_t destination_register = 0;
+  uint64_t destination_value = 0;
+};
+
+struct ReferenceIntegerWrite {
+  uint8_t destination_register = 0;
+  uint64_t value = 0;
+};
+
 struct ReferenceStoreValue {
   OperationId id;
   uint64_t address = 0;
@@ -34,22 +50,27 @@ struct ReferenceStoreValue {
 struct ReferenceStepResult {
   CheckResult check;
   std::vector<ReferenceStoreValue> stores;
-  bool architectural_state_checked = false;
+  std::optional<ReferenceIntegerWrite> integer_write;
+  uint64_t reference_pc = 0;
+  uint32_t reference_instruction = 0;
+  bool took_trap = false;
 };
 
-// Joins transport closure, scalar PPO consumption, source-order rank assignment
-// and independent REF store audits. Architecture-state REF stepping and
-// language-specific transport decoding remain host responsibilities.
+// Joins transport closure, source-order ranks, scalar PPO and REF results. The
+// host steps the per-hart REF; this session checks PC/raw/GPR results and audits
+// REF-derived stores against provisional LocalStore events.
 class ObservationSession {
 public:
   using ReferenceStepper =
-      std::function<ReferenceStepResult(const InstructionRetireEvent &, const std::vector<ReferenceLoadValue> &)>;
+      std::function<ReferenceStepResult(const InstructionRetireEvent &, const ArchitecturalRetirement &,
+                                        const std::vector<ReferenceLoadValue> &)>;
 
   ObservationSession(StreamContract contract, std::vector<ProducerCapability> producers,
                     Memory::ReadGlobal read_global, Memory::WriteGlobal write_global, ReferenceStepper reference_stepper,
                     size_t max_live_instructions = 65536, size_t max_pending_retirements = 65536);
 
-  SessionSubmitResult submit(const EventBatch &batch);
+  SessionSubmitResult submit(const EventBatch &batch,
+                             const std::vector<ArchitecturalRetirement> &retirements = {});
   CheckResult poll();
   CheckResult finalize(uint64_t completed_cycle);
   size_t pending_events() const { return pending_events_.size(); }
@@ -62,7 +83,6 @@ private:
   struct ReferenceRecord {
     std::vector<ReferenceStoreValue> stores;
     size_t audited_stores = 0;
-    bool architectural_state_checked = false;
   };
 
   size_t max_pending_events_;
@@ -70,6 +90,7 @@ private:
   CheckerEventConsumer consumer_;
   ReferenceStepper reference_stepper_;
   std::deque<PendingEvent> pending_events_;
+  std::map<OperationId, ArchitecturalRetirement> architectural_retirements_;
   std::map<OperationId, ReferenceRecord> reference_records_;
   std::optional<std::pair<uint32_t, uint64_t>> current_rank_event_;
   ObservationTime current_rank_;
@@ -82,7 +103,7 @@ private:
   CheckResult collect_closed_events();
   CheckResult consume_pending_events();
   CheckResult consume_retirement(const RuntimeEvent &event, const InstructionRetireEvent &retirement);
-  CheckResult step_reference(const InstructionRetireEvent &retirement);
+  CheckResult step_reference(const InstructionRetireEvent &retirement, const ArchitecturalRetirement &snapshot);
   CheckResult remember_failure(CheckResult result);
 };
 

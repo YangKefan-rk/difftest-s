@@ -1,6 +1,8 @@
 #include "session.h"
 #include <algorithm>
 #include <limits>
+#include <map>
+#include <set>
 #include <stdexcept>
 #include <utility>
 
@@ -9,6 +11,53 @@ namespace {
 CheckResult invalid(const char *message) { return {CheckStatus::Invalid, 0, message}; }
 CheckResult pending(const char *message) { return {CheckStatus::Pending, 0, message}; }
 CheckResult incomplete(const char *message) { return {CheckStatus::Incomplete, 0, message}; }
+
+bool is_memory_event_kind(const RuntimeEvent &event) {
+  switch (event.kind) {
+  case RuntimeEventKind::LoadSample:
+  case RuntimeEventKind::StorePublish:
+    return true;
+  case RuntimeEventKind::AtomicLifecycle: {
+    const auto phase = std::get<AtomicLifecycleEvent>(event.payload).phase;
+    return phase == AtomicObservationPhase::ReadEffect || phase == AtomicObservationPhase::WriteEffect;
+  }
+  default:
+    return false;
+  }
+}
+
+CheckResult validate_memory_rank_order(const std::vector<RuntimeEvent> &events) {
+  struct CycleSources {
+    std::set<uint32_t> producers;
+    std::map<uint16_t, std::set<uint32_t>> phase_producers;
+    bool has_unqualified_source = false;
+  };
+
+  std::map<uint64_t, CycleSources> cycles;
+  for (const auto &event : events) {
+    if (!is_memory_event_kind(event))
+      continue;
+    auto &sources = cycles[event.source.cycle];
+    sources.producers.insert(event.producer_id);
+    if (!event.source.order_qualified) {
+      sources.has_unqualified_source = true;
+      continue;
+    }
+    sources.phase_producers[event.source.qualified_phase].insert(event.producer_id);
+  }
+
+  for (const auto &cycle : cycles) {
+    const auto &sources = cycle.second;
+    if (sources.producers.size() < 2)
+      continue;
+    if (sources.has_unqualified_source)
+      return incomplete("same-cycle memory events lack cross-producer order evidence");
+    for (const auto &phase : sources.phase_producers)
+      if (phase.second.size() > 1)
+        return incomplete("same-cycle memory events share a phase without qualified relative order");
+  }
+  return {};
+}
 } // namespace
 
 ObservationSession::ObservationSession(StreamContract contract, std::vector<ProducerCapability> producers,
@@ -25,17 +74,7 @@ ObservationSession::ObservationSession(StreamContract contract, std::vector<Prod
 }
 
 bool ObservationSession::is_memory_event(const RuntimeEvent &event) {
-  switch (event.kind) {
-  case RuntimeEventKind::LoadSample:
-  case RuntimeEventKind::StorePublish:
-    return true;
-  case RuntimeEventKind::AtomicLifecycle: {
-    const auto phase = std::get<AtomicLifecycleEvent>(event.payload).phase;
-    return phase == AtomicObservationPhase::ReadEffect || phase == AtomicObservationPhase::WriteEffect;
-  }
-  default:
-    return false;
-  }
+  return is_memory_event_kind(event);
 }
 
 std::optional<ObservationTime> ObservationSession::resolve_current_rank(const RuntimeEvent &event) const {
@@ -64,6 +103,14 @@ CheckResult ObservationSession::collect_closed_events() {
                                                                            : CheckStatus::Incomplete;
     return remember_failure({status, 0, drained.message});
   }
+  std::vector<RuntimeEvent> rank_window;
+  rank_window.reserve(pending_events_.size() + drained.events.size());
+  for (const auto &pending_event : pending_events_)
+    rank_window.push_back(pending_event.event);
+  rank_window.insert(rank_window.end(), drained.events.begin(), drained.events.end());
+  auto order = validate_memory_rank_order(rank_window);
+  if (!order)
+    return remember_failure(order);
   for (const auto &event : drained.events)
     pending_events_.push_back({event});
   return {};
@@ -117,12 +164,20 @@ CheckResult ObservationSession::consume_pending_events() {
     }
   }
 
-  return consumer_.poll();
+  auto result = consumer_.poll();
+  if (!result || result.status == CheckStatus::Pending)
+    return result;
+  if (!pending_events_.empty())
+    return pending("session retains closed events awaiting semantic prerequisites");
+  return result;
 }
 
-CheckResult ObservationSession::step_reference(const InstructionRetireEvent &retirement) {
+CheckResult ObservationSession::step_reference(const InstructionRetireEvent &retirement,
+                                               const ArchitecturalRetirement &snapshot) {
   if (!reference_stepper_)
     return {CheckStatus::Unsupported, 0, "retirement has no independent reference-step callback"};
+  if (snapshot.destination == ArchitecturalDestination::Unsupported)
+    return {CheckStatus::Unsupported, 0, "architectural destination type is outside the scalar integer session"};
 
   std::vector<ReferenceLoadValue> loads;
   for (const auto &operation : retirement.instruction.memory) {
@@ -142,13 +197,24 @@ CheckResult ObservationSession::step_reference(const InstructionRetireEvent &ret
     loads.push_back({operation.id, operation.attempt, std::move(expected)});
   }
 
-  auto result = reference_stepper_(retirement, loads);
+  auto result = reference_stepper_(retirement, snapshot, loads);
   if (result.check.status == CheckStatus::Pending)
     return invalid("reference step callback must finish synchronously once invoked");
   if (!result.check)
     return result.check;
-  if (!result.architectural_state_checked)
-    return {CheckStatus::Incomplete, 0, "reference step did not confirm architectural state comparison"};
+  if (result.reference_pc != retirement.instruction.pc ||
+      result.reference_instruction != retirement.instruction.instruction)
+    return {CheckStatus::Violation, 0, "reference PC or instruction differs from retirement"};
+  if (result.took_trap)
+    return {CheckStatus::Unsupported, 0, "reference instruction trapped outside generic trap semantics"};
+  if (snapshot.destination == ArchitecturalDestination::Integer) {
+    if (!snapshot.destination_register || snapshot.destination_register >= 32 || !result.integer_write ||
+        result.integer_write->destination_register != snapshot.destination_register ||
+        result.integer_write->value != snapshot.destination_value)
+      return {CheckStatus::Violation, 0, "reference integer write differs from the DUT retirement snapshot"};
+  } else if (snapshot.destination_register != 0 || result.integer_write) {
+    return {CheckStatus::Violation, 0, "unexpected integer write for a non-writing retirement"};
+  }
 
   std::vector<const MemoryOperation *> stores;
   for (const auto &operation : retirement.instruction.memory)
@@ -165,21 +231,27 @@ CheckResult ObservationSession::step_reference(const InstructionRetireEvent &ret
   }
 
   const OperationId id{retirement.instruction.hart, retirement.instruction.epoch, retirement.instruction.uid, 0};
-  reference_records_[id] = {std::move(result.stores), 0, true};
+  reference_records_[id] = {std::move(result.stores), 0};
   return {};
 }
 
 CheckResult ObservationSession::consume_retirement(const RuntimeEvent &event,
                                                    const InstructionRetireEvent &retirement) {
   const OperationId id{retirement.instruction.hart, retirement.instruction.epoch, retirement.instruction.uid, 0};
+  auto snapshot = architectural_retirements_.find(id);
+  if (snapshot == architectural_retirements_.end())
+    return pending("retirement awaits its independent architectural snapshot");
+  if (snapshot->second.pc != retirement.instruction.pc ||
+      snapshot->second.instruction != retirement.instruction.instruction)
+    return remember_failure(invalid("architectural snapshot differs from the retired instruction identity"));
   auto reference = reference_records_.find(id);
   if (reference == reference_records_.end()) {
-    auto result = step_reference(retirement);
+    auto result = step_reference(retirement, snapshot->second);
     if (!result)
       return result;
     reference = reference_records_.find(id);
   }
-  if (reference == reference_records_.end() || !reference->second.architectural_state_checked)
+  if (reference == reference_records_.end())
     return {CheckStatus::Incomplete, 0, "retirement has no completed independent reference result"};
 
   while (reference->second.audited_stores < reference->second.stores.size()) {
@@ -193,12 +265,15 @@ CheckResult ObservationSession::consume_retirement(const RuntimeEvent &event,
   }
 
   auto result = consumer_.consume_closed(event);
-  if (result)
+  if (result) {
     reference_records_.erase(reference);
+    architectural_retirements_.erase(snapshot);
+  }
   return result;
 }
 
-SessionSubmitResult ObservationSession::submit(const EventBatch &batch) {
+SessionSubmitResult ObservationSession::submit(const EventBatch &batch,
+                                               const std::vector<ArchitecturalRetirement> &retirements) {
   SessionSubmitResult result;
   if (!failure_) {
     result.transport = {EventValidationStatus::Invalid, failure_.message};
@@ -211,6 +286,31 @@ SessionSubmitResult ObservationSession::submit(const EventBatch &batch) {
     result.check = remember_failure(invalid("event submitted after session finalization"));
     result.pending_events = pending_events_.size();
     return result;
+  }
+
+  std::set<OperationId> new_retirement_ids;
+  if (retirements.size() > max_pending_events_ -
+                               std::min(max_pending_events_, architectural_retirements_.size())) {
+    result.transport = {EventValidationStatus::Pending, "architectural snapshot queue is full"};
+    result.check = pending("retry architectural snapshots after their retirement events are consumed");
+    result.pending_events = pending_events_.size();
+    return result;
+  }
+  for (const auto &snapshot : retirements) {
+    const bool supported_destination = snapshot.destination == ArchitecturalDestination::None ||
+                                       snapshot.destination == ArchitecturalDestination::Integer ||
+                                       snapshot.destination == ArchitecturalDestination::Unsupported;
+    if (!snapshot.id.uid || snapshot.id.subaccess != 0 || snapshot.pc % 2 ||
+        !supported_destination ||
+        (snapshot.destination == ArchitecturalDestination::Integer &&
+         (snapshot.destination_register == 0 || snapshot.destination_register >= 32)) ||
+        (snapshot.destination != ArchitecturalDestination::Integer && snapshot.destination_register != 0) ||
+        architectural_retirements_.count(snapshot.id) || !new_retirement_ids.insert(snapshot.id).second) {
+      result.transport = {EventValidationStatus::Invalid, "invalid or duplicate architectural retirement snapshot"};
+      result.check = remember_failure(invalid("invalid or duplicate architectural retirement snapshot"));
+      result.pending_events = pending_events_.size();
+      return result;
+    }
   }
 
   result.transport = stream_.submit(batch);
@@ -226,6 +326,9 @@ SessionSubmitResult ObservationSession::submit(const EventBatch &batch) {
     result.pending_events = pending_events_.size();
     return result;
   }
+
+  for (const auto &snapshot : retirements)
+    architectural_retirements_.emplace(snapshot.id, snapshot);
 
   result.check = poll();
   result.pending_events = pending_events_.size();
@@ -272,6 +375,8 @@ CheckResult ObservationSession::finalize(uint64_t completed_cycle) {
     return pending("finalization awaits every producer watermark through the requested cycle");
   if (!pending_events_.empty())
     return incomplete("session has retained semantic events that cannot make progress");
+  if (!architectural_retirements_.empty())
+    return remember_failure(incomplete("session has architectural snapshots without matching retirements"));
   auto result = consumer_.finalize();
   if (!result)
     return remember_failure(result);
