@@ -2,7 +2,10 @@
 #define DIFFTEST_RVWMO_EVENT_H
 
 #include <cstdint>
+#include <limits>
+#include <optional>
 #include <string>
+#include <variant>
 #include <vector>
 
 namespace rvwmo {
@@ -108,6 +111,145 @@ struct RetiredInstruction {
   bool failed_sc = false;
   std::vector<MemoryOperation> memory;
   DependencyMetadata dependencies;
+};
+
+// Internal C++ event contract. Language-specific transports must convert to
+// this representation; std::variant is not a DPI or generated RTL wire ABI.
+struct SourcePosition {
+  static constexpr uint16_t cycle_closed_phase = std::numeric_limits<uint16_t>::max();
+
+  uint64_t cycle = 0;
+  // Qualified phase values use one ABI-wide ordering shared by all producers.
+  // A producer without that common phase contract must leave order_qualified false.
+  uint16_t qualified_phase = 0;
+  uint64_t producer_sequence = 0;
+  bool order_qualified = false;
+
+  static SourcePosition end_of_cycle(uint64_t cycle) {
+    return {cycle, cycle_closed_phase, std::numeric_limits<uint64_t>::max(), true};
+  }
+};
+
+struct ProducerWatermark {
+  uint32_t producer_id = 0;
+  SourcePosition closed_through;
+};
+
+enum class AtomicObservationPhase : uint8_t {
+  ReadEffect = 1,
+  WriteEffect = 2,
+  Begin = 3,
+  Request = 4,
+  Replay = 5,
+  Response = 6,
+  Finish = 7,
+  Cancel = 8
+};
+
+struct InstructionAllocateEvent {
+  OperationId id;
+  uint64_t pc = 0;
+  uint32_t instruction = 0;
+  uint8_t length = 0;
+};
+
+struct InstructionCancelAttemptEvent {
+  OperationId id;
+  uint32_t attempt = 0;
+};
+
+struct LocalStoreEvent {
+  OperationId id;
+  uint64_t address = 0;
+  std::vector<uint8_t> bytes;
+  std::vector<uint8_t> byte_mask;
+};
+
+struct LoadSampleEvent {
+  MemoryOperation operation;
+  std::vector<uint8_t> actual_bytes;
+  std::vector<std::optional<OperationId>> forwarded_writers;
+};
+
+struct StorePublishMember {
+  OperationId id;
+  SourcePosition publish_position;
+};
+
+struct StorePublishEvent {
+  uint64_t transaction_id = 0;
+  uint64_t address = 0;
+  std::vector<uint8_t> bytes;
+  std::vector<uint8_t> byte_mask;
+  std::vector<OperationId> byte_writers;
+  std::vector<StorePublishMember> members;
+};
+
+struct AtomicLifecycleEvent {
+  OperationId id;
+  uint32_t attempt = 0;
+  AtomicObservationPhase phase = AtomicObservationPhase::Begin;
+  uint64_t address = 0;
+  uint64_t data = 0;
+  uint8_t mask = 0;
+  uint8_t command = 0;
+  uint8_t fuop = 0;
+  bool success = false;
+  bool error = false;
+};
+
+struct ActualLoadValue {
+  OperationId id;
+  uint32_t attempt = 0;
+  std::vector<uint8_t> bytes;
+};
+
+struct InstructionRetireEvent {
+  RetiredInstruction instruction;
+  std::vector<ActualLoadValue> loads;
+};
+
+struct HartDoneEvent {
+  // This architectural notification does not close memory-observation channels.
+  uint32_t hart = 0;
+  int32_t exit_code = 0;
+};
+
+struct TrapEvent {
+  uint32_t hart = 0;
+  OperationId instruction;
+  uint64_t pc = 0;
+  uint64_t cause = 0;
+  bool interrupt = false;
+};
+
+enum class RuntimeEventKind : uint8_t {
+  InstructionAllocate,
+  InstructionCancelAttempt,
+  LocalStore,
+  LoadSample,
+  StorePublish,
+  AtomicLifecycle,
+  InstructionRetire,
+  HartDone,
+  Trap
+};
+
+using RuntimeEventPayload = std::variant<InstructionAllocateEvent, InstructionCancelAttemptEvent, LocalStoreEvent,
+                                         LoadSampleEvent, StorePublishEvent, AtomicLifecycleEvent,
+                                         InstructionRetireEvent, HartDoneEvent, TrapEvent>;
+
+struct RuntimeEvent {
+  uint32_t producer_id = 0;
+  SourcePosition source;
+  RuntimeEventKind kind = RuntimeEventKind::InstructionAllocate;
+  RuntimeEventPayload payload = InstructionAllocateEvent{};
+};
+
+struct EventBatch {
+  uint32_t abi_version = 1;
+  std::vector<RuntimeEvent> events;
+  std::vector<ProducerWatermark> watermarks;
 };
 
 } // namespace rvwmo
