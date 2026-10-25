@@ -75,6 +75,7 @@ private:
   CheckResult consume_load_sample(const RuntimeEvent &event, const LoadSampleEvent &sample);
   CheckResult consume_store_publish(const RuntimeEvent &event, const StorePublishEvent &publish);
   CheckResult consume_cancel(const InstructionCancelAttemptEvent &event);
+  CheckResult consume_squash(const InstructionSquashEvent &event);
   CheckResult consume_retire(const InstructionRetireEvent &event);
   void collect_store_metadata();
   CheckResult remember_failure(CheckResult result);

@@ -43,7 +43,7 @@ SourceOrder compare_source_position(uint32_t lhs_producer, const SourcePosition 
 
 ObservationStream::ObservationStream(StreamContract contract, std::vector<ProducerCapability> producers)
     : contract_(std::move(contract)) {
-  if (contract_.abi_version != 1 || contract_.required_producers.empty() || producers.empty() ||
+  if (contract_.abi_version != 2 || contract_.required_producers.empty() || producers.empty() ||
       contract_.max_pending_events == 0) {
     configuration_ = unsupported("at least one event producer is required");
     return;
@@ -111,6 +111,7 @@ bool ObservationStream::payload_matches_kind(const RuntimeEvent &event) {
   case RuntimeEventKind::InstructionRetire: return std::holds_alternative<InstructionRetireEvent>(event.payload);
   case RuntimeEventKind::HartDone: return std::holds_alternative<HartDoneEvent>(event.payload);
   case RuntimeEventKind::Trap: return std::holds_alternative<TrapEvent>(event.payload);
+  case RuntimeEventKind::InstructionSquash: return std::holds_alternative<InstructionSquashEvent>(event.payload);
   }
   return false;
 }
@@ -162,6 +163,10 @@ bool ObservationStream::payload_has_valid_shape(const RuntimeEvent &event) {
   }
   case RuntimeEventKind::HartDone: return true;
   case RuntimeEventKind::Trap: return std::get<TrapEvent>(event.payload).instruction.uid != 0;
+  case RuntimeEventKind::InstructionSquash: {
+    const auto &squash = std::get<InstructionSquashEvent>(event.payload);
+    return squash.id.uid && squash.id.subaccess == 0;
+  }
   }
   return false;
 }
@@ -226,7 +231,7 @@ bool ObservationStream::effects_overlap(const MemoryEffect &lhs, const MemoryEff
 StreamResult ObservationStream::validate_transaction(const ObservationStream &stream, const EventBatch &batch) {
   if (!stream.configuration_)
     return stream.configuration_;
-  if (batch.abi_version != 1)
+  if (batch.abi_version != 2)
     return unsupported("unsupported event ABI version");
 
   using SourceSequenceKey = std::tuple<uint32_t, uint64_t, uint16_t, uint64_t>;
@@ -303,6 +308,7 @@ StreamResult ObservationStream::validate_transaction(const ObservationStream &st
   // semantic identity for the duration of a long run. The checker owns lifetime validation.
   std::set<OperationId> allocated;
   std::set<OperationId> retired;
+  std::set<OperationId> squashed;
   std::set<OperationId> local_stores;
   std::set<std::pair<OperationId, uint32_t>> attempts;
   for (const auto &event : batch.events) {
@@ -314,6 +320,10 @@ StreamResult ObservationStream::validate_transaction(const ObservationStream &st
       OperationId id{instruction.hart, instruction.epoch, instruction.uid, 0};
       if (!retired.insert(id).second)
         return invalid("instruction identity was retired more than once");
+    } else if (event.kind == RuntimeEventKind::InstructionSquash) {
+      const auto &squash = std::get<InstructionSquashEvent>(event.payload);
+      if (!squashed.insert(squash.id).second)
+        return invalid("instruction identity was squashed more than once");
     } else if (event.kind == RuntimeEventKind::LocalStore) {
       if (!local_stores.insert(std::get<LocalStoreEvent>(event.payload).id).second)
         return invalid("local store identity was published more than once");
