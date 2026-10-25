@@ -306,7 +306,7 @@ CheckResult CheckerEventConsumer::consume_retire(const InstructionRetireEvent &e
       if (cancelled_loads_.count(key))
         return remember_failure(invalid("retirement selected a cancelled load attempt"));
       if (sample == loads_.end())
-        return remember_failure(incomplete("retirement has no sample for its selected load attempt"));
+        return pending("retirement awaits the selected load-attempt sample");
       if (sample->second.operation.address != operation.address ||
           sample->second.operation.byte_mask != operation.byte_mask || !selected_loads.insert(key).second)
         return remember_failure(invalid("retired load differs from or duplicates its sampled operation"));
