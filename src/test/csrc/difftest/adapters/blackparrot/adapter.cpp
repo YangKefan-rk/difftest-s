@@ -1,7 +1,9 @@
 #include "adapter.h"
 #include <algorithm>
+#include <functional>
 #include <limits>
 #include <map>
+#include <queue>
 #include <set>
 #include <utility>
 
@@ -52,6 +54,117 @@ void clear_model_times(rvwmo::MemoryOperation &operation) {
   // GMO is resolved by the caller after stream closure, never at conversion.
   operation.read_time = {};
   operation.write_time = {};
+}
+
+using CandidateQueue = std::priority_queue<size_t, std::vector<size_t>, std::greater<size_t>>;
+
+void normalize_cycle(std::vector<rvwmo::RuntimeEvent> &events, size_t begin, size_t end,
+                     std::vector<ConversionDiagnostic> &diagnostics) {
+  struct ProducerEvents {
+    std::vector<size_t> indices;
+    size_t next = 0;
+  };
+
+  std::map<uint32_t, ProducerEvents> by_producer;
+  std::map<uint16_t, size_t> remaining_phases;
+  for (size_t index = begin; index < end; ++index) {
+    const auto &event = events[index];
+    by_producer[event.producer_id].indices.push_back(index);
+    if (event.source.order_qualified)
+      ++remaining_phases[event.source.qualified_phase];
+  }
+  for (auto &producer : by_producer)
+    std::sort(producer.second.indices.begin(), producer.second.indices.end(), [&](size_t left, size_t right) {
+      return events[left].source.producer_sequence < events[right].source.producer_sequence;
+    });
+
+  CandidateQueue unqualified_fronts;
+  std::map<uint16_t, CandidateQueue> phase_fronts;
+  const auto enqueue_front = [&](ProducerEvents &producer) {
+    if (producer.next == producer.indices.size())
+      return;
+    const size_t index = producer.indices[producer.next];
+    const auto &source = events[index].source;
+    if (source.order_qualified)
+      phase_fronts[source.qualified_phase].push(index);
+    else
+      unqualified_fronts.push(index);
+  };
+  for (auto &producer : by_producer)
+    enqueue_front(producer.second);
+
+  const auto is_current_front = [&](size_t index) {
+    const auto producer = by_producer.find(events[index].producer_id);
+    return producer != by_producer.end() && producer->second.next < producer->second.indices.size() &&
+           producer->second.indices[producer->second.next] == index;
+  };
+  const auto discard_stale = [&](CandidateQueue &candidates) {
+    while (!candidates.empty() && !is_current_front(candidates.top()))
+      candidates.pop();
+  };
+
+  std::vector<size_t> order;
+  order.reserve(end - begin);
+  while (order.size() < end - begin) {
+    discard_stale(unqualified_fronts);
+    CandidateQueue *qualified_front = nullptr;
+    if (!remaining_phases.empty()) {
+      qualified_front = &phase_fronts[remaining_phases.begin()->first];
+      discard_stale(*qualified_front);
+    }
+
+    const bool has_unqualified = !unqualified_fronts.empty();
+    const bool has_qualified = qualified_front && !qualified_front->empty();
+    if (!has_unqualified && !has_qualified) {
+      diagnostics.push_back({rvwmo::CheckStatus::Incomplete, {},
+                             "same-cycle per-producer sequences conflict with qualified source phases"});
+      order.clear();
+      for (size_t index = begin; index < end; ++index)
+        order.push_back(index);
+      break;
+    }
+
+    CandidateQueue *selected_front = nullptr;
+    if (!has_qualified || (has_unqualified && unqualified_fronts.top() < qualified_front->top()))
+      selected_front = &unqualified_fronts;
+    else
+      selected_front = qualified_front;
+    const size_t selected = selected_front->top();
+    selected_front->pop();
+    order.push_back(selected);
+
+    const auto &source = events[selected].source;
+    if (source.order_qualified) {
+      auto phase = remaining_phases.find(source.qualified_phase);
+      if (--phase->second == 0)
+        remaining_phases.erase(phase);
+    }
+    auto &producer = by_producer.at(events[selected].producer_id);
+    ++producer.next;
+    enqueue_front(producer);
+  }
+
+  std::vector<rvwmo::RuntimeEvent> ordered;
+  ordered.reserve(end - begin);
+  for (const auto index : order)
+    ordered.push_back(std::move(events[index]));
+  std::move(ordered.begin(), ordered.end(), events.begin() + begin);
+}
+
+void normalize_source_order(ConvertedOutput &output) {
+  auto &events = output.batch.events;
+  // Source cycles share a clock domain. Within one cycle, retain each producer's
+  // factual sequence and only apply cross-producer phase evidence when qualified.
+  std::stable_sort(events.begin(), events.end(), [](const auto &left, const auto &right) {
+    return left.source.cycle < right.source.cycle;
+  });
+  for (size_t begin = 0; begin < events.size();) {
+    size_t end = begin + 1;
+    while (end < events.size() && events[end].source.cycle == events[begin].source.cycle)
+      ++end;
+    normalize_cycle(events, begin, end, output.diagnostics);
+    begin = end;
+  }
 }
 } // namespace
 
@@ -635,6 +748,7 @@ ConversionResult Adapter::squash(const Origin &origin, const rvwmo::OperationId 
 ConvertedOutput Adapter::take_output() {
   auto output = std::move(state_->output);
   state_->output = {};
+  normalize_source_order(output);
   return output;
 }
 

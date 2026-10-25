@@ -133,6 +133,9 @@ public:
   // allocation and attempt observations.
   ConversionResult squash(const Origin &origin, const rvwmo::OperationId &id);
 
+  // Events are normalized by factual cycle/source sequence/qualified phase for
+  // delivery. Stable cross-producer ties remain unqualified; this order never
+  // supplies a GMO rank or arbitration proof.
   ConvertedOutput take_output();
   PendingState pending() const;
   static std::vector<std::string> consumer_gaps();
