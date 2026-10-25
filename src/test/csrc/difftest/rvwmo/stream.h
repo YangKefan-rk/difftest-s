@@ -21,7 +21,7 @@ struct ProducerRequirement {
 };
 
 struct StreamContract {
-  uint32_t abi_version = 1;
+  uint32_t abi_version = 2;
   // Required observation producers, not an architectural hart roster.
   std::vector<ProducerRequirement> required_producers;
   // Bounds transport buffering if a required source stalls its watermark.
