@@ -41,6 +41,7 @@ enum class CheckStatus {
   Pass,
   Violation,
   Pending,
+  Incomplete,
   Unsupported,
   Invalid
 };
