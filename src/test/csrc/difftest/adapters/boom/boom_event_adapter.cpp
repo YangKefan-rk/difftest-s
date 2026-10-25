@@ -375,11 +375,16 @@ CheckResult BoomEventAdapter::retire(const Retirement &record) {
     for (const auto &attempt : state.attempts)
       if (attempt.first != *record.load_attempt && attempt.second.state != AttemptState::Cancelled)
         return invalid("BOOM load retirement left an uncancelled attempt");
+    if (!record.load_address || !record.load_log2_size)
+      return incomplete("BOOM load retirement lacks an independent physical address or width");
+    if (*record.load_log2_size > 3 || *record.load_address != selected->second.operation->address ||
+        (size_t{1} << *record.load_log2_size) != selected->second.operation->byte_mask.size())
+      return invalid("BOOM retirement physical load address or width differs from its selected sample");
     if (record.load_bytes.size() != selected->second.operation->byte_mask.size())
       return incomplete("BOOM load retirement lacks independently captured actual bytes");
     retirement.instruction.memory.push_back(*selected->second.operation);
     retirement.loads.push_back({record.id, *record.load_attempt, record.load_bytes});
-  } else if (record.load_attempt || !record.load_bytes.empty()) {
+  } else if (record.load_attempt || !record.load_bytes.empty() || record.load_address || record.load_log2_size) {
     return invalid("BOOM non-load retirement carries a load attempt/result");
   }
   if (state.allocation.stq) {
