@@ -1,6 +1,7 @@
 #include "boom_event_adapter.h"
 #include "../../rvwmo/checker_event_consumer.h"
 #include "../../rvwmo/stream.h"
+#include "../../rvwmo/producer_ids.h"
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
@@ -20,6 +21,46 @@ bool valid_bytes(uint64_t address, const std::vector<uint8_t> &bytes, const std:
          std::any_of(mask.begin(), mask.end(), [](uint8_t bit) { return bit != 0; });
 }
 
+std::optional<uint8_t> scalar_memory_log2_size(uint32_t instruction, uint8_t length, bool load) {
+  unsigned function = 0;
+  if (length == 4) {
+    const unsigned expected_opcode = load ? 0x03 : 0x23;
+    if ((instruction & 0x7f) != expected_opcode)
+      return std::nullopt;
+    function = (instruction >> 12) & 7;
+    if (load) {
+      switch (function) {
+      case 0: case 4: return 0; // LB/LBU
+      case 1: case 5: return 1; // LH/LHU
+      case 2: case 6: return 2; // LW/LWU
+      case 3: return 3;         // LD
+      default: return std::nullopt;
+      }
+    }
+    if (function <= 3)
+      return static_cast<uint8_t>(function); // SB/SH/SW/SD
+    return std::nullopt;
+  }
+  if (length != 2)
+    return std::nullopt;
+  const unsigned quadrant = instruction & 3;
+  if (quadrant != 0 && quadrant != 2)
+    return std::nullopt;
+  function = (instruction >> 13) & 7;
+  if (load) {
+    if (function == 2) return 2; // C.LW/C.LWSP
+    if (function == 3) return 3; // C.LD/C.LDSP
+  } else {
+    if (function == 6) return 2; // C.SW/C.SWSP
+    if (function == 7) return 3; // C.SD/C.SDSP
+  }
+  return std::nullopt;
+}
+
+bool complete_scalar_mask(const std::vector<uint8_t> &mask) {
+  return !mask.empty() && std::all_of(mask.begin(), mask.end(), [](uint8_t bit) { return bit == 1; });
+}
+
 bool selected_bytes_equal(const std::vector<uint8_t> &lhs, const std::vector<uint8_t> &rhs,
                           const std::vector<uint8_t> &mask) {
   if (lhs.size() != rhs.size())
@@ -28,6 +69,109 @@ bool selected_bytes_equal(const std::vector<uint8_t> &lhs, const std::vector<uin
     if (mask[byte] && lhs[byte] != rhs[byte])
       return false;
   return true;
+}
+
+std::optional<uint8_t> integer_rd(uint32_t instruction, uint8_t length) {
+  if (length == 4) {
+    const unsigned opcode = instruction & 0x7f;
+    const unsigned function = (instruction >> 12) & 7;
+    switch (opcode) {
+    case 0x03: // scalar integer load
+      if (function <= 6)
+        return static_cast<uint8_t>((instruction >> 7) & 31);
+      return std::nullopt;
+    case 0x13: case 0x17: case 0x1b: case 0x33: case 0x37: case 0x3b:
+    case 0x67: case 0x6f:
+      return static_cast<uint8_t>((instruction >> 7) & 31);
+    case 0x53: { // FP comparisons/conversions/fmv.x forms write an integer rd.
+      const unsigned function7 = (instruction >> 25) & 0x7f;
+      if (function7 == 0x50 || function7 == 0x51 || function7 == 0x60 || function7 == 0x61 ||
+          function7 == 0x70 || function7 == 0x71)
+        return static_cast<uint8_t>((instruction >> 7) & 31);
+      return std::nullopt;
+    }
+    case 0x73: // CSR reads write rd; ECALL/returns have no integer rd.
+      if (function != 0)
+        return static_cast<uint8_t>((instruction >> 7) & 31);
+      return std::nullopt;
+    default:
+      return std::nullopt;
+    }
+  }
+  if (length != 2)
+    return std::nullopt;
+  const unsigned quadrant = instruction & 3;
+  const unsigned function = (instruction >> 13) & 7;
+  if (quadrant == 0) {
+    if (function == 0 || function == 2 || function == 3)
+      return static_cast<uint8_t>(((instruction >> 2) & 7) + 8); // C.ADDI4SPN/LW/LD
+    return std::nullopt;
+  }
+  if (quadrant == 1) {
+    if (function <= 3)
+      return static_cast<uint8_t>((instruction >> 7) & 31); // C.ADDI/ADDIW/LI/LUI
+    if (function == 4)
+      return static_cast<uint8_t>(((instruction >> 7) & 7) + 8); // C integer ALU
+    return std::nullopt;
+  }
+  if (quadrant == 2 && (function == 0 || function == 2 || function == 3))
+    return static_cast<uint8_t>((instruction >> 7) & 31); // C.SLLI/LWSP/LDSP
+  if (quadrant == 2 && function == 4) {
+    const unsigned destination = (instruction >> 7) & 31;
+    const unsigned source = (instruction >> 2) & 31;
+    const bool high_bit = (instruction >> 12) & 1;
+    if (!high_bit)
+      return source ? std::optional<uint8_t>{static_cast<uint8_t>(destination)} : std::nullopt;
+    if (!source)
+      return destination ? std::optional<uint8_t>{1} : std::nullopt; // C.JALR; rd==0 is EBREAK.
+    return static_cast<uint8_t>(destination);
+  }
+  return std::nullopt;
+}
+
+std::optional<uint8_t> floating_rd(uint32_t instruction, uint8_t length) {
+  if (length == 2) {
+    const unsigned quadrant = instruction & 3;
+    const unsigned function = (instruction >> 13) & 7;
+    if ((quadrant == 0 || quadrant == 2) && (function == 1 || function == 5))
+      return static_cast<uint8_t>((instruction >> 7) & 31);
+    return std::nullopt;
+  }
+  if (length != 4)
+    return std::nullopt;
+  const unsigned opcode = instruction & 0x7f;
+  const unsigned function7 = (instruction >> 25) & 0x7f;
+  if (opcode == 0x07) // FLH/FLW/FLD
+    return static_cast<uint8_t>((instruction >> 7) & 31);
+  if (opcode == 0x43 || opcode == 0x47 || opcode == 0x4b || opcode == 0x4f)
+    return static_cast<uint8_t>((instruction >> 7) & 31);
+  if (opcode != 0x53)
+    return std::nullopt;
+  // F2I and FMV.X/FCLASS forms write GPRs, not FPRs.
+  if (function7 == 0x50 || function7 == 0x51 || function7 == 0x60 || function7 == 0x61 ||
+      function7 == 0x70 || function7 == 0x71)
+    return std::nullopt;
+  return static_cast<uint8_t>((instruction >> 7) & 31);
+}
+
+bool csr_instruction(uint32_t instruction) {
+  return (instruction & 0x7f) == 0x73 && ((instruction >> 12) & 7) != 0;
+}
+
+RetirementResultCoverage retirement_coverage(uint32_t instruction, IntegerDestinationType destination_type) {
+  if (destination_type == IntegerDestinationType::Floating)
+    return RetirementResultCoverage::FloatingRegisterAndFflagsNeedComparator;
+  const unsigned opcode = instruction & 0x7f;
+  const unsigned function7 = (instruction >> 25) & 0x7f;
+  const bool floating_instruction = opcode == 0x43 || opcode == 0x47 || opcode == 0x4b ||
+      opcode == 0x4f || (opcode == 0x53 && function7 != 0x70 && function7 != 0x71);
+  if (floating_instruction)
+    return RetirementResultCoverage::FloatingFlagsNeedComparator;
+  if (csr_instruction(instruction))
+    return RetirementResultCoverage::CsrStateNeedsComparator;
+  if ((instruction & 0x7f) == 0x73)
+    return RetirementResultCoverage::SystemStateNeedsComparator;
+  return RetirementResultCoverage::Complete;
 }
 
 bool fence_instruction(uint32_t instruction) {
@@ -47,7 +191,8 @@ BoomEventAdapter::BoomEventAdapter(uint32_t hart, uint64_t epoch, AdapterLimits 
     : hart_(hart), epoch_(epoch), limits_(limits), rob_(limits.rob_slots), ldq_(limits.ldq_slots),
       stq_(limits.stq_slots) {
   if (!limits.rob_slots || !limits.ldq_slots || !limits.stq_slots || !limits.live_instructions ||
-      !limits.attempts_per_load || !limits.queued_events || !limits.open_source_sequences || !limits.producers)
+      !limits.attempts_per_load || !limits.queued_events || !limits.open_source_sequences || !limits.producers ||
+      !limits.captured_retirements)
     throw std::invalid_argument("BOOM adapter requires nonzero lifecycle and transport limits");
 }
 
@@ -82,6 +227,35 @@ CheckResult BoomEventAdapter::validate_source(const EventSource &source) const {
   return {};
 }
 
+CheckResult BoomEventAdapter::reserve_source_sequence(const EventSource &source) {
+  auto result = validate_source(source);
+  if (!result)
+    return result;
+  auto highest = highest_source_sequences_.find(source.producer_id);
+  if (highest == highest_source_sequences_.end() && highest_source_sequences_.size() >= limits_.producers)
+    return incomplete("BOOM producer source history bound reached");
+  if (highest != highest_source_sequences_.end() && source.position.producer_sequence <= highest->second)
+    return invalid("BOOM producer source sequence is not strictly increasing");
+  if (seen_source_sequences_.size() >= limits_.open_source_sequences)
+    return pending("BOOM open source-sequence history is full; advance caller watermarks before retrying");
+  highest_source_sequences_[source.producer_id] = source.position.producer_sequence;
+  return {};
+}
+
+CheckResult BoomEventAdapter::validate_event_source(RuntimeEventKind kind, const EventSource &source) const {
+  auto result = validate_source(source);
+  if (!result)
+    return result;
+  const bool publication = kind == RuntimeEventKind::StorePublish;
+  const uint32_t expected = publication ? kMemoryFabricProducerBase + 0 : hart_producer_id(hart_);
+  const bool valid_channel = publication ? source.producer_id >= kMemoryFabricProducerBase
+                                         : source.producer_id == expected;
+  if (!valid_channel)
+    return invalid(publication ? "BOOM StorePublish must use a registered shared-fabric producer"
+                               : "BOOM hart-private event must use the configured hart producer");
+  return {};
+}
+
 CheckResult BoomEventAdapter::available_slot(const std::vector<SlotOwner> &slots, const SlotGeneration &slot) const {
   if (slot.index >= slots.size() || !slot.generation)
     return invalid("BOOM slot is out of range or has zero generation");
@@ -110,18 +284,17 @@ void BoomEventAdapter::release_slot(std::vector<SlotOwner> &slots, const SlotGen
 }
 
 CheckResult BoomEventAdapter::append(const EventSource &source, RuntimeEventKind kind, RuntimeEventPayload payload) {
-  auto result = validate_source(source);
+  auto result = validate_event_source(kind, source);
   if (!result)
     return result;
   if (batch_.events.size() >= limits_.queued_events)
     return pending("BOOM event queue is full; submit the existing batch before retrying");
   const auto sequence_key = std::make_pair(source.producer_id, source.position.producer_sequence);
-  auto closed = closed_source_sequences_.find(source.producer_id);
-  if (seen_source_sequences_.count(sequence_key) ||
-      (closed != closed_source_sequences_.end() && source.position.producer_sequence <= closed->second))
-    return invalid("BOOM producer source sequence was reused within or across closed prefixes");
-  if (seen_source_sequences_.size() >= limits_.open_source_sequences)
-    return pending("BOOM open source-sequence history is full; advance caller watermarks before retrying");
+  if (seen_source_sequences_.count(sequence_key))
+    return invalid("BOOM producer source sequence was reused");
+  result = reserve_source_sequence(source);
+  if (!result)
+    return result;
   batch_.events.push_back({source.producer_id, source.position, kind, std::move(payload)});
   seen_source_sequences_.emplace(sequence_key, source.position);
   return {};
@@ -152,6 +325,10 @@ CheckResult BoomEventAdapter::allocate(const InstructionAllocation &record) {
   if (load != record.ldq.has_value() ||
       (store != record.stq.has_value() && !(record.stq && fence_instruction(record.instruction))))
     return invalid("BOOM raw scalar opcode does not match its LDQ/STQ allocation");
+  if (load && !scalar_memory_log2_size(record.instruction, record.length, true))
+    return unsupported("BOOM load encoding is not a supported scalar integer width");
+  if (store && !scalar_memory_log2_size(record.instruction, record.length, false))
+    return unsupported("BOOM store encoding is not a supported scalar integer width");
   if (record.length == 4 && ((record.instruction >> 2) & 7) == 7)
     return unsupported("BOOM extended-length instruction exceeds the scalar consumer decode width");
   if (record.ldq && record.stq)
@@ -216,6 +393,11 @@ CheckResult BoomEventAdapter::begin_load_attempt(const LoadAttempt &record, cons
     if (instruction->attempts.at(*instruction->latest_attempt).state != AttemptState::Cancelled)
       return invalid("BOOM replay began before cancellation of the previous load attempt");
   }
+  if (source_lower_bound.producer_id != hart_producer_id(hart_))
+    return invalid("BOOM load attempt lower bound must use its hart-private producer");
+  result = reserve_source_sequence(source_lower_bound);
+  if (!result)
+    return result;
   instruction->attempts.emplace(record.attempt, Attempt{AttemptState::Executing, {}, source_lower_bound});
   instruction->latest_attempt = record.attempt;
   return {};
@@ -238,9 +420,13 @@ CheckResult BoomEventAdapter::sample_load(const LoadObservation &record) {
     return invalid("BOOM load source sample precedes its execution-attempt lower bound");
   if (!record.source_complete || record.sampling_point == LoadSamplingPoint::Unavailable)
     return incomplete("BOOM load sample lacks complete source-side sampling evidence");
-  if (!valid_bytes(record.address, record.bytes, record.byte_mask) ||
+  const auto expected_size = scalar_memory_log2_size(instruction->allocation.instruction,
+                                                       instruction->allocation.length, true);
+  if (!expected_size || record.bytes.size() != (size_t{1} << *expected_size) ||
+      !complete_scalar_mask(record.byte_mask) ||
+      !valid_bytes(record.address, record.bytes, record.byte_mask) ||
       (!record.forwarded_writers.empty() && record.forwarded_writers.size() != record.bytes.size()))
-    return invalid("BOOM load sample has an invalid scalar byte range or forwarding shape");
+    return invalid("BOOM load sample width, scalar mask or forwarding shape differs from its instruction");
   if (!record.forwarded_writers.empty()) {
     for (const auto &writer : record.forwarded_writers)
       if (writer && (writer->hart != hart_ || writer->epoch != epoch_ || !writer->uid || writer->subaccess))
@@ -294,8 +480,11 @@ CheckResult BoomEventAdapter::commit_store(const StoreCommit &record) {
     return invalid("BOOM fence STQ entry has no LocalStore memory effect");
   if (!record.architecturally_committed)
     return incomplete("BOOM STQ allocation/request is not an architectural LocalStore commit");
-  if (!valid_bytes(record.address, record.bytes, record.byte_mask))
-    return invalid("BOOM LocalStore has an invalid scalar byte range");
+  const auto expected_size = scalar_memory_log2_size(found->second.allocation.instruction,
+                                                       found->second.allocation.length, false);
+  if (!expected_size || record.bytes.size() != (size_t{1} << *expected_size) ||
+      !complete_scalar_mask(record.byte_mask) || !valid_bytes(record.address, record.bytes, record.byte_mask))
+    return invalid("BOOM LocalStore width or scalar byte mask differs from its instruction");
   result = append(record.source, RuntimeEventKind::LocalStore,
                   LocalStoreEvent{record.id, record.address, record.bytes, record.byte_mask});
   if (!result)
@@ -371,6 +560,28 @@ CheckResult BoomEventAdapter::retire(const Retirement &record) {
   auto found = instructions_.find(record.id);
   if (found == instructions_.end() || found->second.retired || record.id.uid <= last_retired_uid_)
     return invalid("BOOM retirement is stale, duplicated or out of architectural program order");
+  if (captured_retirements_.size() >= limits_.captured_retirements)
+    return pending("BOOM architectural result queue is full; retrieve captured retirements and retry");
+  if (record.destination_type > IntegerDestinationType::Zero || record.logical_destination > 31)
+    return invalid("BOOM retirement has an invalid destination type or architectural register");
+  const auto decoded_integer_rd = integer_rd(record.instruction, found->second.allocation.length);
+  const auto decoded_floating_rd = floating_rd(record.instruction, found->second.allocation.length);
+  if (record.destination_type == IntegerDestinationType::Integer) {
+    if (!decoded_integer_rd || *decoded_integer_rd != record.logical_destination)
+      return invalid("BOOM integer retirement destination differs from its raw instruction rd");
+  } else if (record.destination_type == IntegerDestinationType::Floating) {
+    if (!decoded_floating_rd || *decoded_floating_rd != record.logical_destination)
+      return invalid("BOOM floating retirement destination differs from its raw instruction rd");
+  } else if ((record.destination_type == IntegerDestinationType::None ||
+              record.destination_type == IntegerDestinationType::Zero) &&
+             ((decoded_integer_rd && *decoded_integer_rd != 0) ||
+              (decoded_floating_rd && *decoded_floating_rd != 0))) {
+    return invalid("BOOM retirement omits a register destination present in its raw instruction");
+  }
+  for (const auto &older : instructions_)
+    if (older.first.hart == record.id.hart && older.first.epoch == record.id.epoch &&
+        older.first.uid < record.id.uid && !older.second.retired)
+      return pending("BOOM retirement awaits an older live instruction to retire or squash");
   auto &state = found->second;
   if (record.pc != state.allocation.pc || record.instruction != state.allocation.instruction)
     return invalid("BOOM retirement raw instruction or PC differs from allocation");
@@ -392,6 +603,9 @@ CheckResult BoomEventAdapter::retire(const Retirement &record) {
         return invalid("BOOM load retirement left an uncancelled attempt");
     if (!record.load_address || !record.load_log2_size)
       return incomplete("BOOM load retirement lacks an independent physical address or width");
+    const auto expected_size = scalar_memory_log2_size(record.instruction, state.allocation.length, true);
+    if (!expected_size || *record.load_log2_size != *expected_size)
+      return invalid("BOOM load retirement width differs from its raw instruction");
     if (*record.load_log2_size > 3 || *record.load_address != selected->second.operation->address ||
         (size_t{1} << *record.load_log2_size) != selected->second.operation->byte_mask.size())
       return invalid("BOOM retirement physical load address or width differs from its selected sample");
@@ -412,6 +626,20 @@ CheckResult BoomEventAdapter::retire(const Retirement &record) {
   if (!result)
     return result;
   state.retired = true;
+  CapturedRetirement captured{record.id, record.pc, record.instruction, record.source,
+                              record.destination_type, {}, {},
+                              retirement_coverage(record.instruction, record.destination_type)};
+  if (record.destination_type == IntegerDestinationType::Integer && record.logical_destination != 0) {
+    captured.destination_register = record.logical_destination;
+    captured.destination_value = record.writeback_value;
+  } else if (record.destination_type == IntegerDestinationType::Floating) {
+    captured.destination_register = record.logical_destination;
+    captured.destination_value = record.writeback_value;
+  } else if (record.destination_type == IntegerDestinationType::Zero ||
+             (record.destination_type == IntegerDestinationType::Integer && record.logical_destination == 0)) {
+    captured.destination_type = IntegerDestinationType::Zero;
+  }
+  captured_retirements_.push_back(std::move(captured));
   last_retired_uid_ = record.id.uid;
   release_slot(rob_, state.allocation.rob);
   if (state.allocation.ldq)
@@ -475,6 +703,8 @@ CheckResult BoomEventAdapter::squash(const OperationId &id, const SlotGeneration
 CheckResult BoomEventAdapter::close_prefix(const ProducerWatermark &watermark) {
   if (!watermark.producer_id)
     return invalid("BOOM watermark has no registered producer identity");
+  if (watermark.producer_id != hart_producer_id(hart_))
+    return unsupported("BOOM adapter closes only its hart channel; the common session owns fabric watermarks");
   auto previous = watermarks_.find(watermark.producer_id);
   if (previous == watermarks_.end() && watermarks_.size() >= limits_.producers)
     return incomplete("BOOM producer watermark bound reached");
@@ -528,13 +758,10 @@ CheckResult BoomEventAdapter::close_prefix(const ProducerWatermark &watermark) {
         position.cycle == watermark.closed_through.cycle;
     const auto order = compare_source_position(watermark.producer_id, position,
                                                watermark.producer_id, watermark.closed_through);
-    if (whole_cycle_closed || order == SourceOrder::Before || order == SourceOrder::Equal) {
-      auto &closed_sequence = closed_source_sequences_[watermark.producer_id];
-      closed_sequence = std::max(closed_sequence, sequence->first.second);
+    if (whole_cycle_closed || order == SourceOrder::Before || order == SourceOrder::Equal)
       sequence = seen_source_sequences_.erase(sequence);
-    } else {
+    else
       ++sequence;
-    }
   }
   return {};
 }
@@ -545,9 +772,17 @@ EventBatch BoomEventAdapter::take_batch() {
   return result;
 }
 
+std::vector<CapturedRetirement> BoomEventAdapter::take_retirements() {
+  std::vector<CapturedRetirement> result;
+  result.swap(captured_retirements_);
+  return result;
+}
+
 CheckResult BoomEventAdapter::completion() const {
   if (!batch_.events.empty())
     return incomplete("BOOM converted events have not been handed to the observation stream");
+  if (!captured_retirements_.empty())
+    return incomplete("BOOM architectural results have not been handed to the REF comparator");
   if (!instructions_.empty())
     return incomplete("BOOM instructions or store publish/reference-audit obligations remain live");
   return {};

@@ -91,6 +91,29 @@ struct StorePublication {
   EventSource source;
 };
 
+enum class IntegerDestinationType : uint8_t { Integer = 0, Floating = 1, None = 2, Zero = 3 };
+enum class RetirementResultCoverage : uint8_t {
+  Complete,
+  FloatingRegisterAndFflagsNeedComparator,
+  FloatingFlagsNeedComparator,
+  CsrStateNeedsComparator,
+  SystemStateNeedsComparator
+};
+
+// Private architectural result for the caller's REF register-state comparison.
+// It is deliberately not added to the common RuntimeEvent wire/schema.
+struct CapturedRetirement {
+  OperationId id;
+  uint64_t pc = 0;
+  uint32_t instruction = 0;
+  EventSource source;
+  IntegerDestinationType destination_type = IntegerDestinationType::None;
+  std::optional<uint8_t> destination_register;
+  // Raw architectural destination bits. Interpreted by destination_type.
+  std::optional<uint64_t> destination_value;
+  RetirementResultCoverage coverage = RetirementResultCoverage::Complete;
+};
+
 struct Retirement {
   OperationId id;
   SlotGeneration rob;
@@ -103,6 +126,9 @@ struct Retirement {
   // Independent LDQ retirement address/width must match the selected sample.
   std::optional<uint64_t> load_address;
   std::optional<uint8_t> load_log2_size;
+  IntegerDestinationType destination_type = IntegerDestinationType::None;
+  uint8_t logical_destination = 0;
+  uint64_t writeback_value = 0;
 };
 
 struct ReferenceStoreAudit {
@@ -121,6 +147,7 @@ struct AdapterLimits {
   size_t queued_events = 65536;
   size_t open_source_sequences = 65536;
   size_t producers = 64;
+  size_t captured_retirements = 4096;
 };
 
 class BoomEventAdapter {
@@ -143,6 +170,8 @@ public:
   CheckResult squash(const OperationId &id, const SlotGeneration &rob, const EventSource &source);
   CheckResult close_prefix(const ProducerWatermark &watermark);
   EventBatch take_batch();
+  // Independently delivered private architectural result records for the caller's REF comparison.
+  std::vector<CapturedRetirement> take_retirements();
   // Private lifecycle completeness only; this is never an RVWMO verdict.
   CheckResult completion() const;
   size_t live_instructions() const { return instructions_.size(); }
@@ -181,11 +210,14 @@ private:
   std::vector<SlotOwner> stq_;
   std::map<uint32_t, SourcePosition> watermarks_;
   EventBatch batch_;
+  std::vector<CapturedRetirement> captured_retirements_;
   std::map<std::pair<uint32_t, uint64_t>, SourcePosition> seen_source_sequences_;
-  std::map<uint32_t, uint64_t> closed_source_sequences_;
+  std::map<uint32_t, uint64_t> highest_source_sequences_;
 
   CheckResult validate_id(const OperationId &id) const;
   CheckResult validate_source(const EventSource &source) const;
+  CheckResult validate_event_source(RuntimeEventKind kind, const EventSource &source) const;
+  CheckResult reserve_source_sequence(const EventSource &source);
   CheckResult available_slot(const std::vector<SlotOwner> &slots, const SlotGeneration &slot) const;
   CheckResult owned_slot(const std::vector<SlotOwner> &slots, const SlotGeneration &slot,
                          const OperationId &id) const;

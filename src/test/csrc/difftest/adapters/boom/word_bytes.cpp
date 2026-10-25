@@ -41,8 +41,8 @@ CheckResult extract_word_bytes(uint64_t physical_address, uint8_t log2_size, uin
   if (size > 8 - physical_offset || physical_address > std::numeric_limits<uint64_t>::max() - (size - 1))
     return {CheckStatus::Unsupported, 0, "BOOM access crosses a word boundary and requires split-access support"};
   const unsigned range_mask = ((1U << size) - 1) << offset;
-  if (!(byte_mask & range_mask) || (byte_mask & ~range_mask) || (known_writer_mask & ~byte_mask))
-    return {CheckStatus::Invalid, 0, "BOOM word byte/writer mask exceeds its physical scalar access"};
+  if (byte_mask != range_mask || (known_writer_mask & ~byte_mask))
+    return {CheckStatus::Invalid, 0, "BOOM scalar byte mask does not cover its complete physical access"};
   WordBytes converted;
   converted.address = physical_address;
   for (unsigned byte = 0; byte < size; ++byte) {
@@ -211,7 +211,8 @@ CheckResult convert_retirement(uint32_t hart, const ProbeInstruction &probe, con
   if (!probe.architectural)
     return {CheckStatus::Incomplete, 0, "BOOM predicated-off retirement needs whole-instruction discard semantics"};
   Retirement converted{operation_id(hart, probe.identity), {probe.rob_index, probe.identity.rob_generation},
-                       probe.pc, probe.instruction, {}, {}, source, {}, {}};
+                       probe.pc, probe.instruction, {}, {}, source, {}, {}, probe.destination_type,
+                       probe.logical_destination, probe.writeback_value};
   if (probe.uses_ldq) {
     if (!physical_load_address || !independent_retire_data)
       return {CheckStatus::Incomplete, 0, "BOOM load retirement lacks physical address or independent LDQ result"};
