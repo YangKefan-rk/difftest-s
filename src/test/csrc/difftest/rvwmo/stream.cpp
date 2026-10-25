@@ -47,11 +47,56 @@ struct OrderedNode {
   std::vector<size_t> successors;
 };
 
+struct SourceOrderSummary {
+  struct ProducerEvidence {
+    bool unqualified = false;
+    std::set<uint16_t> phases;
+  };
+
+  std::map<uint32_t, ProducerEvidence> producers;
+  std::map<uint16_t, size_t> qualified_phase_producers;
+  size_t unqualified_producers = 0;
+
+  bool has_unordered_with(uint32_t producer, const SourcePosition &source) const {
+    auto own = producers.find(producer);
+    if (own == producers.end()) {
+      if (!source.order_qualified)
+        return !producers.empty();
+      auto phase = qualified_phase_producers.find(source.qualified_phase);
+      return unqualified_producers != 0 ||
+             (phase != qualified_phase_producers.end() && phase->second != 0);
+    }
+
+    if (!source.order_qualified)
+      return producers.size() > 1;
+    auto phase = qualified_phase_producers.find(source.qualified_phase);
+    const bool same_phase_other_producer =
+        phase != qualified_phase_producers.end() && phase->second > own->second.phases.count(source.qualified_phase);
+    const bool unqualified_other_producer = unqualified_producers > own->second.unqualified;
+    return same_phase_other_producer || unqualified_other_producer;
+  }
+
+  void add(uint32_t producer, const SourcePosition &source) {
+    auto &evidence = producers[producer];
+    if (!source.order_qualified) {
+      if (!evidence.unqualified) {
+        evidence.unqualified = true;
+        ++unqualified_producers;
+      }
+      return;
+    }
+    if (evidence.phases.insert(source.qualified_phase).second)
+      ++qualified_phase_producers[source.qualified_phase];
+  }
+};
+
+struct ByteOrderSummary {
+  SourceOrderSummary all;
+  SourceOrderSummary writes;
+};
+
 void add_order_edge(std::vector<OrderedNode> &nodes, size_t before, size_t after) {
-  auto &successors = nodes[before].successors;
-  if (std::find(successors.begin(), successors.end(), after) != successors.end())
-    return;
-  successors.push_back(after);
+  nodes[before].successors.push_back(after);
   ++nodes[after].indegree;
 }
 
@@ -356,19 +401,6 @@ std::optional<ObservationStream::MemoryEffect> ObservationStream::memory_effect(
   }
 }
 
-bool ObservationStream::effects_overlap(const MemoryEffect &lhs, const MemoryEffect &rhs) {
-  if (!lhs.write && !rhs.write)
-    return false;
-  for (size_t byte = 0; byte < lhs.byte_mask.size(); ++byte) {
-    if (!lhs.byte_mask[byte] || lhs.address > std::numeric_limits<uint64_t>::max() - byte)
-      continue;
-    const uint64_t address = lhs.address + byte;
-    if (address >= rhs.address && address - rhs.address < rhs.byte_mask.size() && rhs.byte_mask[address - rhs.address])
-      return true;
-  }
-  return false;
-}
-
 StreamResult ObservationStream::validate_transaction(const ObservationStream &stream, const EventBatch &batch) {
   if (!stream.configuration_)
     return stream.configuration_;
@@ -512,29 +544,37 @@ DrainedEventBatch ObservationStream::drain() {
   for (const auto &event : pending_events_)
     if (event.source.cycle <= *result.closed_through_cycle)
       ready.push_back(&event);
-  for (size_t lhs = 0; lhs < ready.size(); ++lhs) {
-    for (size_t rhs = lhs + 1; rhs < ready.size(); ++rhs) {
-      const auto &a = *ready[lhs];
-      const auto &b = *ready[rhs];
-      if (a.source.cycle != b.source.cycle)
-        continue;
-      const auto lhs_effect = memory_effect(a);
-      const auto rhs_effect = memory_effect(b);
-      if (lhs_effect && rhs_effect &&
-          compare_source_position(a.producer_id, a.source, b.producer_id, b.source) == SourceOrder::Unordered) {
-        if (effects_overlap(*lhs_effect, *rhs_effect)) {
-          result.status = EventValidationStatus::Incomplete;
-          result.message = "closed same-cycle overlapping memory events lack qualified order";
-          return result;
-        }
-        const auto lhs_hart = memory_hart(a);
-        const auto rhs_hart = memory_hart(b);
-        if (lhs_hart && rhs_hart && *lhs_hart == *rhs_hart) {
-          result.status = EventValidationStatus::Incomplete;
-          result.message = "same-hart memory events lack source order within a closed cycle";
-          return result;
-        }
+  std::map<uint64_t, std::map<uint32_t, SourceOrderSummary>> hart_sources;
+  std::map<uint64_t, std::map<uint64_t, ByteOrderSummary>> byte_sources;
+  for (const auto *event : ready) {
+    const auto effect = memory_effect(*event);
+    if (!effect)
+      continue;
+
+    const auto hart = memory_hart(*event);
+    if (hart) {
+      auto &sources = hart_sources[event->source.cycle][*hart];
+      if (sources.has_unordered_with(event->producer_id, event->source)) {
+        result.status = EventValidationStatus::Incomplete;
+        result.message = "same-hart memory events lack source order within a closed cycle";
+        return result;
       }
+      sources.add(event->producer_id, event->source);
+    }
+
+    for (size_t byte = 0; byte < effect->byte_mask.size(); ++byte) {
+      if (!effect->byte_mask[byte] || effect->address > std::numeric_limits<uint64_t>::max() - byte)
+        continue;
+      auto &sources = byte_sources[event->source.cycle][effect->address + byte];
+      const auto &prior = effect->write ? sources.all : sources.writes;
+      if (prior.has_unordered_with(event->producer_id, event->source)) {
+        result.status = EventValidationStatus::Incomplete;
+        result.message = "closed same-cycle overlapping memory events lack qualified order";
+        return result;
+      }
+      sources.all.add(event->producer_id, event->source);
+      if (effect->write)
+        sources.writes.add(event->producer_id, event->source);
     }
   }
   std::vector<const RuntimeEvent *> ordered;
@@ -553,8 +593,10 @@ DrainedEventBatch ObservationStream::drain() {
       return result;
     }
     latest_sequences[event->producer_id] = event->source.producer_sequence;
-    result.events.push_back(*event);
   }
+  result.events.reserve(ordered.size());
+  for (const auto *event : ordered)
+    result.events.push_back(*event);
   pending_events_.erase(std::remove_if(pending_events_.begin(), pending_events_.end(), [&](const RuntimeEvent &event) {
                           return event.source.cycle <= *result.closed_through_cycle;
                         }),
