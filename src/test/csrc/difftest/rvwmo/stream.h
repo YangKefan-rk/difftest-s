@@ -86,7 +86,6 @@ private:
   static bool position_is_closed(uint32_t producer, const SourcePosition &position,
                                  const SourcePosition &watermark);
   static std::optional<MemoryEffect> memory_effect(const RuntimeEvent &event);
-  static bool effects_overlap(const MemoryEffect &lhs, const MemoryEffect &rhs);
   static StreamResult validate_transaction(const ObservationStream &stream, const EventBatch &batch);
 };
 
