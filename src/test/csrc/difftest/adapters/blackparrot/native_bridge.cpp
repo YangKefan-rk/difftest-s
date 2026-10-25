@@ -24,12 +24,12 @@ struct Attempt {
   bool cancelled = false;
   bool squashed = false;
   uint64_t cancelled_at = 0;
+  uint64_t drained_at = 0;
   uint32_t memory_flags = 0;
   bool observed_store_drain = false;
   bool drained = false;
   std::optional<NativeMemoryFact> store;
   std::optional<NativeMemoryFact> sample;
-  std::array<std::optional<rvwmo::OperationId>, 8> forwarded;
   std::array<std::optional<rvwmo::OperationId>, 8> forwarding_candidates;
   std::array<bool, 8> forwarding_seen{};
 };
@@ -268,8 +268,9 @@ public:
       require(!execution.cancelled, "duplicate execution-attempt cancellation");
     else
       require(!execution.squashed, "duplicate whole-instruction squash");
+    if (!execution.cancelled)
+      execution.cancelled_at = time;
     execution.cancelled = true;
-    execution.cancelled_at = time;
     execution.squashed = reason == 2;
     ++capture.summary.cancellations;
     capture.cancellation_facts.push_back({id, number, time, reason});
@@ -306,6 +307,7 @@ public:
           require(!(fact.mask & (1u << lane)) || input_bytes[lane] == drain_bytes[lane],
                   "physical store drain data differs from its store-buffer input");
         execution.drained = true;
+        execution.drained_at = fact.source_time;
       } else if (fact.kind == 3) {
         require(!execution.sample, "duplicate successful load sample");
         for (size_t lane = 0; lane < 8; ++lane) {
@@ -336,8 +338,11 @@ public:
                   !((attempt_state.store->mask >> lane) & 1))
                 continue;
               observed_writer_byte = true;
+              // The SV bypass registers sample pre-edge queue contents; a
+              // writer can forward on the same edge that drains its entry.
               if (attempt_state.store->source_time <= fact.forwarding_time &&
-                  (!attempt_state.cancelled || attempt_state.cancelled_at > fact.forwarding_time))
+                  (!attempt_state.cancelled || attempt_state.cancelled_at > fact.forwarding_time) &&
+                  (!attempt_state.drained || attempt_state.drained_at >= fact.forwarding_time))
                 eligible_attempts.push_back(writer_attempt.first);
             }
             require(observed_writer_byte, "forwarded writer does not own the captured address/byte lane");
@@ -587,7 +592,7 @@ private:
           continue;
       }
       const rvwmo::InstructionCancelAttemptEvent cancelled{fact.id, fact.attempt};
-      planned.push_back({fact.id.hart, fact.source_time, channels(fact.id.hart).memory, fact.reason == 2,
+      planned.push_back({fact.id.hart, fact.source_time, channels(fact.id.hart).memory, false,
                          [cancelled, squashed = fact.reason == 2](Adapter &target, const Origin &origin) {
                            if (squashed)
                              return target.squash(origin, cancelled.id);
