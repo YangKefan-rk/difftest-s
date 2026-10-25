@@ -23,6 +23,13 @@ and inverted cache edges carry separate half-cycle ticks. Equal-tick events
 remain unqualified. Producer IDs identify channels and never establish order.
 Asynchronous clock configurations need an independently proven time mapping.
 
+The enabled native build defaults to direct compiler invocations. Generated
+Verilator headers, precompiled headers and objects must come from the same
+model layout; use a fresh output directory after changing probes or moving
+build artifacts. An explicit `OBJCACHE=ccache` opt-in should use an isolated,
+validated cache. The native wrapper checks both exit status and the native
+BSG verdict; a zero simulator exit without `BSG-PASS` is a failed smoke run.
+
 ## Integration obligations
 
 The embedding host must supply all of the following before claiming a check:
@@ -42,6 +49,13 @@ The cache array and forwarding paths can sample distinct ticks for one load;
 these facts must be retained rather than assigning the response timestamp to
 all bytes. Early architectural retirement followed by a late miss sample also
 retains both times and exposes the current shared consumer limitation.
+
+When a selected load sample and retirement are on separate producers in the
+same cycle with no qualified source ordering, the adapter retains the
+architectural capture and reports Incomplete, withholding its semantic
+retirement event and keeping the lifecycle pending. It never converts an
+arbitrary tie-breaking order into evidence. A sequence supplied by one producer
+continues to order that producer's events under the shared stream contract.
 
 The adapter emits the schema-v2 whole-instruction squash event. The shared
 consumer still does not support every native atomic, trap/interrupt,

@@ -81,6 +81,8 @@ struct ConvertedOutput {
   // register_value is DUT actual; it must never become REF expected data.
   std::vector<CapturedRetirement> retirements;
   // Exact current-consumer gaps observed in this trace, never a final verdict.
+  // An unordered sample/retirement tie retains its architectural capture while
+  // withholding InstructionRetire and keeping the instruction/prefix pending.
   std::vector<ConversionDiagnostic> diagnostics;
 };
 

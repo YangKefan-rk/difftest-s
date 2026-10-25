@@ -1,4 +1,5 @@
 #include "adapter.h"
+#include "../../rvwmo/stream.h"
 #include <algorithm>
 #include <functional>
 #include <limits>
@@ -179,6 +180,8 @@ struct Adapter::State {
     std::optional<WritebackRecord> writeback;
     std::optional<RetireRecord> retirement;
     Origin retired_at;
+    bool retirement_captured = false;
+    bool unordered_load_retirement_reported = false;
   };
   struct Store {
     rvwmo::LocalStoreEvent local;
@@ -321,14 +324,39 @@ struct Adapter::State {
       if (!live.retirement || needs_writeback(*live.retirement) || missing_load_samples(live))
         return;
       auto record = *live.retirement;
+      bool unordered_load_retirement = false;
       for (const auto &operation : record.memory) {
         const auto sample = live.sampled_at.find(operation.attempt);
-        if (operation.load && sample != live.sampled_at.end() &&
-            sample->second.source.cycle > live.retired_at.source.cycle)
+        if (!operation.load || sample == live.sampled_at.end())
+          continue;
+
+        const auto source_order = rvwmo::compare_source_position(
+            sample->second.producer_id, sample->second.source,
+            live.retired_at.producer_id, live.retired_at.source);
+        if (source_order == rvwmo::SourceOrder::Unordered || source_order == rvwmo::SourceOrder::Equal) {
+          unordered_load_retirement = true;
+          if (!live.unordered_load_retirement_reported) {
+            output.diagnostics.push_back({rvwmo::CheckStatus::Incomplete, record.id,
+                                          "load sample and retirement share a cycle without qualified source order"});
+            live.unordered_load_retirement_reported = true;
+          }
+        } else if (source_order == rvwmo::SourceOrder::After) {
           output.diagnostics.push_back({rvwmo::CheckStatus::Incomplete, record.id,
                                         "load sample occurs after architectural retirement; current source-ordered "
                                         "consumer requires its sample before retirement"});
+        }
       }
+
+      const auto writeback_cycle = live.writeback
+          ? std::optional<uint64_t>{live.writeback->source_cycle} : std::nullopt;
+      if (unordered_load_retirement) {
+        if (!live.retirement_captured) {
+          output.retirements.push_back({live.retired_at, record, writeback_cycle});
+          live.retirement_captured = true;
+        }
+        return;
+      }
+
       rvwmo::RetiredInstruction retired;
       retired.hart = record.id.hart;
       retired.epoch = record.id.epoch;
@@ -343,9 +371,8 @@ struct Adapter::State {
       output.batch.events.push_back({live.retired_at.producer_id, live.retired_at.source,
                                     rvwmo::RuntimeEventKind::InstructionRetire,
                                     rvwmo::InstructionRetireEvent{std::move(retired), record.loads}});
-      output.retirements.push_back({live.retired_at, std::move(record),
-                                   live.writeback ? std::optional<uint64_t>{live.writeback->source_cycle}
-                                                  : std::nullopt});
+      if (!live.retirement_captured)
+        output.retirements.push_back({live.retired_at, std::move(record), writeback_cycle});
       auto store = stores.find(instruction->first);
       if (store != stores.end()) {
         store->second.retired = true;
