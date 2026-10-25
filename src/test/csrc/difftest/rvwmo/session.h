@@ -86,6 +86,7 @@ private:
   };
 
   size_t max_pending_events_;
+  size_t max_architectural_retirements_;
   ObservationStream stream_;
   CheckerEventConsumer consumer_;
   ReferenceStepper reference_stepper_;
