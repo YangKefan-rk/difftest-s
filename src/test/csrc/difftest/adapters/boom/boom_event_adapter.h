@@ -100,6 +100,9 @@ struct Retirement {
   // Independently captured retirement bytes, not copied from LoadObservation.
   std::vector<uint8_t> load_bytes;
   EventSource source;
+  // Independent LDQ retirement address/width must match the selected sample.
+  std::optional<uint64_t> load_address;
+  std::optional<uint8_t> load_log2_size;
 };
 
 struct ReferenceStoreAudit {
