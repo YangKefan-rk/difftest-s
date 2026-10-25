@@ -202,6 +202,37 @@ CheckResult CheckerEventConsumer::consume_cancel(const InstructionCancelAttemptE
   return {};
 }
 
+CheckResult CheckerEventConsumer::consume_squash(const InstructionSquashEvent &event) {
+  if (event.id.subaccess != 0)
+    return remember_failure(unsupported("split instruction squash is not covered by this consumer"));
+  const auto parent = instruction_id(event.id);
+  auto allocation = allocations_.find(parent);
+  if (allocation == allocations_.end())
+    return remember_failure(invalid("instruction squash has no live allocation"));
+  for (const auto &store : stores_)
+    if (same_parent(store.first, parent))
+      return remember_failure(invalid("architecturally committed LocalStore cannot be squashed"));
+
+  for (auto load = loads_.begin(); load != loads_.end();) {
+    if (!same_parent(load->first.first, parent)) {
+      ++load;
+      continue;
+    }
+    auto result = checker_.cancel_load(load->first.first, load->first.second);
+    if (!result)
+      return remember_failure(result);
+    load = loads_.erase(load);
+  }
+  for (auto cancelled = cancelled_loads_.begin(); cancelled != cancelled_loads_.end();) {
+    if (same_parent(cancelled->first, parent))
+      cancelled = cancelled_loads_.erase(cancelled);
+    else
+      ++cancelled;
+  }
+  allocations_.erase(allocation);
+  return {};
+}
+
 CheckResult CheckerEventConsumer::consume_retire(const InstructionRetireEvent &event) {
   auto instruction = event.instruction;
   const OperationId id{instruction.hart, instruction.epoch, instruction.uid, 0};
@@ -359,6 +390,8 @@ CheckResult CheckerEventConsumer::consume_closed(const RuntimeEvent &event) {
     return consume_allocate(std::get<InstructionAllocateEvent>(event.payload));
   case RuntimeEventKind::InstructionCancelAttempt:
     return consume_cancel(std::get<InstructionCancelAttemptEvent>(event.payload));
+  case RuntimeEventKind::InstructionSquash:
+    return consume_squash(std::get<InstructionSquashEvent>(event.payload));
   case RuntimeEventKind::LocalStore:
     return consume_local_store(std::get<LocalStoreEvent>(event.payload));
   case RuntimeEventKind::LoadSample:

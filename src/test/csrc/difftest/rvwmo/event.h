@@ -159,6 +159,10 @@ struct InstructionCancelAttemptEvent {
   uint32_t attempt = 0;
 };
 
+struct InstructionSquashEvent {
+  OperationId id;
+};
+
 struct LocalStoreEvent {
   OperationId id;
   uint64_t address = 0;
@@ -233,12 +237,13 @@ enum class RuntimeEventKind : uint8_t {
   AtomicLifecycle,
   InstructionRetire,
   HartDone,
-  Trap
+  Trap,
+  InstructionSquash
 };
 
 using RuntimeEventPayload = std::variant<InstructionAllocateEvent, InstructionCancelAttemptEvent, LocalStoreEvent,
                                          LoadSampleEvent, StorePublishEvent, AtomicLifecycleEvent,
-                                         InstructionRetireEvent, HartDoneEvent, TrapEvent>;
+                                         InstructionRetireEvent, HartDoneEvent, TrapEvent, InstructionSquashEvent>;
 
 struct RuntimeEvent {
   uint32_t producer_id = 0;
@@ -248,7 +253,7 @@ struct RuntimeEvent {
 };
 
 struct EventBatch {
-  uint32_t abi_version = 1;
+  uint32_t abi_version = 2;
   std::vector<RuntimeEvent> events;
   std::vector<ProducerWatermark> watermarks;
 };
