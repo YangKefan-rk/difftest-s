@@ -45,6 +45,9 @@ struct ProbeInstruction {
   bool atomic = false;
   bool architectural = true;
   uint8_t log2_size = 0;
+  IntegerDestinationType destination_type = IntegerDestinationType::None;
+  uint8_t logical_destination = 0;
+  uint64_t writeback_value = 0;
 };
 
 struct ProbeLoad {
