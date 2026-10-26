@@ -11,10 +11,16 @@ namespace rvwmo {
 
 struct HostSessionConfiguration {
   std::string platform;
+  // State explicitly when a test starts from an initialized architectural
+  // checkpoint rather than checking the platform's boot sequence.
+  std::string verification_scope = "whole_test";
   uint32_t reference_profile = DIFFTEST_REF_PROFILE_ID_UNKNOWN;
   StreamContract stream;
   std::vector<ProducerCapability> producers;
   std::vector<difftest_ref_state_v1> initial_harts;
+  // Optional private-adapter bookkeeping over independently computed REF stores.
+  // It must finish synchronously; it cannot change the REF result or memory.
+  std::function<CheckResult(const ReferenceStoreValue &)> reference_store_observer;
 };
 
 struct HartCompletion {
@@ -47,6 +53,8 @@ public:
   CheckResult finalize(uint64_t completed_cycle);
   bool finalized() const { return finalized_; }
   const ObservationSession *session() const { return session_.get(); }
+  // A diagnostic snapshot. Only a successful terminal finalize produces Pass.
+  std::string final_report() const;
 
 private:
   GlobalMem &memory_;
@@ -60,6 +68,7 @@ private:
   std::map<uint32_t, uint64_t> last_architectural_cycles_;
   CheckResult failure_;
   bool finalized_ = false;
+  uint64_t final_cycle_ = 0;
 
   CheckResult reject(CheckResult result);
   CheckResult validate_batch(const EventBatch &batch) const;
