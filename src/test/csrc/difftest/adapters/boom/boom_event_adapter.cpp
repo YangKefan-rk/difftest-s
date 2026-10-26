@@ -490,7 +490,7 @@ CheckResult BoomEventAdapter::commit_store(const StoreCommit &record) {
       found->second.store || found->second.allocation.stq->index != record.stq.index ||
       found->second.allocation.stq->generation != record.stq.generation) {
     std::string message = "BOOM store commit has no matching live STQ instruction or is duplicated";
-    if (found == instructions_.end()) message += " missing-id";
+    if (found == instructions_.end()) message += " missing-id hart=" + std::to_string(record.id.hart) + " epoch=" + std::to_string(record.id.epoch) + " uid=" + std::to_string(record.id.uid);
     else {
       message += " retired=" + std::to_string(found->second.retired ? 1 : 0);
       message += " store=" + std::to_string(found->second.store ? 1 : 0);
