@@ -50,8 +50,16 @@ struct Hart {
   std::optional<uint64_t> epoch;
   uint64_t last_uid = 0;
   uint64_t heartbeat_time = 0;
+  uint64_t latest_core_time = 0;
   uint32_t pending_retirements = 0;
   bool memory_idle = false;
+  uint64_t memory_idle_time = 0;
+  uint64_t terminal_uid = 0;
+  bool terminal_stopped = false;
+  uint64_t terminal_time = 0;
+  uint64_t latest_memory_time = 0;
+  uint32_t pending_writebacks = 0;
+  std::optional<uint64_t> closed_at;
 };
 
 struct PlannedObservation {
@@ -108,13 +116,24 @@ class Bridge {
 public:
   Configuration configuration;
   NativeSink sink;
+  NativeVerifier verifier;
   NativeCapture capture;
   bool finished = false;
   bool failed = false;
   uint32_t hart_count = 0;
+  std::optional<uint64_t> completed_cycle;
   size_t observations = 0;
   std::map<uint32_t, Hart> harts;
   std::map<rvwmo::OperationId, Instruction> instructions;
+
+  void reject_transport() {
+    failed = true;
+    capture.summary.malformed_transport = true;
+    capture.summary.incomplete = true;
+    if (capture.summary.verification && capture.summary.verification->check.status == rvwmo::CheckStatus::Pass)
+      capture.summary.verification = NativeVerification{
+          {rvwmo::CheckStatus::Invalid, 0, "native observation rejected after a finalized verdict"}, false};
+  }
 
   void require(bool condition, const char *message) const {
     if (!condition)
@@ -183,7 +202,8 @@ public:
         const auto producer = rvwmo::hart_producer_id(index);
         configuration.harts.push_back({index, producer, producer, producer});
       }
-      configuration.publication_producers = {rvwmo::memory_fabric_producer_id()};
+      for (uint32_t index = 0; index < count; ++index)
+        configuration.publication_producers.push_back(rvwmo::memory_fabric_producer_id(index));
     }
     require(configuration.harts.size() == count, "installed sink roster differs from native hart count");
     require(std::any_of(configuration.harts.begin(), configuration.harts.end(),
@@ -205,6 +225,8 @@ public:
   void allocate(const rvwmo::OperationId &id, uint32_t number, uint64_t time, uint64_t pc,
                 uint32_t raw, uint32_t length, uint32_t expanded) {
     auto &state = hart(id.hart);
+    require(!state.closed_at && !completed_cycle, "allocation delivered after the native hart was sealed");
+    state.latest_core_time = std::max(state.latest_core_time, time);
     record("ALLOCATE", id.hart, id.epoch, id.uid, number, time, pc, raw, length, expanded);
     require(id.uid && id.epoch && number, "allocation epoch/UID/attempt must be nonzero");
     require((pc & 1) == 0, "native allocation PC is not halfword aligned");
@@ -254,6 +276,9 @@ public:
   }
 
   void retire(const NativeRetirementFact &fact) {
+    auto &source = hart(fact.id.hart);
+    require(!source.closed_at && !completed_cycle, "retirement delivered after the native hart was sealed");
+    source.latest_core_time = std::max(source.latest_core_time, fact.source_time);
     auto &live = instruction(fact.id);
     auto &execution = attempt(fact.id, fact.attempt, fact.source_time);
     require(!execution.cancelled && !live.retirement && !live.trapped, "duplicate, cancelled or trapped retirement");
@@ -272,6 +297,9 @@ public:
   }
 
   void cancel(const rvwmo::OperationId &id, uint32_t number, uint64_t time, uint32_t reason) {
+    auto &source = hart(id.hart);
+    require(!source.closed_at && !completed_cycle, "cancellation delivered after the native hart was sealed");
+    source.latest_core_time = std::max(source.latest_core_time, time);
     auto &live = instruction(id);
     auto &execution = attempt(id, number, time);
     require(reason == 1 || reason == 2, "unknown native cancellation reason");
@@ -291,6 +319,9 @@ public:
 
   void memory(NativeMemoryFact fact) {
     hart(fact.id.hart);
+    require(!completed_cycle, "memory observation delivered after the terminal source prefix");
+    auto &source = hart(fact.id.hart);
+    source.latest_memory_time = std::max(source.latest_memory_time, fact.source_time);
     require(fact.kind >= 1 && fact.kind <= 3, "unknown native memory observation kind");
     require(fact.mask && !(fact.mask & ~0xffu) && !(fact.address & 7), "invalid aligned memory byte mask/address");
     require(!(fact.flags & ~kKnownMemoryFlags), "unknown native memory flags");
@@ -375,8 +406,7 @@ public:
     } else {
       gap("PTW/internal memory facts are diagnostic and have no fake instruction allocation");
     }
-    if (fact.kind == 2)
-      gap("physical SRAM store drain is an unqualified publication candidate, not StorePublish");
+
     if (fact.flags & 1)
       gap("atomic/LRSC memory requires a complete supported atomic lifecycle");
     if (fact.flags & 2)
@@ -417,7 +447,9 @@ public:
   }
 
   void trap(const NativeTrapFact &fact) {
-    hart(fact.id.hart);
+    auto &source = hart(fact.id.hart);
+    require(!source.closed_at && !completed_cycle, "trap delivered after the native hart was sealed");
+    source.latest_core_time = std::max(source.latest_core_time, fact.source_time);
     require(fact.id.epoch && fact.privilege <= 3 && fact.target_privilege <= 3,
             "invalid native trap epoch/privilege");
     if (fact.id.uid) {
@@ -438,6 +470,101 @@ public:
            fact.cause, fact.interrupt, fact.tval, fact.target_pc, fact.privilege, fact.target_privilege);
   }
 
+  void coherent_drain(const NativeCoherenceFact &fact) {
+    hart(fact.id.hart);
+    require(!completed_cycle, "coherence observation delivered after the terminal source prefix");
+    auto &source = hart(fact.id.hart);
+    source.latest_memory_time = std::max(source.latest_memory_time, fact.source_time);
+    require(!(fact.address & 7) && !(fact.proof_flags & ~0x1fu) && (fact.source_time & 1) &&
+                fact.cache_set < 64 && fact.cache_way < 8,
+            "coherent drain record has an invalid source position, address or proof shape");
+    if (fact.proof_flags == 0x1f) {
+      require(fact.id.epoch && fact.id.uid && fact.attempt &&
+                  (fact.coherence_state == 2 || fact.coherence_state == 6) && fact.grant_time &&
+                  fact.grant_time < fact.source_time,
+              "coherent drain proof lacks the fixed four-hart ownership/write evidence");
+    } else {
+      require(!(fact.proof_flags & 1u), "ordinary coherent drain has incomplete ownership/write evidence");
+      gap("coherence monitor retained a drain outside the ordinary scalar proof");
+    }
+    require(hart_count == 4, "coherent publication proof requires the audited four-hart profile");
+    require(std::none_of(capture.coherence_facts.begin(), capture.coherence_facts.end(), [&](const auto &previous) {
+      return previous.id == fact.id && previous.attempt == fact.attempt;
+    }), "duplicate coherent drain proof");
+    // The two source monitors run in separate SV processes. Match their facts
+    // after delivery, without assuming which DPI callback arrives first.
+    capture.coherence_facts.push_back(fact);
+    record("COHERENT_DRAIN", fact.id.hart, fact.id.epoch, fact.id.uid, fact.attempt,
+           fact.source_time, fact.address, fact.cache_set, fact.cache_way,
+           fact.coherence_state, fact.grant_time, fact.proof_flags);
+  }
+
+  bool can_end() const {
+    if (!hart_count || harts.size() != hart_count || failed || completed_cycle)
+      return false;
+    for (const auto &entry : harts) {
+      const auto &source = entry.second;
+      if (!source.initialized || !source.terminal_stopped || !source.terminal_uid ||
+          source.pending_retirements || source.pending_writebacks || !source.memory_idle)
+        return false;
+    }
+    return true;
+  }
+
+  void terminal_state(uint32_t id, uint64_t time, uint64_t uid, bool stopped, uint32_t pending) {
+    auto &source = hart(id);
+    require(!source.closed_at && !completed_cycle, "terminal state delivered after the native hart was sealed");
+    require(!(time & 1) && time >= source.terminal_time && time >= source.heartbeat_time &&
+                time >= source.latest_core_time,
+            "terminal source time predates its last core observation or is not a core edge");
+    source.latest_core_time = time;
+    source.terminal_time = time;
+    source.terminal_uid = uid;
+    source.terminal_stopped = stopped;
+    source.pending_writebacks = pending;
+    if (stopped) {
+      require(source.epoch.has_value() && uid, "terminal stop has no native epoch or UID");
+      const auto &terminal = instruction({id, *source.epoch, uid, 0});
+      require(terminal.retirement && terminal.expanded_instruction == 0x10500073,
+              "terminal stop has no matching retired WFI");
+    }
+    record("TERMINAL_STATE", id, time, uid, stopped, pending);
+  }
+
+  void close_hart(uint32_t id, uint64_t time, uint64_t uid) {
+    auto &source = hart(id);
+    require(source.terminal_stopped && source.terminal_uid == uid && !source.closed_at &&
+                !source.pending_retirements && !source.pending_writebacks && source.memory_idle,
+            "native hart closure lacks a stopped, drained terminal WFI");
+    require(!(time & 1) && time >= source.terminal_time && time >= source.heartbeat_time &&
+                time >= source.latest_core_time && time > source.latest_memory_time && time > source.memory_idle_time,
+            "native hart closure predates its stopped core or memory source evidence");
+    for (const auto &entry : instructions) {
+      if (entry.first.hart != id)
+        continue;
+      const auto &live = entry.second;
+      require(live.retirement || live.trapped || live.attempts.at(live.latest_attempt).squashed,
+              "native hart closure retains an unsquashed instruction allocation");
+    }
+    source.closed_at = time;
+    record("CLOSE_HART", id, time, uid);
+  }
+
+  void close_prefix(uint64_t time) {
+    require(!completed_cycle && !(time & 1) && hart_count && harts.size() == hart_count,
+            "native prefix closure is duplicate or has an incomplete hart roster");
+    for (const auto &entry : harts) {
+      const auto &source = entry.second;
+      require(source.closed_at && *source.closed_at < time && source.memory_idle &&
+                  source.memory_idle_time > *source.closed_at && source.memory_idle_time < time &&
+                  source.terminal_time <= *source.closed_at && source.heartbeat_time <= *source.closed_at &&
+                  source.latest_memory_time <= source.memory_idle_time,
+              "native prefix closure lacks the final stopped memory-source edge");
+    }
+    completed_cycle = time;
+    record("CLOSE_PREFIX", time);
+  }
+
   void finish() {
     if (finished)
       return;
@@ -452,29 +579,69 @@ public:
       if (!entry.second.memory_idle)
         gap("native finish has no observed physical memory-idle diagnostic for every hart");
     }
-    gap("no source-prefix closure, independent REF result or qualified GMO verdict is inferred from capture");
-    capture.summary.sink_installed = static_cast<bool>(sink);
+    capture.completion.completed_cycle = completed_cycle;
+    capture.completion.all_harts_completed = completed_cycle.has_value();
+    capture.completion.observations_drained = completed_cycle.has_value();
+    capture.completion.memory_drained = completed_cycle.has_value();
+    if (!completed_cycle)
+      gap("no terminal source-prefix closure or complete memory drain was observed");
+    capture.summary.sink_installed = static_cast<bool>(sink) || static_cast<bool>(verifier);
     capture.summary.malformed_transport = failed;
     capture.summary.converted_events = capture.converted.batch.events.size();
-    if (!sink)
+    if (!sink && !verifier)
       gap("no coordinator semantic sink installed");
     if (sink && !failed) {
       const auto result = sink(capture);
       require(static_cast<bool>(result), ("native sink rejected capture: " + result.message).c_str());
     }
-    std::cout << "[Difftest-S] Incomplete: captured allocations=" << capture.summary.allocations
+    capture.summary.incomplete = failed || !completed_cycle || !capture.summary.gaps.empty();
+    const char *verdict = "Incomplete";
+    if (verifier && !failed) {
+      auto result = verifier(capture);
+      if (result.check.status == rvwmo::CheckStatus::Pass &&
+          (!result.finalized || capture.summary.incomplete))
+        result.check = {rvwmo::CheckStatus::Incomplete, 0,
+                        "native verifier lacks complete capture evidence or a finalized public session"};
+      if (result.check.status == rvwmo::CheckStatus::Pending)
+        result.check.status = rvwmo::CheckStatus::Incomplete;
+      capture.summary.verification = result;
+      switch (result.check.status) {
+      case rvwmo::CheckStatus::Pass: verdict = "Pass"; break;
+      case rvwmo::CheckStatus::Violation: verdict = "Violation"; break;
+      case rvwmo::CheckStatus::Unsupported: verdict = "Unsupported"; break;
+      case rvwmo::CheckStatus::Invalid: verdict = "Invalid"; break;
+      default: verdict = "Incomplete"; break;
+      }
+      capture.summary.incomplete = result.check.status != rvwmo::CheckStatus::Pass;
+      if (!result.check.message.empty())
+        std::cout << "[Difftest-S] detail: " << result.check.message << '\n';
+    }
+    std::cout << "[Difftest-S] " << verdict << ": captured allocations=" << capture.summary.allocations
               << " retries=" << capture.summary.retries << " retirements=" << capture.summary.retirements
               << " memory=" << capture.summary.memory_records << " traps=" << capture.summary.traps
-              << " converted=" << capture.summary.converted_events << " sink=" << (sink ? "installed" : "absent")
+              << " converted=" << capture.summary.converted_events << " sink="
+              << (capture.summary.sink_installed ? "installed" : "absent")
               << " unresolved=" << capture.summary.gaps.size() << '\n';
     for (const auto &message : capture.summary.gaps)
       std::cout << "[Difftest-S] gap: " << message << '\n';
-    trace("FINISH\tIncomplete");
+    for (const auto &entry : harts) {
+      const uint32_t hart_id = entry.first;
+      const auto retired = std::count_if(capture.retirement_facts.begin(), capture.retirement_facts.end(),
+                                        [hart_id](const auto &fact) { return fact.id.hart == hart_id; });
+      const auto samples = std::count_if(capture.memory_facts.begin(), capture.memory_facts.end(),
+                                        [hart_id](const auto &fact) { return fact.id.hart == hart_id && fact.kind == 3; });
+      const auto publications = std::count_if(capture.coherence_facts.begin(), capture.coherence_facts.end(),
+                                             [hart_id](const auto &fact) { return fact.id.hart == hart_id && fact.proof_flags == 0x1f; });
+      std::cout << "[BP-CHECK] hart=" << hart_id << " retirements=" << retired << " load_samples=" << samples
+                << " coherent_stores=" << publications << " sealed=" << entry.second.closed_at.has_value() << '\n';
+    }
+    trace(std::string("FINISH\t") + verdict);
   }
 
 private:
   bool trace_checked_ = false;
   std::ofstream trace_;
+  uint64_t publication_transaction_ = 0;
 
   const HartChannels &channels(uint32_t id) const {
     return *std::find_if(configuration.harts.begin(), configuration.harts.end(),
@@ -515,6 +682,13 @@ private:
       if (previous == stop_at.end() || time < previous->second)
         stop_at[id] = time;
     };
+    for (const auto &proof : capture.coherence_facts) {
+      const auto match = std::find_if(capture.memory_facts.begin(), capture.memory_facts.end(), [&](const auto &fact) {
+        return fact.kind == 2 && fact.id == proof.id && fact.attempt == proof.attempt &&
+               fact.source_time == proof.source_time && fact.address == proof.address;
+      });
+      require(match != capture.memory_facts.end(), "coherent proof has no exact physical drain fact");
+    }
     for (const auto &entry : instructions) {
       const auto &id = entry.first;
       const auto &live = entry.second;
@@ -530,6 +704,38 @@ private:
         const auto &execution = attempt_entry.second;
         if (execution.store && !execution.drained)
           gap("store-buffer input has no matching physical drain candidate");
+        if (execution.drained) {
+          const auto proof = std::find_if(capture.coherence_facts.begin(), capture.coherence_facts.end(),
+              [&](const auto &fact) { return fact.id == id && fact.attempt == attempt_entry.first &&
+                                            fact.source_time == execution.drained_at &&
+                                            execution.store && fact.address == execution.store->address; });
+          if (proof == capture.coherence_facts.end()) {
+            gap("physical SRAM store drain is an unqualified publication candidate, not StorePublish");
+          } else if (proof->proof_flags != 0x1f || (execution.memory_flags & ~uint32_t{1u << 3})) {
+            gap("coherent drain belongs to an unsupported memory lifecycle");
+          } else if (!live.retirement || live.retirement->attempt != attempt_entry.first || execution.cancelled) {
+            gap("coherent physical store drain has no final committed instruction");
+          } else {
+            require(configuration.publication_producers.size() == hart_count,
+                    "coherent publication requires one factual cache source per hart");
+            const auto &store = *execution.store;
+            const auto span = scalar_span(store.mask);
+            const auto producer = configuration.publication_producers.at(id.hart);
+            rvwmo::StorePublishEvent publish;
+            publish.address = store.address + span.first;
+            publish.bytes = span_bytes(store.aligned_data, span);
+            publish.byte_mask.assign(span.size, 1);
+            publish.byte_writers.assign(span.size, id);
+            // Transaction IDs identify actual per-instruction drains and do not
+            // establish an order among simultaneous cache producers.
+            publish.transaction_id = ++publication_transaction_;
+            planned.push_back({id.hart, proof->source_time, producer, false,
+                [publish, id](Adapter &target, const Origin &origin) mutable {
+                  publish.members = {{id, origin.source}};
+                  return target.publish_store(origin, publish);
+                }});
+          }
+        }
         if (execution.sample && scalar_sample(*execution.sample)) {
           const auto load = sample(*execution.sample);
           const auto time = execution.sample->forwarded_mask ? execution.sample->forwarding_time : execution.sample->array_time;
@@ -577,7 +783,7 @@ private:
                                    architectural_load_bytes(fact.write_data, execution.sample->mask)});
         } else {
           retired.loads.push_back({id, fact.attempt, load.actual_bytes});
-          gap("x0 load has sample-only actual bytes and no architectural register-writeback cross-check");
+
         }
       } else if (is_store(live.expanded_instruction)) {
         if (!execution.store || (execution.store->flags & ~uint32_t{1u << 3})) {
@@ -640,10 +846,37 @@ private:
       if (observation.stops_hart)
         blocked.insert(observation.hart);
     }
-    capture.converted = adapter.take_output();
+    if (completed_cycle) {
+      std::set<uint32_t> producers;
+      for (const auto &channel : configuration.harts) {
+        producers.insert(channel.instruction);
+        producers.insert(channel.memory);
+        producers.insert(channel.control);
+      }
+      producers.insert(configuration.publication_producers.begin(), configuration.publication_producers.end());
+      for (uint32_t producer : producers) {
+        const auto closed = adapter.close_prefix({producer, rvwmo::SourcePosition::end_of_cycle(*completed_cycle)});
+        if (!closed)
+          gap("native source prefix cannot close converted events: " + closed.message);
+        // Deliver each watermark before trying the next producer; this is
+        // adapter delivery, never a hardware relative-order witness.
+        auto output = adapter.take_output();
+        capture.converted.batch.events.insert(capture.converted.batch.events.end(),
+            output.batch.events.begin(), output.batch.events.end());
+        capture.converted.batch.watermarks.insert(capture.converted.batch.watermarks.end(),
+            output.batch.watermarks.begin(), output.batch.watermarks.end());
+        capture.converted.retirements.insert(capture.converted.retirements.end(),
+            output.retirements.begin(), output.retirements.end());
+        capture.converted.diagnostics.insert(capture.converted.diagnostics.end(),
+            output.diagnostics.begin(), output.diagnostics.end());
+      }
+    } else {
+      capture.converted = adapter.take_output();
+    }
     for (const auto &diagnostic : capture.converted.diagnostics)
       gap(diagnostic.message);
     const auto pending = adapter.pending();
+    capture.completion.pending = pending;
     if (pending.instructions || pending.writebacks || pending.load_samples)
       gap("converted capture retains pending instruction, writeback or load-sample state");
     if (pending.unpublished_stores)
@@ -667,13 +900,11 @@ template <typename Function> int invoke(const char *name, Function action, bool 
     return state.failed ? 1 : 0;
   } catch (const std::exception &error) {
     auto &state = bridge();
-    state.failed = true;
-    state.capture.summary.malformed_transport = true;
+    state.reject_transport();
     std::cerr << "[Difftest-S] rejected " << name << ": " << error.what() << '\n';
     return 1;
   } catch (...) {
-    bridge().failed = true;
-    bridge().capture.summary.malformed_transport = true;
+    bridge().reject_transport();
     std::cerr << "[Difftest-S] rejected " << name << ": unknown host exception\n";
     return 1;
   }
@@ -682,13 +913,25 @@ template <typename Function> int invoke(const char *name, Function action, bool 
 
 ConversionResult install_native_sink(Configuration configuration, NativeSink sink) {
   auto &state = bridge();
-  if (state.hart_count || state.finished || !sink)
+  if (state.hart_count || state.finished || !sink || state.sink || state.verifier)
     return {ConversionStatus::Invalid, "install a nonempty native sink before producer initialization"};
   Adapter check(configuration);
   if (!check.configuration())
     return check.configuration();
   state.configuration = std::move(configuration);
   state.sink = std::move(sink);
+  return {};
+}
+
+ConversionResult install_native_verifier(Configuration configuration, NativeVerifier verifier) {
+  auto &state = bridge();
+  if (state.hart_count || state.finished || !verifier || state.sink || state.verifier)
+    return {ConversionStatus::Invalid, "install one native verifier before producer initialization"};
+  Adapter check(configuration);
+  if (!check.configuration())
+    return check.configuration();
+  state.configuration = std::move(configuration);
+  state.verifier = std::move(verifier);
   return {};
 }
 
@@ -747,18 +990,56 @@ extern "C" int bp_difftest_s_forward_byte(uint32_t hart, uint64_t epoch, uint64_
 extern "C" int bp_difftest_s_heartbeat(uint32_t hart, uint64_t time, uint32_t pending) {
   return blackparrot::invoke("heartbeat", [&](auto &state) {
     auto &source = state.hart(hart);
+    state.require(!source.closed_at && !state.completed_cycle, "heartbeat delivered after native source seal");
     state.require(time >= source.heartbeat_time, "hart heartbeat source time regressed");
-    source.heartbeat_time = time; source.pending_retirements = pending;
+    source.heartbeat_time = time;
+    source.latest_core_time = std::max(source.latest_core_time, time);
+    source.pending_retirements = pending;
     state.record("HEARTBEAT", hart, time, pending);
   });
 }
 extern "C" int bp_difftest_s_memory_idle(uint32_t hart, uint64_t time, uint32_t idle) {
   return blackparrot::invoke("memory_idle", [&](auto &state) {
     state.require(idle <= 1, "invalid physical memory-idle flag");
-    state.hart(hart).memory_idle = idle != 0;
+    auto &source = state.hart(hart);
+    state.require(!state.completed_cycle, "memory observation delivered after the terminal source prefix");
+    state.require(time >= source.memory_idle_time && time >= source.latest_memory_time,
+                  "memory-idle source time predates its last memory observation");
+    source.memory_idle = idle != 0;
+    source.memory_idle_time = time;
     state.record("MEMORY_IDLE", hart, time, idle);
   });
 }
+extern "C" int bp_difftest_s_coherent_drain(uint32_t hart, uint64_t epoch, uint64_t uid, uint32_t attempt,
+                                              uint64_t time, uint64_t address, uint32_t cache_set,
+                                              uint32_t cache_way, uint32_t state, uint64_t grant_time,
+                                              uint32_t proof_flags) {
+  return blackparrot::invoke("coherent_drain", [&](auto &bridge) {
+    bridge.coherent_drain({{hart, epoch, uid, 0}, attempt, time, address, cache_set, cache_way,
+                           state, grant_time, proof_flags});
+  });
+}
+extern "C" int bp_difftest_s_terminal_state(uint32_t hart, uint64_t time, uint64_t uid,
+                                              uint32_t stopped, uint32_t pending) {
+  return blackparrot::invoke("terminal_state", [&](auto &state) {
+    state.require(stopped <= 1, "invalid terminal stopped flag");
+    state.terminal_state(hart, time, uid, stopped != 0, pending);
+  });
+}
+extern "C" int bp_difftest_s_can_end() {
+  return blackparrot::bridge().can_end() ? 1 : 0;
+}
+extern "C" int bp_difftest_s_close_hart(uint32_t hart, uint64_t time, uint64_t uid) {
+  return blackparrot::invoke("close_hart", [&](auto &state) { state.close_hart(hart, time, uid); });
+}
+extern "C" int bp_difftest_s_close_prefix(uint64_t time) {
+  return blackparrot::invoke("close_prefix", [&](auto &state) { state.close_prefix(time); });
+}
+
 extern "C" int bp_difftest_s_finish() {
-  return blackparrot::invoke("finish", [](auto &state) { state.finish(); }, true);
+  const int transport = blackparrot::invoke("finish", [](auto &state) { state.finish(); }, true);
+  if (transport)
+    return transport;
+  const auto &verification = blackparrot::last_native_capture().summary.verification;
+  return verification && (verification->check.status != rvwmo::CheckStatus::Pass || !verification->finalized) ? 2 : 0;
 }
