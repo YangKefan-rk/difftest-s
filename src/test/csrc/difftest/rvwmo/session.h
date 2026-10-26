@@ -91,13 +91,14 @@ public:
   const std::map<uint32_t, CheckMemoryStatistics> &memory_statistics() const { return consumer_.memory_statistics(); }
 
 private:
-  struct ReadGroup {
+  struct MemoryGroup {
     size_t remaining = 0;
     ObservationTime time;
+    bool independent_effects = false;
   };
   struct PendingEvent {
     RuntimeEvent event;
-    std::shared_ptr<ReadGroup> read_group;
+    std::shared_ptr<MemoryGroup> memory_group;
   };
   struct ReferenceRecord {
     std::vector<ReferenceStoreValue> stores;
@@ -123,8 +124,8 @@ private:
   static bool is_memory_event(const RuntimeEvent &event);
   std::optional<ObservationTime> resolve_current_rank(const RuntimeEvent &event) const;
   CheckResult collect_closed_events();
-  CheckResult classify_read_groups(const std::vector<RuntimeEvent> &events,
-                                   std::vector<std::shared_ptr<ReadGroup>> &groups) const;
+  CheckResult classify_memory_groups(const std::vector<RuntimeEvent> &events,
+                                     std::vector<std::shared_ptr<MemoryGroup>> &groups) const;
   CheckResult ensure_statistics_hart(uint32_t hart);
   CheckResult consume_pending_events();
   CheckResult consume_retirement(const RuntimeEvent &event, const InstructionRetireEvent &retirement);

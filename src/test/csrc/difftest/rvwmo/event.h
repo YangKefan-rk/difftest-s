@@ -38,6 +38,9 @@ struct ObservationTime {
   // Internal certificate for loads sampling one source-closed read-only prefix.
   // It does not assert an order between equal-rank group members.
   bool unordered_read_group = false;
+  // Independent effects commute on their enabled bytes; this certificate
+  // preserves a partial order without inventing order inside the group.
+  bool unordered_effect_group = false;
 };
 
 enum class CheckStatus {
