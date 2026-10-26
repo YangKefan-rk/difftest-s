@@ -92,3 +92,16 @@ independent reference state, closed fabric/transport prefixes and native workloa
 completion. Hart park, an empty STQ or a successful host conversion is not that
 verdict. Scalar integer RAM is the current generic path; unsupported architectural
 state, atomics/LRSC, split access, FP/vector, trap and MMIO must not be dropped.
+
+## WFI retirement
+
+An actually retired `WFI` (`0x10500073`) has no scalar register or CSR write;
+its PC, raw instruction and absence of a GPR result are checked through the
+ordinary reference step. The validated scope is M-mode with no pending
+interrupt. Other system instructions, CSR effects and trap/interrupt handling
+retain their explicit coverage limits.
+
+WFI retirement does not complete a hart or close any source prefix. BOOM may
+stall its ROB at WFI until an interrupt arrives. Seeing its execution request,
+a quiet cache or a parked program counter cannot substitute for architectural
+retirement, an explicit completion boundary, or physical and transport drain.
