@@ -527,7 +527,7 @@ CheckResult BoomEventAdapter::release_store_slot(const OperationId &id, const Sl
     return result;
   auto found = instructions_.find(id);
   if (found == instructions_.end() || !found->second.allocation.stq ||
-      found->second.allocation.stq->index != stq.index || found->second.allocation.stq->generation != stq.generation)
+      *found->second.allocation.stq != stq)
     return invalid("BOOM STQ release has no matching original allocation generation");
   if (found->second.stq_released ||
       (!found->second.store && !fence_instruction(found->second.allocation.instruction)))
