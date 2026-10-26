@@ -19,12 +19,21 @@ struct RetiredLoad {
   std::vector<uint8_t> bytes;
 };
 
+struct CheckMemoryStatistics {
+  uint64_t verified_load_operations = 0;
+  uint64_t verified_store_operations = 0;
+  // One per verified load with any enabled byte from another hart's canonical
+  // dynamic writer. Initialization and caller-provided provenance do not count.
+  uint64_t cross_hart_reads = 0;
+  uint64_t store_audits = 0;
+};
+
 // Event transport and REF execution remain outside this class. Provisional
 // store bytes may advance candidate memory state, but cannot earn a final pass
 // until independently computed REF stores have verified every provisional write.
 class Checker {
 public:
-  explicit Checker(Memory &memory) : memory_(memory) {}
+  explicit Checker(Memory &memory, size_t max_statistics_harts = 4096);
   // Allocates a collision-free MemoryWriter for full epoch/UID/subaccess identity.
   CheckResult memory_writer(const OperationId &operation, MemoryWriter &writer);
   CheckResult record_store(const MemoryStore &store, const MemoryOperation &operation,
@@ -67,6 +76,7 @@ public:
     return loads_.size();
   }
   static OperationId initialization_writer(uint64_t byte_address);
+  const std::map<uint32_t, CheckMemoryStatistics> &memory_statistics() const { return memory_statistics_; }
 
 private:
   struct LoadSample {
@@ -79,6 +89,8 @@ private:
   };
   using LoadKey = std::pair<OperationId, uint32_t>;
   Memory &memory_;
+  size_t max_statistics_harts_;
+  std::map<uint32_t, CheckMemoryStatistics> memory_statistics_;
   PpoChecker ppo_;
   LrScChecker lrsc_;
   std::map<OperationId, StoreConditionalEvidence> sc_evidence_;
@@ -100,6 +112,8 @@ private:
   CheckResult drain(uint32_t hart);
   CheckResult prepare(Retirement &retirement);
   CheckResult require_verified_sources(const MemorySnapshot &snapshot) const;
+  CheckResult ensure_statistics_hart(uint32_t hart);
+  CheckResult verified_memory_delta(const RetiredInstruction &instruction, CheckMemoryStatistics &delta) const;
   CheckResult remember_failure(CheckResult result);
 };
 

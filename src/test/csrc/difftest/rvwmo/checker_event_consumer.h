@@ -34,6 +34,7 @@ public:
                           const std::vector<uint8_t> &mask);
   CheckResult poll();
   CheckResult finalize();
+  const std::map<uint32_t, CheckMemoryStatistics> &memory_statistics() const { return checker_.memory_statistics(); }
 
 private:
   friend class ObservationSession;
