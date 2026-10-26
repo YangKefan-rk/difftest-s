@@ -15,7 +15,10 @@ namespace blackparrot {
 class HostSessionAdapter {
 public:
   explicit HostSessionAdapter(rvwmo::HostSession &session);
+  // Single-batch path; the caller must keep the capture within stream capacity.
   rvwmo::SessionSubmitResult submit(const NativeCapture &capture);
+  // One-shot terminal replay in bounded event batches. NativeCapture stays resident.
+  rvwmo::SessionSubmitResult submit_complete_capture(const NativeCapture &capture);
   rvwmo::SessionSubmitResult submit_closed(
       const rvwmo::EventBatch &batch, const std::vector<rvwmo::ArchitecturalRetirement> &retirements);
   rvwmo::CheckResult finalize(const NativeCompletionEvidence &evidence);
