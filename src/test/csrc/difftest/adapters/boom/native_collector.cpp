@@ -301,8 +301,9 @@ CheckResult NativeCollector::take_ready(CollectedObservations &output) {
   });
   CollectedObservations ready;
   std::map<OperationId, SourcePosition> retirement_positions;
-  std::map<uint64_t, size_t> memory_per_cycle;
   uint64_t next_sequence = emitted_sequence_;
+  // The shared session certifies concurrent read prefixes and checks PPO ties.
+  // This producer sequence preserves delivery identity, not subcycle GMO order.
   for (const auto &event : staged_events_) {
     if (event.source.cycle > through)
       continue;
@@ -311,8 +312,6 @@ CheckResult NativeCollector::take_ready(CollectedObservations &output) {
       if (next_sequence == std::numeric_limits<uint64_t>::max())
         return remember_failure(invalid("BOOM public source sequence exhausted"));
       converted.source.producer_sequence = ++next_sequence;
-      if (event.kind == RuntimeEventKind::LoadSample && ++memory_per_cycle[event.source.cycle] > 1)
-        return remember_failure(incomplete("BOOM simultaneous local load samples lack relative source order"));
     }
     if (event.kind == RuntimeEventKind::InstructionRetire) {
       const auto &retired = std::get<InstructionRetireEvent>(event.payload).instruction;

@@ -44,8 +44,12 @@ does not consume a public producer sequence. `take_ready` releases a safe source
 prefix in cycle order and then assigns strictly increasing hart-channel
 sequences. An unresolved attempt keeps its possible sample cycle open. Sequence
 numbers only organize one source channel; they do not qualify order between
-independent channels. Simultaneous local load samples without a supported order
-representation remain Incomplete.
+independent channels. The shared session's certified read-prefix contract
+handles simultaneous local load samples without inventing their relative order.
+It returns Incomplete when PPO requires strict order inside an unresolved prefix;
+a true observed rank inversion remains a Violation. Build every C++ checker and
+stepper object against that same public contract, including its internal
+timestamp certificates.
 
 `core.retire` is paired with the independent `lsu.retire_load` address, final
 attempt and `retire_load_data`. Physical predicated-off retirements validate
