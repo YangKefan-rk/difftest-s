@@ -169,6 +169,10 @@ RetirementResultCoverage retirement_coverage(uint32_t instruction, IntegerDestin
     return RetirementResultCoverage::FloatingFlagsNeedComparator;
   if (csr_instruction(instruction))
     return RetirementResultCoverage::CsrStateNeedsComparator;
+  // A retired WFI has no scalar register or CSR write. Trap/interrupt handling
+  // and proof of native completion remain separate lifecycle obligations.
+  if (instruction == 0x10500073)
+    return RetirementResultCoverage::Complete;
   if ((instruction & 0x7f) == 0x73)
     return RetirementResultCoverage::SystemStateNeedsComparator;
   return RetirementResultCoverage::Complete;
