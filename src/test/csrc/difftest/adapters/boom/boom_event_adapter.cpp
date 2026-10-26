@@ -488,8 +488,18 @@ CheckResult BoomEventAdapter::commit_store(const StoreCommit &record) {
   auto found = instructions_.find(record.id);
   if (found == instructions_.end() || !found->second.allocation.stq ||
       found->second.store || found->second.allocation.stq->index != record.stq.index ||
-      found->second.allocation.stq->generation != record.stq.generation)
-    return invalid("BOOM store commit has no matching live STQ instruction or is duplicated");
+      found->second.allocation.stq->generation != record.stq.generation) {
+    std::string message = "BOOM store commit has no matching live STQ instruction or is duplicated";
+    if (found == instructions_.end()) message += " missing-id";
+    else {
+      message += " retired=" + std::to_string(found->second.retired ? 1 : 0);
+      message += " store=" + std::to_string(found->second.store ? 1 : 0);
+      message += " alloc=" + std::to_string(found->second.allocation.stq ? found->second.allocation.stq->index : 9999);
+      message += ":" + std::to_string(found->second.allocation.stq ? found->second.allocation.stq->generation : 0);
+      message += " record=" + std::to_string(record.stq.index) + ":" + std::to_string(record.stq.generation);
+    }
+    return {CheckStatus::Invalid, 0, std::move(message)};
+  }
   if (found->second.unsupported_memory)
     return unsupported("BOOM committed memory instruction exceeds the scalar consumer profile");
   if (fence_instruction(found->second.allocation.instruction))
