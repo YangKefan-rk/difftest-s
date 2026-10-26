@@ -21,6 +21,7 @@ public:
   rvwmo::SessionSubmitResult submit_complete_capture(const NativeCapture &capture);
   rvwmo::SessionSubmitResult submit_closed(
       const rvwmo::EventBatch &batch, const std::vector<rvwmo::ArchitecturalRetirement> &retirements);
+  rvwmo::CheckResult poll();
   rvwmo::CheckResult finalize(const NativeCompletionEvidence &evidence);
   rvwmo::CheckResult report_source_failure(rvwmo::CheckResult failure);
   bool finalized() const { return finalized_; }
@@ -37,6 +38,7 @@ private:
 
 // The adapter and its borrowed public host must outlive the native simulation.
 ConversionResult install_native_host_session(Configuration configuration, HostSessionAdapter &adapter);
+ConversionResult install_native_online_session(Configuration configuration, HostSessionAdapter &adapter);
 
 } // namespace blackparrot
 

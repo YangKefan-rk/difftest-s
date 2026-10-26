@@ -33,6 +33,9 @@ struct Configuration {
   // Session-long exact transaction deduplication. Exhaustion is Unsupported;
   // history is never silently evicted or reused as a new publication.
   size_t max_publication_transactions = 65536;
+  // Online native source IDs increase per publication producer. The monotonic
+  // frontier detects reuse without retaining lifetime transaction history.
+  bool monotonic_publication_transactions = false;
 };
 
 enum class ConversionStatus { Accepted, Waiting, Incomplete, Invalid, Unsupported };

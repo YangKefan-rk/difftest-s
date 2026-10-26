@@ -77,6 +77,12 @@ rvwmo::SessionSubmitResult HostSessionAdapter::submit_closed(
   return result;
 }
 
+rvwmo::CheckResult HostSessionAdapter::poll() {
+  if (!failure_)
+    return failure_;
+  return session_.poll();
+}
+
 rvwmo::CheckResult HostSessionAdapter::finalize(const NativeCompletionEvidence &evidence) {
   finalized_ = false;
   if (!failure_)
@@ -125,6 +131,28 @@ ConversionResult install_native_host_session(Configuration configuration, HostSe
     const auto result = adapter.finalize(capture.completion);
     return NativeVerification{result, adapter.finalized()};
   }, [&adapter](const rvwmo::CheckResult &failure) { adapter.report_source_failure(failure); });
+}
+
+ConversionResult install_native_online_session(Configuration configuration, HostSessionAdapter &adapter) {
+  return install_native_online_verifier(std::move(configuration),
+      [&adapter](const ConvertedOutput &converted) {
+        std::vector<rvwmo::ArchitecturalRetirement> snapshots;
+        const auto mapped = capture_architectural_retirements(converted, snapshots);
+        if (!mapped) {
+          rvwmo::SessionSubmitResult result;
+          result.check = adapter.report_source_failure(mapped);
+          return result;
+        }
+        return adapter.submit_closed(converted.batch, snapshots);
+      },
+      [&adapter](const NativeCapture &capture) {
+        if (!capture.summary.gaps.empty())
+          return NativeVerification{adapter.report_source_failure(
+              {rvwmo::CheckStatus::Incomplete, 0, capture.summary.gaps.front()}), false};
+        const auto result = adapter.finalize(capture.completion);
+        return NativeVerification{result, adapter.finalized()};
+      },
+      [&adapter](const rvwmo::CheckResult &failure) { adapter.report_source_failure(failure); });
 }
 
 } // namespace blackparrot

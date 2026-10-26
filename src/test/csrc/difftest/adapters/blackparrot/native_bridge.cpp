@@ -1,5 +1,6 @@
 #include "native_bridge.h"
 #include "cache_geometry.h"
+#include "load_order.h"
 #include "../../rvwmo/producer_ids.h"
 #include <algorithm>
 #include <cstdlib>
@@ -17,6 +18,7 @@ namespace blackparrot {
 namespace {
 constexpr size_t kMaximumInstructions = 65536;
 constexpr size_t kMaximumObservations = 1048576;
+constexpr size_t kMaximumOnlinePrefixEvents = 32768;
 constexpr uint32_t kKnownMemoryFlags = 0x3f;
 constexpr uint32_t kInternalMemoryFlag = 1u << 2;
 using DrainKey = std::tuple<rvwmo::OperationId, uint32_t, uint64_t, uint64_t>;
@@ -48,6 +50,10 @@ struct Instruction {
   std::map<uint32_t, Attempt> attempts;
   std::optional<NativeRetirementFact> retirement;
   bool trapped = false;
+  bool staged = false;
+  bool allocation_staged = false;
+  uint64_t last_fact_time = 0;
+  std::optional<LoadOrderCertificate> load_order;
 };
 
 struct Hart {
@@ -66,6 +72,10 @@ struct Hart {
   uint64_t latest_memory_time = 0;
   uint32_t pending_writebacks = 0;
   std::optional<uint64_t> closed_at;
+  std::optional<rvwmo::OperationId> retired_wfi;
+  uint64_t retirements = 0;
+  uint64_t load_samples = 0;
+  uint64_t coherent_stores = 0;
 };
 
 struct PlannedObservation {
@@ -123,11 +133,21 @@ public:
   Configuration configuration;
   NativeSink sink;
   NativeVerifier verifier;
+  NativePrefixConsumer prefix_consumer;
+  std::unique_ptr<Adapter> online_adapter;
+  rvwmo::CheckResult online_result;
+  std::optional<uint64_t> delivery_barrier;
+  std::optional<uint64_t> online_closed;
+  std::map<uint32_t, uint64_t> online_sequences;
+  std::map<uint64_t, std::vector<PlannedObservation>> online_observations;
+  ConvertedOutput online_batch;
+  LoadOrderValidator load_orders;
   NativeFailureObserver failure_observer;
   bool notifying_failure = false;
   NativeCapture capture;
   bool finished = false;
   bool failed = false;
+  bool online_failure_reported = false;
   uint32_t hart_count = 0;
   std::optional<uint64_t> completed_cycle;
   size_t observations = 0;
@@ -143,6 +163,11 @@ public:
     capture.summary.malformed_transport = true;
     capture.summary.incomplete = true;
     const rvwmo::CheckResult failure{rvwmo::CheckStatus::Invalid, 0, message};
+    if (online_adapter) {
+      remember_online_failure(failure);
+      capture.summary.verification = NativeVerification{online_result, false};
+      return;
+    }
     if (capture.summary.verification && capture.summary.verification->check.status == rvwmo::CheckStatus::Pass)
       capture.summary.verification = NativeVerification{failure, false};
     if (!first_failure || !failure_observer)
@@ -168,7 +193,8 @@ public:
   }
 
   template <typename... Fields> void record(const char *kind, const Fields &...fields) {
-    require(observations < kMaximumObservations, "native observation buffer limit reached");
+    require(online_adapter || observations < kMaximumObservations, "native observation buffer limit reached");
+    require(observations != std::numeric_limits<size_t>::max(), "native observation counter exhausted");
     ++observations;
     auto *output = trace_stream();
     if (!output)
@@ -263,11 +289,13 @@ public:
                   live.expanded_instruction == expanded,
               "retry changed its stable raw instruction identity");
       require(time >= live.attempts.at(live.latest_attempt).cancelled_at, "retry source time predates cancellation");
+      require(!online_closed || time > *online_closed, "retry allocation arrived inside a closed online prefix");
       live.latest_attempt = number;
       live.attempts.emplace(number, Attempt{}).first->second.allocated_at = time;
       ++capture.summary.retries;
     } else {
       require(instructions.size() < kMaximumInstructions, "native instruction buffer limit reached");
+      require(!online_closed || time > *online_closed, "allocation arrived inside a closed online prefix");
       require(number == 1, "first allocation must use attempt one");
       if (state.epoch && *state.epoch != id.epoch) {
         require(state.reset_pending && id.epoch > *state.epoch, "epoch changed without a native reset boundary");
@@ -282,9 +310,19 @@ public:
       live.allocation = {id, pc, raw, static_cast<uint8_t>(length)};
       live.expanded_instruction = expanded;
       live.allocated_at = time;
+      live.last_fact_time = time;
       live.latest_attempt = number;
       live.attempts.emplace(number, Attempt{}).first->second.allocated_at = time;
+      if (online_adapter) {
+        const auto allocation = live.allocation;
+        const auto producer = channels(id.hart).instruction;
+        online_observations[time].push_back({id.hart, time, producer, false,
+            [allocation](Adapter &target, const Origin &origin) { return target.allocate(origin, allocation); }});
+        live.allocation_staged = true;
+      }
       instructions.emplace(id, std::move(live));
+      capture.summary.live_instructions = instructions.size();
+      capture.summary.peak_live_instructions = std::max(capture.summary.peak_live_instructions, instructions.size());
       ++capture.summary.allocations;
     }
     if (!length)
@@ -304,6 +342,10 @@ public:
             "retirement differs from its stable dispatch identity");
     require(fact.rd < 32 && (!fact.write_enable || fact.rd != 0), "invalid architectural writeback destination");
     live.retirement = fact;
+    live.last_fact_time = std::max(live.last_fact_time, fact.source_time);
+    source.retired_wfi = live.expanded_instruction == 0x10500073
+        ? std::optional<rvwmo::OperationId>{fact.id} : std::nullopt;
+    ++source.retirements;
     capture.retirement_facts.push_back(fact);
     ++capture.summary.retirements;
     if (fact.fp)
@@ -318,7 +360,9 @@ public:
     source.latest_core_time = std::max(source.latest_core_time, time);
     auto &live = instruction(id);
     auto &execution = attempt(id, number, time);
+    live.last_fact_time = std::max(live.last_fact_time, time);
     require(reason == 1 || reason == 2, "unknown native cancellation reason");
+    require(!online_closed || time > *online_closed, "cancellation arrived inside a closed online prefix");
     require(!live.retirement, "cancellation names an architecturally retired instruction");
     if (reason == 1)
       require(!execution.cancelled, "duplicate execution-attempt cancellation");
@@ -347,6 +391,8 @@ public:
             "memory sampling time is later than its source observation");
     const bool internal = (fact.flags & kInternalMemoryFlag) != 0;
     if (!internal) {
+      auto &live = instruction(fact.id);
+      live.last_fact_time = std::max(live.last_fact_time, fact.source_time);
       auto &execution = attempt(fact.id, fact.attempt, fact.source_time);
       require(!execution.cancelled, "memory observation belongs to a cancelled execution attempt");
       execution.memory_flags |= fact.flags;
@@ -416,6 +462,7 @@ public:
         const auto sample_time = fact.forwarded_mask ? fact.forwarding_time : fact.array_time;
         require(!sample_time || sample_time >= execution.allocated_at, "load byte sample predates dispatch attempt");
         execution.sample = fact;
+        ++source.load_samples;
       }
     } else {
       gap("PTW/internal memory facts are diagnostic and have no fake instruction allocation");
@@ -513,6 +560,10 @@ public:
       gap("coherence monitor retained a drain outside the ordinary scalar proof");
     }
     require(hart_count == 4, "coherent publication proof requires the audited four-hart profile");
+    if (online_adapter)
+      instruction(fact.id).last_fact_time = std::max(instruction(fact.id).last_fact_time, fact.source_time);
+    if (fact.proof_flags == 0x1f)
+      ++source.coherent_stores;
     const auto key = drain_key(fact.id, fact.attempt, fact.source_time, fact.address);
     require(!coherent_drain_indices.count(key), "duplicate coherent drain proof");
     // The two source monitors run in separate SV processes. Match their facts
@@ -550,8 +601,7 @@ public:
     source.pending_writebacks = pending;
     if (stopped) {
       require(source.epoch.has_value() && uid, "terminal stop has no native epoch or UID");
-      const auto &terminal = instruction({id, *source.epoch, uid, 0});
-      require(terminal.retirement && terminal.expanded_instruction == 0x10500073,
+      require(source.retired_wfi && *source.retired_wfi == rvwmo::OperationId{id, *source.epoch, uid, 0},
               "terminal stop has no matching retired WFI");
     }
     record("TERMINAL_STATE", id, time, uid, stopped, pending);
@@ -592,12 +642,26 @@ public:
     record("CLOSE_PREFIX", time);
   }
 
+  void advance(uint64_t delivered_through) {
+    require(online_adapter != nullptr, "online source progress has no installed online session");
+    require(!delivery_barrier || delivered_through >= *delivery_barrier,
+            "online delivery barrier regressed");
+    delivery_barrier = delivered_through;
+    if (!online_result || harts.size() != configuration.harts.size())
+      return;
+    pump_online(delivered_through);
+  }
+
   void finish() {
     if (finished)
       return;
     finished = true;
-    if (!failed && hart_count)
-      convert();
+    if (!failed && hart_count) {
+      if (online_adapter)
+        finish_online();
+      else
+        convert();
+    }
     if (!hart_count)
       gap("no native producer initialized");
     for (const auto &entry : harts) {
@@ -614,7 +678,8 @@ public:
       gap("no terminal source-prefix closure or complete memory drain was observed");
     capture.summary.sink_installed = static_cast<bool>(sink) || static_cast<bool>(verifier);
     capture.summary.malformed_transport = failed;
-    capture.summary.converted_events = capture.converted.batch.events.size();
+    if (!online_adapter)
+      capture.summary.converted_events = capture.converted.batch.events.size();
     if (!sink && !verifier)
       gap("no coordinator semantic sink installed");
     if (sink && !failed) {
@@ -623,8 +688,15 @@ public:
     }
     capture.summary.incomplete = failed || !completed_cycle || !capture.summary.gaps.empty();
     const char *verdict = "Incomplete";
+    if (online_adapter && !online_result) {
+      verdict = online_result.status == rvwmo::CheckStatus::Violation ? "Violation"
+                : online_result.status == rvwmo::CheckStatus::Invalid ? "Invalid"
+                : online_result.status == rvwmo::CheckStatus::Unsupported ? "Unsupported" : "Incomplete";
+      capture.summary.verification = NativeVerification{online_result, false};
+    }
     if (verifier && !failed) {
-      auto result = verifier(capture);
+      auto result = online_adapter && !online_result
+          ? NativeVerification{online_result, false} : verifier(capture);
       if (result.check.status == rvwmo::CheckStatus::Pass &&
           (!result.finalized || capture.summary.incomplete))
         result.check = {rvwmo::CheckStatus::Incomplete, 0,
@@ -643,7 +715,8 @@ public:
       if (!result.check.message.empty())
         std::cout << "[Difftest-S] detail: " << result.check.message << '\n';
     }
-    std::cout << "[Difftest-S] " << verdict << ": captured allocations=" << capture.summary.allocations
+    if (!online_failure_reported)
+      std::cout << "[Difftest-S] " << verdict << ": captured allocations=" << capture.summary.allocations
               << " retries=" << capture.summary.retries << " retirements=" << capture.summary.retirements
               << " memory=" << capture.summary.memory_records << " traps=" << capture.summary.traps
               << " converted=" << capture.summary.converted_events << " sink="
@@ -653,12 +726,9 @@ public:
       std::cout << "[Difftest-S] gap: " << message << '\n';
     for (const auto &entry : harts) {
       const uint32_t hart_id = entry.first;
-      const auto retired = std::count_if(capture.retirement_facts.begin(), capture.retirement_facts.end(),
-                                        [hart_id](const auto &fact) { return fact.id.hart == hart_id; });
-      const auto samples = std::count_if(capture.memory_facts.begin(), capture.memory_facts.end(),
-                                        [hart_id](const auto &fact) { return fact.id.hart == hart_id && fact.kind == 3; });
-      const auto publications = std::count_if(capture.coherence_facts.begin(), capture.coherence_facts.end(),
-                                             [hart_id](const auto &fact) { return fact.id.hart == hart_id && fact.proof_flags == 0x1f; });
+      const auto retired = entry.second.retirements;
+      const auto samples = entry.second.load_samples;
+      const auto publications = entry.second.coherent_stores;
       std::cout << "[BP-CHECK] hart=" << hart_id << " retirements=" << retired << " load_samples=" << samples
                 << " coherent_stores=" << publications << " sealed=" << entry.second.closed_at.has_value() << '\n';
     }
@@ -715,17 +785,459 @@ private:
     return result;
   }
 
+  void remember_online_failure(rvwmo::CheckResult result) {
+    if (online_result.status == rvwmo::CheckStatus::Pass || online_result.status == rvwmo::CheckStatus::Pending) {
+      online_result = std::move(result);
+      const char *verdict = online_result.status == rvwmo::CheckStatus::Violation ? "Violation"
+                            : online_result.status == rvwmo::CheckStatus::Invalid ? "Invalid"
+                            : online_result.status == rvwmo::CheckStatus::Unsupported ? "Unsupported" : "Incomplete";
+      online_failure_reported = true;
+      std::cout << "[Difftest-S] " << verdict << ": online prefix rejected: " << online_result.message << '\n';
+      std::cout.flush();
+      if (failure_observer) {
+        notifying_failure = true;
+        try {
+          failure_observer(online_result);
+        } catch (...) {
+          std::cerr << "[Difftest-S] online failure observer threw; source remains rejected\n";
+        }
+        notifying_failure = false;
+      }
+    }
+  }
+
+  bool raw_instruction_complete(const rvwmo::OperationId &id, const Instruction &live) const {
+    if (!live.retirement && !live.trapped && !live.attempts.at(live.latest_attempt).squashed)
+      return false;
+    if (live.retirement && is_load(live.expanded_instruction) &&
+        !live.attempts.at(live.retirement->attempt).sample)
+      return false;
+    if (live.retirement && is_store(live.expanded_instruction) &&
+        !live.attempts.at(live.retirement->attempt).store)
+      return false;
+    for (const auto &entry : live.attempts) {
+      const auto &execution = entry.second;
+      if (execution.store && !execution.drained)
+        return false;
+      if (!execution.drained)
+        continue;
+      const auto key = drain_key(id, entry.first, execution.drained_at, execution.store->address);
+      if (!coherent_drain_indices.count(key))
+        return false;
+    }
+    for (const auto &proof : capture.coherence_facts) {
+      if (proof.id != id)
+        continue;
+      const auto drain = physical_drain_counts.find(drain_key(id, proof.attempt, proof.source_time, proof.address));
+      if (drain == physical_drain_counts.end() || drain->second != 1)
+        return false;
+    }
+    return true;
+  }
+
+  uint64_t raw_safe_frontier(uint64_t delivered_through) const {
+    uint64_t safe = delivered_through;
+    // Any delayed result, WB or proof can refer back to this allocation, so
+    // closing before the oldest unresolved allocation is conservative across
+    // every monitor. A callback barrier alone never closes such an interval.
+    for (const auto &entry : instructions) {
+      if (raw_instruction_complete(entry.first, entry.second))
+        continue;
+      const auto &active = entry.second.attempts.at(entry.second.latest_attempt);
+      // A cancelled attempt cannot later deliver a sample or retire. Preserve
+      // its UID for a possible future retry, without pinning other harts to the
+      // abandoned attempt's old allocation forever (e.g. a sleeping WFI hart).
+      if (active.cancelled && !active.store)
+        continue;
+      safe = std::min(safe, active.allocated_at ? active.allocated_at - 1 : 0);
+    }
+    return safe;
+  }
+
+  bool stage_online_instructions(uint64_t raw_safe) {
+    std::set<uint32_t> blocked_harts;
+    for (auto &entry : instructions) {
+      auto &live = entry.second;
+      if (live.staged || blocked_harts.count(entry.first.hart))
+        continue;
+      if (!raw_instruction_complete(entry.first, live) || live.last_fact_time > raw_safe) {
+        blocked_harts.insert(entry.first.hart);
+        continue;
+      }
+      if (live.trapped) {
+        remember_online_failure({rvwmo::CheckStatus::Unsupported, 0,
+                                 "online native trap requires architectural session support"});
+        return false;
+      }
+      if (live.retirement) {
+        const auto &execution = live.attempts.at(live.retirement->attempt);
+        const NativeMemoryFact *memory = execution.sample ? &*execution.sample
+                                              : execution.store ? &*execution.store : nullptr;
+        const NativeCoherenceFact *proof = nullptr;
+        if (execution.drained) {
+          const auto found = coherent_drain_indices.find(
+              drain_key(entry.first, live.retirement->attempt, execution.drained_at, execution.store->address));
+          if (found != coherent_drain_indices.end())
+            proof = &capture.coherence_facts[found->second];
+        }
+        LoadOrderCertificate certificate;
+        const auto order = load_orders.retire(*live.retirement, live.expanded_instruction,
+            memory, proof, raw_safe, capture.memory_facts, certificate);
+        if (!order) {
+          remember_online_failure(order.status == rvwmo::CheckStatus::Pending
+              ? rvwmo::CheckResult{rvwmo::CheckStatus::Incomplete, order.rule, order.message} : order);
+          return false;
+        }
+        if (certificate.valid) {
+          live.load_order = certificate;
+          if (certificate.modeled_witness)
+            record("LOAD_ORDER_WINDOW", entry.first.hart, entry.first.epoch, entry.first.uid,
+                   certificate.attempt, certificate.begin, certificate.end,
+                   certificate.selected, certificate.mask);
+        }
+      }
+      std::vector<PlannedObservation> planned;
+      std::map<uint32_t, uint64_t> stop_at;
+      plan_instruction(entry.first, live, planned, stop_at);
+      for (const auto &fact : capture.cancellation_facts) {
+        if (fact.id != entry.first || fact.reason == 1)
+          continue;
+        const rvwmo::InstructionCancelAttemptEvent cancelled{fact.id, fact.attempt};
+        planned.push_back({fact.id.hart, fact.source_time, channels(fact.id.hart).memory, false,
+            [cancelled, squashed = fact.reason == 2](Adapter &target, const Origin &origin) {
+              return squashed ? target.squash(origin, cancelled.id) : target.cancel_load(origin, cancelled);
+            }});
+      }
+      if (!capture.summary.gaps.empty() || !stop_at.empty()) {
+        remember_online_failure({rvwmo::CheckStatus::Incomplete, 0,
+            capture.summary.gaps.empty() ? "online conversion stopped an unsupported instruction"
+                                         : capture.summary.gaps.front()});
+        return false;
+      }
+      for (auto &observation : planned)
+        online_observations[observation.time].push_back(std::move(observation));
+      live.staged = true;
+    }
+    return true;
+  }
+
+  bool submit_online_batch(uint64_t through) {
+    const auto submitted = prefix_consumer(online_batch);
+    if (!submitted.accepted) {
+      if (submitted.check.status != rvwmo::CheckStatus::Pending)
+        remember_online_failure(submitted.check);
+      return false;
+    }
+    ++capture.summary.online_prefixes;
+    capture.summary.converted_events += online_batch.batch.events.size();
+    online_batch = {};
+    online_closed = through;
+    if (submitted.check.status != rvwmo::CheckStatus::Pass &&
+        submitted.check.status != rvwmo::CheckStatus::Pending) {
+      remember_online_failure(submitted.check);
+      return false;
+    }
+    return true;
+  }
+
+  bool close_online_batch(uint64_t through) {
+    std::set<uint32_t> producers;
+    for (const auto &channel : configuration.harts) {
+      producers.insert(channel.instruction);
+      producers.insert(channel.memory);
+      producers.insert(channel.control);
+    }
+    producers.insert(configuration.publication_producers.begin(), configuration.publication_producers.end());
+    for (const auto producer : producers) {
+      const auto closed = online_adapter->close_prefix({producer, rvwmo::SourcePosition::end_of_cycle(through)});
+      if (!closed) {
+        remember_online_failure({rvwmo::CheckStatus::Incomplete, 0, closed.message});
+        return false;
+      }
+    }
+    online_batch = online_adapter->take_output();
+    if (!online_batch.diagnostics.empty()) {
+      remember_online_failure({rvwmo::CheckStatus::Incomplete, 0, online_batch.diagnostics.front().message});
+      return false;
+    }
+    return submit_online_batch(through);
+  }
+
+  void release_online_prefix(uint64_t through) {
+    std::set<rvwmo::OperationId> released;
+    for (auto instruction = instructions.begin(); instruction != instructions.end();) {
+      if (instruction->second.staged && instruction->second.last_fact_time <= through) {
+        released.insert(instruction->first);
+        instruction = instructions.erase(instruction);
+      } else {
+        ++instruction;
+      }
+    }
+    const auto cancelled_before = [this, through](const rvwmo::OperationId &id, uint32_t number) {
+      const auto instruction = instructions.find(id);
+      if (instruction == instructions.end())
+        return false;
+      const auto execution = instruction->second.attempts.find(number);
+      return execution != instruction->second.attempts.end() && execution->second.cancelled &&
+             !execution->second.store && execution->second.cancelled_at <= through;
+    };
+    capture.memory_facts.erase(std::remove_if(capture.memory_facts.begin(), capture.memory_facts.end(),
+        [&](const auto &fact) { return fact.kind == 3 && cancelled_before(fact.id, fact.attempt); }),
+        capture.memory_facts.end());
+    capture.forwarding_facts.erase(std::remove_if(capture.forwarding_facts.begin(), capture.forwarding_facts.end(),
+        [&](const auto &fact) { return cancelled_before(fact.reader, fact.attempt); }), capture.forwarding_facts.end());
+    capture.cancellation_facts.erase(std::remove_if(capture.cancellation_facts.begin(), capture.cancellation_facts.end(),
+        [&](const auto &fact) { return fact.reason == 1 && cancelled_before(fact.id, fact.attempt); }),
+        capture.cancellation_facts.end());
+    const auto remove_released = [&released](auto &facts, const auto &identity) {
+      facts.erase(std::remove_if(facts.begin(), facts.end(), [&](const auto &fact) {
+        return released.count(identity(fact)) != 0;
+      }), facts.end());
+    };
+    remove_released(capture.retirement_facts, [](const auto &fact) { return fact.id; });
+    remove_released(capture.memory_facts, [](const auto &fact) { return fact.id; });
+    remove_released(capture.coherence_facts, [](const auto &fact) { return fact.id; });
+    remove_released(capture.cancellation_facts, [](const auto &fact) { return fact.id; });
+    remove_released(capture.forwarding_facts, [](const auto &fact) { return fact.reader; });
+    for (auto drain = physical_drain_counts.begin(); drain != physical_drain_counts.end();)
+      if (released.count(std::get<0>(drain->first)))
+        drain = physical_drain_counts.erase(drain);
+      else
+        ++drain;
+    coherent_drain_indices.clear();
+    for (size_t index = 0; index < capture.coherence_facts.size(); ++index) {
+      const auto &fact = capture.coherence_facts[index];
+      coherent_drain_indices.emplace(drain_key(fact.id, fact.attempt, fact.source_time, fact.address), index);
+    }
+    forwarding_fact_indices.clear();
+    for (size_t index = 0; index < capture.forwarding_facts.size(); ++index) {
+      const auto &fact = capture.forwarding_facts[index];
+      forwarding_fact_indices.emplace(std::make_tuple(fact.reader, fact.attempt, fact.byte_index), index);
+    }
+    for (auto &entry : instructions) {
+      auto &attempts = entry.second.attempts;
+      for (auto execution = attempts.begin(); execution != attempts.end();) {
+        if (execution->first != entry.second.latest_attempt && execution->second.cancelled &&
+            execution->second.cancelled_at <= through)
+          execution = attempts.erase(execution);
+        else
+          ++execution;
+      }
+    }
+    capture.summary.live_instructions = instructions.size();
+  }
+
+  void pump_online(uint64_t delivered_through) {
+    if (!online_batch.batch.watermarks.empty()) {
+      const uint64_t through = online_batch.batch.watermarks.front().closed_through.cycle;
+      if (!submit_online_batch(through))
+        return;
+      release_online_prefix(through);
+    }
+    const uint64_t raw_safe = raw_safe_frontier(delivered_through);
+    if (!stage_online_instructions(raw_safe))
+      return;
+    uint64_t through = raw_safe;
+    for (const auto &entry : instructions) {
+      if (entry.second.staged)
+        continue;
+      const auto &active = entry.second.attempts.at(entry.second.latest_attempt);
+      if (!active.cancelled || active.store)
+        through = std::min(through, active.allocated_at ? active.allocated_at - 1 : 0);
+    }
+    // Do not seal a retirement before its selected sample has reached Adapter.
+    // A complete instruction may span this prefix because another hart has an
+    // older unresolved allocation. Keep the retirement and late sample queued.
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      for (const auto &entry : instructions) {
+        const auto &live = entry.second;
+        if (live.staged && live.retirement && live.load_order &&
+            live.retirement->source_time <= through && live.load_order->selected > through) {
+          through = live.retirement->source_time ? live.retirement->source_time - 1 : 0;
+          changed = true;
+        }
+      }
+    }
+    if (online_closed && through <= *online_closed)
+      return;
+    size_t batch_events = 0;
+    for (const auto &cycle : online_observations) {
+      if (cycle.first > through)
+        break;
+      batch_events += cycle.second.size();
+    }
+    if (batch_events > kMaximumOnlinePrefixEvents) {
+      remember_online_failure({rvwmo::CheckStatus::Incomplete, 0,
+                               "one unresolved online prefix exceeds the bounded live event window"});
+      return;
+    }
+    for (auto cycle = online_observations.begin(); cycle != online_observations.end() && cycle->first <= through;) {
+      for (const auto &observation : cycle->second) {
+        const Origin origin{observation.producer,
+            {observation.time, 0, ++online_sequences[observation.producer], false}};
+        const auto converted = observation.convert(*online_adapter, origin);
+        if (!converted) {
+          const auto status = converted.status == ConversionStatus::Invalid ? rvwmo::CheckStatus::Invalid
+                              : converted.status == ConversionStatus::Unsupported ? rvwmo::CheckStatus::Unsupported
+                                                                                  : rvwmo::CheckStatus::Incomplete;
+          remember_online_failure({status, 0, converted.message});
+          return;
+        }
+      }
+      cycle = online_observations.erase(cycle);
+    }
+    if (close_online_batch(through))
+      release_online_prefix(through);
+  }
+
+  void finish_online() {
+    if (online_result) {
+      const uint64_t through = completed_cycle.value_or(delivery_barrier.value_or(0));
+      pump_online(through);
+    }
+    capture.completion.pending = online_adapter->pending();
+    // Native facts not yet converted must also participate in final drain.
+    capture.completion.pending.instructions += instructions.size();
+    if (!instructions.empty() || !online_observations.empty() || !online_batch.batch.watermarks.empty())
+      gap("online native capture retains unresolved instructions, source observations or backpressure");
+  }
+
+  void plan_instruction(const rvwmo::OperationId &id, const Instruction &live,
+                        std::vector<PlannedObservation> &planned, std::map<uint32_t, uint64_t> &stop_at) {
+    const auto stop = [&](uint32_t hart_id, uint64_t time, const std::string &message) {
+      gap(message);
+      const auto previous = stop_at.find(hart_id);
+      if (previous == stop_at.end() || time < previous->second)
+        stop_at[hart_id] = time;
+    };
+    const auto &channel = channels(id.hart);
+    const auto allocation = live.allocation;
+    if (!allocation.length) {
+      stop(id.hart, live.allocated_at, "raw encoding unavailable; subsequent instruction facts remain unconverted");
+      return;
+    }
+    if (!live.allocation_staged)
+      planned.push_back({id.hart, live.allocated_at, channel.instruction, false,
+                         [allocation](Adapter &target, const Origin &origin) { return target.allocate(origin, allocation); }});
+    for (const auto &attempt_entry : live.attempts) {
+      const auto &execution = attempt_entry.second;
+      if (execution.store && !execution.drained)
+        gap("store-buffer input has no matching physical drain candidate");
+      if (execution.drained) {
+        const auto key = drain_key(id, attempt_entry.first, execution.drained_at, execution.store->address);
+        const auto proof_index = coherent_drain_indices.find(key);
+        if (proof_index == coherent_drain_indices.end()) {
+          gap("physical SRAM store drain is an unqualified publication candidate, not StorePublish");
+        } else if (capture.coherence_facts[proof_index->second].proof_flags != 0x1f ||
+                   (execution.memory_flags & ~uint32_t{1u << 3})) {
+          gap("coherent drain belongs to an unsupported memory lifecycle");
+        } else if (!live.retirement || live.retirement->attempt != attempt_entry.first || execution.cancelled) {
+          gap("coherent physical store drain has no final committed instruction");
+        } else {
+          require(configuration.publication_producers.size() == hart_count,
+                  "coherent publication requires one factual cache source per hart");
+          const auto &store = *execution.store;
+          const auto span = scalar_span(store.mask);
+          const auto producer = configuration.publication_producers.at(id.hart);
+          rvwmo::StorePublishEvent publish;
+          publish.address = store.address + span.first;
+          publish.bytes = span_bytes(store.aligned_data, span);
+          publish.byte_mask.assign(span.size, 1);
+          publish.byte_writers.assign(span.size, id);
+          // Transaction IDs identify actual per-instruction drains and do not
+          // establish an order among simultaneous cache producers.
+
+          planned.push_back({id.hart, capture.coherence_facts[proof_index->second].source_time,
+              producer, false,
+              [this, publish, id](Adapter &target, const Origin &origin) mutable {
+                publish.transaction_id = ++publication_transaction_;
+                publish.members = {{id, origin.source}};
+                return target.publish_store(origin, publish);
+              }});
+        }
+      }
+      if (execution.sample && (!online_adapter || !execution.cancelled) && scalar_sample(*execution.sample)) {
+        const auto load = sample(*execution.sample);
+        const auto actual_time = execution.sample->forwarded_mask
+            ? execution.sample->forwarding_time : execution.sample->array_time;
+        const auto time = live.load_order && live.retirement && live.retirement->attempt == attempt_entry.first
+            ? live.load_order->selected : actual_time;
+        planned.push_back({id.hart, time, channel.memory, false,
+                           [load](Adapter &target, const Origin &origin) { return target.load_sample(origin, load); }});
+      }
+
+    }
+    if (!live.retirement) {
+      if (!live.trapped && !live.attempts.at(live.latest_attempt).squashed)
+        gap("native finish retains allocated instructions without architectural completion");
+      return;
+    }
+    const auto &fact = *live.retirement;
+    const auto &execution = live.attempts.at(fact.attempt);
+    const bool ordinary_load = is_load(live.expanded_instruction);
+    const bool ordinary_store = is_store(live.expanded_instruction);
+    const bool mismatched_effect = (execution.sample && !ordinary_load) ||
+                                   ((execution.store || execution.observed_store_drain) && !ordinary_store);
+    if (fact.fp || is_atomic(live.expanded_instruction) || is_cbo(live.expanded_instruction) ||
+        (execution.memory_flags & ~uint32_t{1u << 3}) || mismatched_effect) {
+      stop(id.hart, fact.source_time, "unsupported or non-scalar memory effect retained as raw fact, not ordinary retirement");
+      return;
+    }
+    RetireRecord retired;
+    retired.id = id;
+    retired.pc = fact.pc;
+    retired.instruction = fact.instruction;
+    retired.length = static_cast<uint8_t>(fact.instruction_bytes);
+    retired.rd = static_cast<uint8_t>(fact.rd);
+    retired.integer_writeback = fact.write_enable;
+    if (fact.write_enable)
+      retired.register_value = fact.write_data;
+    if (is_load(live.expanded_instruction)) {
+      if (!execution.sample || !scalar_sample(*execution.sample)) {
+        stop(id.hart, fact.source_time, "retired load lacks a representable final byte sample");
+        return;
+      }
+      const auto load = sample(*execution.sample);
+      retired.memory.push_back(load.operation);
+      if (fact.write_enable) {
+        // The load's architectural actual value comes from the separately
+        // paired register writeback, not the SRAM/forwarding sample itself.
+        retired.loads.push_back({id, fact.attempt,
+                                 architectural_load_bytes(fact.write_data, execution.sample->mask)});
+      } else {
+        retired.loads.push_back({id, fact.attempt, load.actual_bytes});
+
+      }
+    } else if (is_store(live.expanded_instruction)) {
+      if (!execution.store || (execution.store->flags & ~uint32_t{1u << 3})) {
+        stop(id.hart, fact.source_time, "retired store lacks ordinary captured store bytes");
+        return;
+      }
+      const auto &store = *execution.store;
+      const auto span = scalar_span(store.mask);
+      const rvwmo::LocalStoreEvent local{id, store.address + span.first, span_bytes(store.aligned_data, span),
+                                        std::vector<uint8_t>(span.size, 1)};
+      planned.push_back({id.hart, fact.source_time, channel.memory, false,
+                         [local](Adapter &target, const Origin &origin) { return target.local_store(origin, local); }});
+      rvwmo::MemoryOperation operation;
+      operation.id = id;
+      operation.attempt = fact.attempt;
+      operation.address = local.address;
+      operation.byte_mask = local.byte_mask;
+      operation.store = true;
+      retired.memory.push_back(operation);
+    }
+    planned.push_back({id.hart, fact.source_time, channel.instruction, false,
+                       [retired](Adapter &target, const Origin &origin) { return target.retire(origin, retired); }});
+  }
+
   void convert() {
     Adapter adapter(configuration);
     require(static_cast<bool>(adapter.configuration()), adapter.configuration().message.c_str());
     std::vector<PlannedObservation> planned;
     std::map<uint32_t, uint64_t> stop_at;
-    const auto stop = [&](uint32_t id, uint64_t time, const std::string &message) {
-      gap(message);
-      const auto previous = stop_at.find(id);
-      if (previous == stop_at.end() || time < previous->second)
-        stop_at[id] = time;
-    };
     for (const auto &proof : capture.coherence_facts) {
       const auto key = drain_key(proof.id, proof.attempt, proof.source_time, proof.address);
       if (physical_drain_counts[key] != 1)
@@ -734,124 +1246,8 @@ private:
     for (const auto &drain : physical_drain_counts)
       if (drain.second != 1 || !coherent_drain_indices.count(drain.first))
         gap("physical store drain has no unique coherence/location proof");
-    for (const auto &entry : instructions) {
-      const auto &id = entry.first;
-      const auto &live = entry.second;
-      const auto &channel = channels(id.hart);
-      const auto allocation = live.allocation;
-      if (!allocation.length) {
-        stop(id.hart, live.allocated_at, "raw encoding unavailable; subsequent instruction facts remain unconverted");
-        continue;
-      }
-      planned.push_back({id.hart, live.allocated_at, channel.instruction, false,
-                         [allocation](Adapter &target, const Origin &origin) { return target.allocate(origin, allocation); }});
-      for (const auto &attempt_entry : live.attempts) {
-        const auto &execution = attempt_entry.second;
-        if (execution.store && !execution.drained)
-          gap("store-buffer input has no matching physical drain candidate");
-        if (execution.drained) {
-          const auto key = drain_key(id, attempt_entry.first, execution.drained_at, execution.store->address);
-          const auto proof_index = coherent_drain_indices.find(key);
-          if (proof_index == coherent_drain_indices.end()) {
-            gap("physical SRAM store drain is an unqualified publication candidate, not StorePublish");
-          } else if (capture.coherence_facts[proof_index->second].proof_flags != 0x1f ||
-                     (execution.memory_flags & ~uint32_t{1u << 3})) {
-            gap("coherent drain belongs to an unsupported memory lifecycle");
-          } else if (!live.retirement || live.retirement->attempt != attempt_entry.first || execution.cancelled) {
-            gap("coherent physical store drain has no final committed instruction");
-          } else {
-            require(configuration.publication_producers.size() == hart_count,
-                    "coherent publication requires one factual cache source per hart");
-            const auto &store = *execution.store;
-            const auto span = scalar_span(store.mask);
-            const auto producer = configuration.publication_producers.at(id.hart);
-            rvwmo::StorePublishEvent publish;
-            publish.address = store.address + span.first;
-            publish.bytes = span_bytes(store.aligned_data, span);
-            publish.byte_mask.assign(span.size, 1);
-            publish.byte_writers.assign(span.size, id);
-            // Transaction IDs identify actual per-instruction drains and do not
-            // establish an order among simultaneous cache producers.
-            publish.transaction_id = ++publication_transaction_;
-            planned.push_back({id.hart, capture.coherence_facts[proof_index->second].source_time,
-                producer, false,
-                [publish, id](Adapter &target, const Origin &origin) mutable {
-                  publish.members = {{id, origin.source}};
-                  return target.publish_store(origin, publish);
-                }});
-          }
-        }
-        if (execution.sample && scalar_sample(*execution.sample)) {
-          const auto load = sample(*execution.sample);
-          const auto time = execution.sample->forwarded_mask ? execution.sample->forwarding_time : execution.sample->array_time;
-          planned.push_back({id.hart, time, channel.memory, false,
-                             [load](Adapter &target, const Origin &origin) { return target.load_sample(origin, load); }});
-        }
-
-      }
-      if (!live.retirement) {
-        if (!live.trapped && !live.attempts.at(live.latest_attempt).squashed)
-          gap("native finish retains allocated instructions without architectural completion");
-        continue;
-      }
-      const auto &fact = *live.retirement;
-      const auto &execution = live.attempts.at(fact.attempt);
-      const bool ordinary_load = is_load(live.expanded_instruction);
-      const bool ordinary_store = is_store(live.expanded_instruction);
-      const bool mismatched_effect = (execution.sample && !ordinary_load) ||
-                                     ((execution.store || execution.observed_store_drain) && !ordinary_store);
-      if (fact.fp || is_atomic(live.expanded_instruction) || is_cbo(live.expanded_instruction) ||
-          (execution.memory_flags & ~uint32_t{1u << 3}) || mismatched_effect) {
-        stop(id.hart, fact.source_time, "unsupported or non-scalar memory effect retained as raw fact, not ordinary retirement");
-        continue;
-      }
-      RetireRecord retired;
-      retired.id = id;
-      retired.pc = fact.pc;
-      retired.instruction = fact.instruction;
-      retired.length = static_cast<uint8_t>(fact.instruction_bytes);
-      retired.rd = static_cast<uint8_t>(fact.rd);
-      retired.integer_writeback = fact.write_enable;
-      if (fact.write_enable)
-        retired.register_value = fact.write_data;
-      if (is_load(live.expanded_instruction)) {
-        if (!execution.sample || !scalar_sample(*execution.sample)) {
-          stop(id.hart, fact.source_time, "retired load lacks a representable final byte sample");
-          continue;
-        }
-        const auto load = sample(*execution.sample);
-        retired.memory.push_back(load.operation);
-        if (fact.write_enable) {
-          // The load's architectural actual value comes from the separately
-          // paired register writeback, not the SRAM/forwarding sample itself.
-          retired.loads.push_back({id, fact.attempt,
-                                   architectural_load_bytes(fact.write_data, execution.sample->mask)});
-        } else {
-          retired.loads.push_back({id, fact.attempt, load.actual_bytes});
-
-        }
-      } else if (is_store(live.expanded_instruction)) {
-        if (!execution.store || (execution.store->flags & ~uint32_t{1u << 3})) {
-          stop(id.hart, fact.source_time, "retired store lacks ordinary captured store bytes");
-          continue;
-        }
-        const auto &store = *execution.store;
-        const auto span = scalar_span(store.mask);
-        const rvwmo::LocalStoreEvent local{id, store.address + span.first, span_bytes(store.aligned_data, span),
-                                          std::vector<uint8_t>(span.size, 1)};
-        planned.push_back({id.hart, fact.source_time, channel.memory, false,
-                           [local](Adapter &target, const Origin &origin) { return target.local_store(origin, local); }});
-        rvwmo::MemoryOperation operation;
-        operation.id = id;
-        operation.attempt = fact.attempt;
-        operation.address = local.address;
-        operation.byte_mask = local.byte_mask;
-        operation.store = true;
-        retired.memory.push_back(operation);
-      }
-      planned.push_back({id.hart, fact.source_time, channel.instruction, false,
-                         [retired](Adapter &target, const Origin &origin) { return target.retire(origin, retired); }});
-    }
+    for (const auto &entry : instructions)
+      plan_instruction(entry.first, entry.second, planned, stop_at);
     for (const auto &fact : capture.cancellation_facts) {
       if (fact.reason == 1) {
         const auto instruction = instructions.find(fact.id);
@@ -985,6 +1381,20 @@ ConversionResult install_native_verifier(Configuration configuration, NativeVeri
   return {};
 }
 
+ConversionResult install_native_online_verifier(Configuration configuration, NativePrefixConsumer consume,
+    NativeVerifier finalize, NativeFailureObserver failure_observer) {
+  if (!consume || !finalize)
+    return {ConversionStatus::Invalid, "online native session requires prefix and finalization callbacks"};
+  configuration.monotonic_publication_transactions = true;
+  auto installed = install_native_verifier(std::move(configuration), std::move(finalize), std::move(failure_observer));
+  if (!installed)
+    return installed;
+  auto &state = bridge();
+  state.prefix_consumer = std::move(consume);
+  state.online_adapter = std::make_unique<Adapter>(state.configuration);
+  return {};
+}
+
 ConversionResult reset_native_session() {
   if (session && session->notifying_failure)
     return {ConversionStatus::Invalid, "native failure notification must return before resetting its session"};
@@ -1089,6 +1499,10 @@ extern "C" int bp_difftest_s_close_prefix(uint64_t time) {
   return blackparrot::invoke("close_prefix", [&](auto &state) { state.close_prefix(time); });
 }
 
+extern "C" int bp_difftest_s_advance(uint64_t time) {
+  const auto status = blackparrot::invoke("advance", [&](auto &state) { state.advance(time); });
+  return status || !blackparrot::bridge().online_result ? 1 : 0;
+}
 extern "C" int bp_difftest_s_finish() {
   const int transport = blackparrot::invoke("finish", [](auto &state) { state.finish(); }, true);
   if (transport)

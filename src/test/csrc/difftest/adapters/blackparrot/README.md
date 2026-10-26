@@ -11,7 +11,8 @@ The adapter does not implement another Runtime, REF or event ABI.
   attempts, delayed writebacks, single-writer publications and source prefixes.
   `ConvertedOutput` preserves DUT architectural snapshots separately from REF.
 - `native_bridge.h/.cpp` receives the native `bp_difftest_s_*` DPI records,
-  pairs physical facts, and converts complete captures. `NativeSink` supports
+  pairs physical facts, and either converts terminal captures or delivers
+  source-closed prefixes during simulation. `NativeSink` supports
   capture consumers; it cannot provide a semantic Pass. `NativeVerifier` keeps
   semantic status separate from malformed transport.
 - `session_adapter.h/.cpp` supports a borrowed `ObservationSession` and common
@@ -19,7 +20,9 @@ The adapter does not implement another Runtime, REF or event ABI.
   to the public `HostSession`, which owns the fixed hart roster, reference pool,
   source drains and final checks. Install the native host before probe startup
   with `install_native_host_session(configuration, adapter)`. The adapter, public
-  host and backing memory must outlive the run. A final Pass requires native
+  host and backing memory must outlive the run. For continuous execution use
+  `install_native_online_session(configuration, adapter)` before probe startup.
+  A final Pass requires native
   completion evidence and successful public host finalization.
 - RTL probes live beside BlackParrot's existing nonsynth monitors. The opt-in
   native build entry is `black-parrot-sim/Makefile.difftest-s`.
@@ -106,7 +109,46 @@ native exit status and the BSG verdict in both capture and semantic modes.
 `Configuration` bounds live instructions, outstanding stores and exact
 publication deduplication history. History exhaustion returns Unsupported.
 Callers retain inputs on Waiting and deliver queued prefixes with
-`take_output()` before adding observations on that producer. The current native
-capture also has hard session bounds of 65,536 allocated instructions and
-1,048,576 observations. It fails on overflow rather than dropping events;
-long-program streaming capture is a separate extension.
+`take_output()` before adding observations on that producer. The terminal-capture path has session bounds of 65,536 allocated instructions
+and 1,048,576 observations. The online path instead bounds unresolved work:
+65,536 live native identities and 32,768 events in one ready source prefix.
+Already consumed facts are released; publication transaction IDs use monotonic
+producer frontiers instead of lifetime history. A genuinely unbounded unresolved
+hardware request or an oversized live prefix remains an explicit failure.
+
+## Online source progress
+
+Build with `DIFFTEST_S_ONLINE=1` and an embedding that installs
+`install_native_online_session`; this requires semantic checking. The native
+wrapper uses a distinct online build tag. Its post-negedge phase barrier calls
+`bp_difftest_s_advance(delivered_through_tick)` after core/cache/coherence monitor
+callbacks and NBA updates. This is a delivery notification, not a memory rank
+or an assertion that no delayed result exists.
+
+The bridge keeps unresolved load, identified writeback and store/proof pairs
+behind their active allocation frontier. Retirements reach the same public
+HostSession in each hart's final retirement order. The bridge retains an exact
+unaccepted batch for retry; an accepted Pending batch is never resubmitted.
+After source closure and public acceptance it reclaims native identities, raw
+facts and indexes. A cancelled attempt may retain its stable retry UID without
+pinning other harts indefinitely; a retry or squash cannot use a source time
+inside an already closed prefix. WFI itself never silently squashes younger
+identities or substitutes for the final stopped/drained-source protocol.
+
+## Stable-byte load-order windows
+
+`load_order.h` retains constant-size order summaries per hart. An ordinary SRAM
+load that crosses an older W-to-R FENCE can receive a model-order witness only
+when its complete raw sampling interval is closed and none of its enabled bytes
+has any hart's store-input or store-drain transition in that interval. Writer
+identity transitions matter even when the data values are equal. Mixed
+forwarding, missing evidence, overlapping writes, or an interval with no legal
+point remain Incomplete/Unsupported.
+
+The raw `NativeMemoryFact` keeps its actual array/forwarding and callback times.
+A derived `LOAD_ORDER_WINDOW` record separately identifies the original interval
+and selected model point; that point is not a new observed hardware timestamp.
+The public session still checks independent REF bytes, store audits and every
+supported PPO condition at retirement. The private certificate never constructs
+expected values from DUT actual data, and it does not change the public checker
+or claim a complete coherence-protocol proof.
