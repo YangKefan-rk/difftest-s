@@ -27,7 +27,8 @@ struct HartChannels {
 struct Configuration {
   std::vector<HartChannels> harts;
   std::vector<uint32_t> publication_producers;
-  // Independent bounds for live instructions and outstanding LocalStore records.
+  // Independent bounds for live instructions and outstanding store lifecycle
+  // records, including physical publications awaiting their LocalStore match.
   size_t max_live_instructions = 65536;
   // Session-long exact transaction deduplication. Exhaustion is Unsupported;
   // history is never silently evicted or reused as a new publication.
@@ -90,6 +91,8 @@ struct PendingState {
   size_t instructions = 0;
   size_t writebacks = 0;
   size_t load_samples = 0;
+  // Store lifecycle gaps: LocalStore awaiting publication, or publication
+  // awaiting its exact LocalStore match. Neither may disappear at finalization.
   size_t unpublished_stores = 0;
 };
 
@@ -98,8 +101,8 @@ struct PendingState {
 // CheckerEventConsumer consume_closed, independent REF and session finalization.
 // Accepted means converted/buffered, never architectural or RVWMO Pass.
 // Source cycles are the common-domain hardware times, not delivery times.
-// A miss may retire before its refill sample: retain both times. Such a trace
-// exposes a current-consumer gap instead of moving retirement to writeback.
+// A miss may retire before its refill sample: retain both times. The public
+// session retries that retirement after its selected sample becomes available.
 class Adapter {
 public:
   explicit Adapter(Configuration configuration);
@@ -114,6 +117,8 @@ public:
   ConversionResult load_sample(const Origin &origin, const rvwmo::LoadSampleEvent &record);
   ConversionResult cancel_load(const Origin &origin, const rvwmo::InstructionCancelAttemptEvent &record);
   ConversionResult local_store(const Origin &origin, const rvwmo::LocalStoreEvent &record);
+  // Physical publication can precede architectural LocalStore. Preserve its
+  // source position, retain a bounded orphan and validate its later exact match.
   ConversionResult publish_store(const Origin &origin, const rvwmo::StorePublishEvent &record);
   // Memory/actual-load metadata must be supplied explicitly by the caller.
   // The selected sample or integer writeback may arrive later; the original
