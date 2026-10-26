@@ -50,6 +50,9 @@ public:
   CheckResult complete_hart(const HartCompletion &completion);
   CheckResult drain_producer(const ProducerDrain &drain);
   CheckResult poll();
+  // Preserve a terminal transport/private-adapter failure in the common final
+  // verdict. This entry never accepts a caller-supplied success certificate.
+  CheckResult report_source_failure(CheckResult failure);
   CheckResult finalize(uint64_t completed_cycle);
   bool finalized() const { return finalized_; }
   const ObservationSession *session() const { return session_.get(); }
