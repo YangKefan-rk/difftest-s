@@ -35,6 +35,9 @@ struct OperationId {
 struct ObservationTime {
   uint64_t rank = 0;
   bool valid = false;
+  // Internal certificate for loads sampling one source-closed read-only prefix.
+  // It does not assert an order between equal-rank group members.
+  bool unordered_read_group = false;
 };
 
 enum class CheckStatus {

@@ -15,11 +15,15 @@ DependencySummary stamp(const MemoryOperation &operation, bool latest) {
   return result;
 }
 CheckResult require_before(const DependencySummary &before, const MemoryOperation &after, unsigned rule) {
-  if (!before.valid || before.rank < stamp(after, false).rank)
+  const auto after_rank = stamp(after, false).rank;
+  if (!before.valid || before.rank < after_rank)
     return {};
   std::ostringstream text;
   text << "PPO rule " << rule << ": hart " << after.id.hart << " uid " << before.source.uid << " rank " << before.rank
-       << " must precede uid " << after.id.uid << " rank " << stamp(after, false).rank;
+       << " must precede uid " << after.id.uid << " rank " << after_rank;
+  if (before.rank == after_rank && after.load && !after.store && !after.atomic && !after.lr && !after.sc &&
+      !after.acquire && !after.release && !after.rcsc && !after.has_paired_lr && after.read_time.unordered_read_group)
+    return {CheckStatus::Incomplete, rule, text.str() + "; the shared read prefix lacks intra-group order evidence"};
   return {CheckStatus::Violation, rule, text.str()};
 }
 } // namespace

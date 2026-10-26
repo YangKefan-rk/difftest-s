@@ -105,10 +105,9 @@ CheckResult ObservationSession::classify_read_groups(const std::vector<RuntimeEv
     std::vector<size_t> memory_events;
     std::set<uint32_t> producers;
     std::map<uint16_t, std::set<uint32_t>> phase_producers;
-    std::set<uint32_t> harts;
+    std::set<std::pair<OperationId, uint32_t>> read_attempts;
     bool unqualified = false;
     bool all_loads = true;
-    bool unique_harts = true;
     for (size_t index = begin; index < end; ++index) {
       const auto &event = events[index];
       if (!is_memory_event(event))
@@ -122,23 +121,28 @@ CheckResult ObservationSession::classify_read_groups(const std::vector<RuntimeEv
       if (!ordinary_scalar_load(event)) {
         all_loads = false;
       } else {
-        unique_harts &= harts.insert(std::get<LoadSampleEvent>(event.payload).operation.id.hart).second;
+        const auto &load = std::get<LoadSampleEvent>(event.payload).operation;
+        if (!read_attempts.insert({load.id, load.attempt}).second)
+          return invalid("closed read-prefix group repeats an operation attempt");
       }
     }
     begin = end;
-    if (producers.size() < 2)
+    if (memory_events.size() < 2)
       continue;
 
-    bool unordered = unqualified;
-    for (const auto &phase : phase_producers)
-      unordered |= phase.second.size() > 1;
-    if (!unordered)
+    if (!all_loads) {
+      bool unordered = unqualified;
+      for (const auto &phase : phase_producers)
+        unordered |= phase.second.size() > 1;
+      if (producers.size() > 1 && unordered)
+        return incomplete("same-cycle unordered writes require qualified source order");
       continue;
-    if (!all_loads || !unique_harts || memory_events.size() != producers.size())
-      return incomplete("same-cycle unordered memory requires one ordinary load per hart and producer");
+    }
     if (unqualified && phase_producers.size() > 1)
       return incomplete("unqualified reads cannot share a rank across distinct qualified phases");
 
+    // Same-producer sequence still validates lossless delivery. It cannot
+    // fabricate subcycle memory order for a common sampled read-only prefix.
     std::map<uint16_t, std::vector<size_t>> phase_groups;
     for (const auto index : memory_events)
       phase_groups[unqualified ? 0 : events[index].source.qualified_phase].push_back(index);
@@ -188,7 +192,7 @@ CheckResult ObservationSession::consume_pending_events() {
         current_rank_event_ = std::make_pair(event.producer_id, event.source.producer_sequence);
         if (pending_event->read_group) {
           if (!pending_event->read_group->time.valid)
-            pending_event->read_group->time = {next_rank_, true};
+            pending_event->read_group->time = {next_rank_, true, true};
           current_rank_ = pending_event->read_group->time;
         } else {
           current_rank_ = {next_rank_, true};

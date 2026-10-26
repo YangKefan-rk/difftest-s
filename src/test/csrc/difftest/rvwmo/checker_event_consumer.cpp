@@ -46,12 +46,13 @@ CheckResult CheckerEventConsumer::require_rank(const RuntimeEvent &event, Observ
   const auto resolved = rank_resolver_(event);
   if (!resolved || !resolved->valid || resolved->rank == 0)
     return incomplete("memory event has no hardware-justified GMO rank");
+  if (resolved->unordered_read_group != certified_read_group)
+    return incomplete("read-prefix rank certificate is unavailable outside its private session group");
   if (last_memory_rank_ && resolved->rank <= *last_memory_rank_) {
     const auto *sample = std::get_if<LoadSampleEvent>(&event.payload);
     if (!certified_read_group || !sample || !last_read_group_ || resolved->rank != *last_memory_rank_ ||
         last_read_group_->rank != resolved->rank || last_read_group_->cycle != event.source.cycle ||
-        last_read_group_->harts.count(sample->operation.id.hart) ||
-        last_read_group_->producers.count(event.producer_id))
+        last_read_group_->members.count({sample->operation.id, sample->operation.attempt}))
       return incomplete("memory event rank is not a strictly increasing observed order or a certified read group");
   }
   time = *resolved;
@@ -147,9 +148,8 @@ CheckResult CheckerEventConsumer::consume_load_sample(const RuntimeEvent &event,
   last_memory_rank_ = time.rank;
   if (certified_read_group) {
     if (!last_read_group_ || last_read_group_->rank != time.rank)
-      last_read_group_ = ReadGroupReceipt{time.rank, event.source.cycle, {}, {}};
-    last_read_group_->harts.insert(operation.id.hart);
-    last_read_group_->producers.insert(event.producer_id);
+      last_read_group_ = ReadGroupReceipt{time.rank, event.source.cycle, {}};
+    last_read_group_->members.insert(key);
   } else {
     last_read_group_.reset();
   }
