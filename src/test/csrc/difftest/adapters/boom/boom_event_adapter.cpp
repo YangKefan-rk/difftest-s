@@ -716,10 +716,7 @@ void BoomEventAdapter::collect(const OperationId &id) {
   const auto &instruction = found->second;
   if (instruction.store && (!instruction.published || !instruction.audited))
     return;
-  // A retired store may be observed by the native LocalStore probe after the
-  // physical STQ slot was released and reused. Retain its identity until the
-  // delayed LocalStore arrives; otherwise commit_store cannot audit it.
-  if (instruction.allocation.stq && (!instruction.store || !instruction.stq_released))
+  if (instruction.allocation.stq && !instruction.stq_released)
     return;
   instructions_.erase(found);
 }
