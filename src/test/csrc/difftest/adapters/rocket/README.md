@@ -167,3 +167,10 @@ Storage is bounded by the configured pending-instruction capacity plus 32
 scoreboard slots and the 32-token squash history. Allocation, retirement and
 writeback identity lookup take O(log N); completed records are drained once.
 No ordinary ALU instruction history is retained after its snapshot is drained.
+
+The emitter tracks its unretired frontier separately from retired stores that
+await publication. Retiring a new instruction no longer scans every retained
+store. Hart watermark checks inspect only unretired allocations; they still
+inspect every such allocation because native token order alone does not prove
+allocation source-time order. Publication identities and store bytes remain
+live until their real publication is accepted.

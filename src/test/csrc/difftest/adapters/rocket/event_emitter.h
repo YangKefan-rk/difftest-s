@@ -5,6 +5,7 @@
 #include <deque>
 #include <map>
 #include <optional>
+#include <set>
 
 namespace rocket_difftest {
 
@@ -79,6 +80,7 @@ private:
 
   EmitterConfiguration configuration_;
   std::map<uint64_t, Instruction> instructions_;
+  std::set<uint64_t> unretired_tokens_;
   std::optional<uint64_t> last_token_;
   std::optional<uint64_t> closed_cycle_;
   uint64_t next_uid_ = 1;
