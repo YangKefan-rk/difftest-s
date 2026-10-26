@@ -10,6 +10,9 @@ namespace blackparrot {
 struct NativeCapture;
 struct NativeCompletionEvidence;
 
+rvwmo::CheckResult validate_native_capture(const NativeCapture &capture);
+rvwmo::CheckResult validate_native_completion(const NativeCompletionEvidence &evidence);
+
 // Convert DUT actual snapshots only. The borrowed public session owns all REF
 // execution, expected values, store audits, source-order ranks and checking.
 rvwmo::CheckResult capture_architectural_retirements(
