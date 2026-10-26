@@ -132,3 +132,38 @@ and dual-core enabled TestHarness CHIRRTL elaboration. These checks do not
 substitute for production transport wiring, RTL execution, or a final multicore
 RVWMO result. Source selection is `DIFFTEST_S_DUT=rocket`; the common build and
 Chipyard harness wiring remain owned by the integration coordinator.
+
+
+## Architectural retirement capture
+
+`RetirementCapture` joins the ID returned by `EventEmitter::begin()` with
+independent `RocketCoreObservation.retire` and `lateWrite` facts. Call
+`allocate(instruction, id)` once for each accepted allocation, `retire()` with
+the native WB PC/raw/control/value, and `late_write()` only with the observed
+scoreboard token/destination. Repeated EX/MEM/WB squash facts are idempotent
+within the bounded scalar kill history; retirement cannot be retracted.
+
+Keep the two capture capacities consistent and retain native inputs on Pending;
+a successfully accepted allocation/retirement must not be resubmitted to that
+component when the other component needs retry. The embedding collector owns
+this per-input progress, batch delivery and watermark closure.
+
+`take_ready()` returns logical-ID/PC/raw/integer-result records in retirement
+order after any deferred integer value is known. A missing deferred value keeps
+`finalize()` pending. The original retirement source is retained, not replaced
+by the late writeback timestamp. Writes to x0 normalize to no architectural
+write; a nonzero pending scoreboard destination cannot be reused. The record
+contains DUT actual state for comparison, never a REF expected load value.
+
+The public session maps each private `CapturedRetirement` to its existing
+`rvwmo::ArchitecturalRetirement`: copy `id`, `pc` and `instruction`; select
+`ArchitecturalDestination::Integer` when `integer_write` is true (otherwise
+`None`), then copy `destination`/`value` to `destination_register`/
+`destination_value`. No second public transport or snapshot ABI is introduced.
+FP/unsupported instruction comparators fail closed. The collector must check
+every capture result and deliver snapshots before session finalization.
+
+Storage is bounded by the configured pending-instruction capacity plus 32
+scoreboard slots and the 32-token squash history. Allocation, retirement and
+writeback identity lookup take O(log N); completed records are drained once.
+No ordinary ALU instruction history is retained after its snapshot is drained.

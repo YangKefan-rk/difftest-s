@@ -150,6 +150,8 @@ CheckResult EventEmitter::begin(const InstructionObservation &allocation, Operat
   Instruction instruction;
   instruction.id = {configuration_.hart, configuration_.epoch, next_uid_++, 0};
   instruction.allocation = allocation;
+  if (allocation.length == 2)
+    instruction.allocation.instruction &= 0xffff;
   instruction.kind = classified_kind;
   id = instruction.id;
   instructions_.emplace(allocation.token, std::move(instruction));
