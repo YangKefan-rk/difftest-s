@@ -19,6 +19,7 @@ public:
   rvwmo::SessionSubmitResult submit_closed(
       const rvwmo::EventBatch &batch, const std::vector<rvwmo::ArchitecturalRetirement> &retirements);
   rvwmo::CheckResult finalize(const NativeCompletionEvidence &evidence);
+  rvwmo::CheckResult report_source_failure(rvwmo::CheckResult failure);
   bool finalized() const { return finalized_; }
 
 private:

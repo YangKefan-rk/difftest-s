@@ -126,6 +126,8 @@ public:
   Configuration configuration;
   NativeSink sink;
   NativeVerifier verifier;
+  NativeFailureObserver failure_observer;
+  bool notifying_failure = false;
   NativeCapture capture;
   bool finished = false;
   bool failed = false;
@@ -138,13 +140,23 @@ public:
   std::map<DrainKey, size_t> coherent_drain_indices;
   std::map<std::tuple<rvwmo::OperationId, uint32_t, uint32_t>, size_t> forwarding_fact_indices;
 
-  void reject_transport() {
+  void reject_transport(const char *message) {
+    const bool first_failure = !failed;
     failed = true;
     capture.summary.malformed_transport = true;
     capture.summary.incomplete = true;
+    const rvwmo::CheckResult failure{rvwmo::CheckStatus::Invalid, 0, message};
     if (capture.summary.verification && capture.summary.verification->check.status == rvwmo::CheckStatus::Pass)
-      capture.summary.verification = NativeVerification{
-          {rvwmo::CheckStatus::Invalid, 0, "native observation rejected after a finalized verdict"}, false};
+      capture.summary.verification = NativeVerification{failure, false};
+    if (!first_failure || !failure_observer)
+      return;
+    notifying_failure = true;
+    try {
+      failure_observer(failure);
+    } catch (...) {
+      std::cerr << "[Difftest-S] native failure observer threw; transport remains rejected\n";
+    }
+    notifying_failure = false;
   }
 
   void require(bool condition, const char *message) const {
@@ -923,48 +935,55 @@ Bridge &bridge() {
 template <typename Function> int invoke(const char *name, Function action, bool final = false) noexcept {
   try {
     auto &state = bridge();
+    state.require(!state.notifying_failure, "native failure observer cannot reenter capture");
     if (!final)
       state.require(!state.finished && !state.failed, "native session is finished or has a prior transport failure");
     action(state);
     return state.failed ? 1 : 0;
   } catch (const std::exception &error) {
     auto &state = bridge();
-    state.reject_transport();
+    state.reject_transport(error.what());
     std::cerr << "[Difftest-S] rejected " << name << ": " << error.what() << '\n';
     return 1;
   } catch (...) {
-    bridge().reject_transport();
+    bridge().reject_transport("unknown native host exception");
     std::cerr << "[Difftest-S] rejected " << name << ": unknown host exception\n";
     return 1;
   }
 }
 } // namespace
 
-ConversionResult install_native_sink(Configuration configuration, NativeSink sink) {
+ConversionResult install_native_sink(Configuration configuration, NativeSink sink,
+                                     NativeFailureObserver failure_observer) {
   auto &state = bridge();
-  if (state.hart_count || state.finished || !sink || state.sink || state.verifier)
+  if (state.hart_count || state.finished || state.failed || !sink || state.sink || state.verifier)
     return {ConversionStatus::Invalid, "install a nonempty native sink before producer initialization"};
   Adapter check(configuration);
   if (!check.configuration())
     return check.configuration();
   state.configuration = std::move(configuration);
   state.sink = std::move(sink);
+  state.failure_observer = std::move(failure_observer);
   return {};
 }
 
-ConversionResult install_native_verifier(Configuration configuration, NativeVerifier verifier) {
+ConversionResult install_native_verifier(Configuration configuration, NativeVerifier verifier,
+                                         NativeFailureObserver failure_observer) {
   auto &state = bridge();
-  if (state.hart_count || state.finished || !verifier || state.sink || state.verifier)
+  if (state.hart_count || state.finished || state.failed || !verifier || state.sink || state.verifier)
     return {ConversionStatus::Invalid, "install one native verifier before producer initialization"};
   Adapter check(configuration);
   if (!check.configuration())
     return check.configuration();
   state.configuration = std::move(configuration);
   state.verifier = std::move(verifier);
+  state.failure_observer = std::move(failure_observer);
   return {};
 }
 
 ConversionResult reset_native_session() {
+  if (session && session->notifying_failure)
+    return {ConversionStatus::Invalid, "native failure notification must return before resetting its session"};
   if (session && session->hart_count && !session->finished)
     return {ConversionStatus::Invalid, "active native capture must finish before starting a fresh session"};
   session = std::make_unique<Bridge>();
@@ -1071,5 +1090,5 @@ extern "C" int bp_difftest_s_finish() {
   if (transport)
     return transport;
   const auto &verification = blackparrot::last_native_capture().summary.verification;
-  return verification && (verification->check.status != rvwmo::CheckStatus::Pass || !verification->finalized) ? 2 : 0;
+  return !verification || verification->check.status != rvwmo::CheckStatus::Pass || !verification->finalized ? 2 : 0;
 }

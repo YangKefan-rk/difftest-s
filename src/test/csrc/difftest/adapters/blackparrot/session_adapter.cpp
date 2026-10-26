@@ -34,7 +34,7 @@ rvwmo::CheckResult validate_capture(const NativeCapture &capture) {
       return {CheckStatus::Incomplete, 0, "coherence proof has no unique matching physical store drain"};
     if (proof.proof_flags != 0x1f)
       continue;
-    if (!(proof.address & 7) || proof.cache_set >= 64 || proof.cache_way >= 8 ||
+    if ((proof.address & 7) || proof.cache_set >= 64 || proof.cache_way >= 8 ||
         !proof.bank_select || (proof.bank_select & (proof.bank_select - 1)) ||
         (proof.bank_select & ~uint32_t{0xff}) || proof.physical_sram_index >= 64 * 8)
       return {CheckStatus::Invalid, 0, "ordinary coherence proof has malformed cache or SRAM geometry"};

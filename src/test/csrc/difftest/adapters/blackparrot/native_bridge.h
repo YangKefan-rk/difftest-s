@@ -140,12 +140,17 @@ struct NativeCapture {
 using NativeVerifier = std::function<NativeVerification(const NativeCapture &)>;
 
 using NativeSink = std::function<ConversionResult(const NativeCapture &)>;
+// The callback receives the first transport rejection. It must remain alive
+// with any objects it borrows until the native session is reset or destroyed.
+using NativeFailureObserver = std::function<void(const rvwmo::CheckResult &)>;
 
 // Install before probe initialization. The coordinator owns the producer roster,
 // ObservationStream, source-prefix proof, REF, rank resolver and final verdict.
-ConversionResult install_native_sink(Configuration configuration, NativeSink sink);
+ConversionResult install_native_sink(Configuration configuration, NativeSink sink,
+                                     NativeFailureObserver failure_observer = {});
 // A verifier reports the public session result separately from transport status.
-ConversionResult install_native_verifier(Configuration configuration, NativeVerifier verifier);
+ConversionResult install_native_verifier(Configuration configuration, NativeVerifier verifier,
+                                         NativeFailureObserver failure_observer = {});
 // An explicit fresh session is allowed only before initialization or after finish.
 ConversionResult reset_native_session();
 const NativeCapture &last_native_capture();
