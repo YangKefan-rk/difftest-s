@@ -142,26 +142,35 @@ CheckResult CheckerEventConsumer::consume_load_sample(const RuntimeEvent &event,
 }
 
 CheckResult CheckerEventConsumer::consume_store_publish(const RuntimeEvent &event, const StorePublishEvent &publish) {
+  if (publish.members.empty())
+    return remember_failure(invalid("store publication has no logical store member"));
   if (publish.members.size() != 1)
     return remember_failure(unsupported("semantic consumer currently requires one logical store per publish event"));
   const auto &member = publish.members.front();
+  if (!publish.transaction_id || !member.id.uid || publish.bytes.empty() ||
+      publish.bytes.size() != publish.byte_mask.size() || publish.byte_writers.size() != publish.bytes.size() ||
+      publish.bytes.size() - 1 > std::numeric_limits<uint64_t>::max() - publish.address ||
+      std::none_of(publish.byte_mask.begin(), publish.byte_mask.end(), [](uint8_t byte) { return byte == 1; }) ||
+      std::any_of(publish.byte_mask.begin(), publish.byte_mask.end(), [](uint8_t byte) { return byte > 1; }))
+    return remember_failure(invalid("invalid single-store publication identity, byte range or mask"));
+  if (member.id.subaccess != 0)
+    return remember_failure(unsupported("split or vector store publication is not covered by this consumer"));
   const auto &member_position = member.publish_position;
   if (member_position.cycle != event.source.cycle ||
       member_position.qualified_phase != event.source.qualified_phase ||
       member_position.producer_sequence != event.source.producer_sequence ||
       member_position.order_qualified != event.source.order_qualified)
-    return remember_failure(incomplete("single-store publish member has no matching envelope source position"));
+    return remember_failure(invalid("single-store publish member has no matching envelope source position"));
+  for (size_t byte = 0; byte < publish.byte_mask.size(); ++byte)
+    if (publish.byte_mask[byte] && publish.byte_writers[byte] != member.id)
+      return remember_failure(invalid("single-store publication names another byte writer"));
   auto store = stores_.find(member.id);
   if (store == stores_.end())
-    return remember_failure(incomplete("store publication has no closed LocalStore record"));
+    return pending("store publication awaits its LocalStore record");
   if (store->second.published || publish.address != store->second.operation.address ||
       publish.bytes.size() != store->second.operation.byte_mask.size() ||
       publish.byte_mask != store->second.operation.byte_mask || publish.byte_writers.size() != publish.bytes.size())
     return remember_failure(invalid("StorePublish differs from its LocalStore record"));
-  for (size_t byte = 0; byte < publish.byte_mask.size(); ++byte)
-    if (publish.byte_mask[byte] && publish.byte_writers[byte] != member.id)
-      return remember_failure(unsupported("single-store publication names another byte writer"));
-
   ObservationTime time;
   auto result = require_rank(event, time);
   if (!result)

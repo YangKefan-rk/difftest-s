@@ -375,18 +375,22 @@ CheckResult ObservationSession::finalize(uint64_t completed_cycle) {
     return {};
 
   auto progress = poll();
-  if (!progress)
-    return progress;
   if (progress.status == CheckStatus::Pending)
+    return remember_failure({CheckStatus::Incomplete, progress.rule,
+                             "session finalized with pending observations: " + progress.message});
+  if (!progress)
     return progress;
   const auto closed_cycle = stream_.minimum_closed_cycle();
   if (!closed_cycle || *closed_cycle < completed_cycle)
-    return pending("finalization awaits every producer watermark through the requested cycle");
+    return remember_failure(incomplete("session finalized before every producer closed the requested cycle"));
   if (!pending_events_.empty())
-    return incomplete("session has retained semantic events that cannot make progress");
+    return remember_failure(incomplete("session has retained semantic events that cannot make progress"));
   if (!architectural_retirements_.empty())
     return remember_failure(incomplete("session has architectural snapshots without matching retirements"));
   auto result = consumer_.finalize();
+  if (result.status == CheckStatus::Pending)
+    return remember_failure({CheckStatus::Incomplete, result.rule,
+                             "session finalized with unresolved checks: " + result.message});
   if (!result)
     return remember_failure(result);
   finalized_ = true;
