@@ -3,28 +3,17 @@
 
 #include "adapter.h"
 #include "../../rvwmo/session.h"
-#include <optional>
 #include <vector>
 
 namespace blackparrot {
 
 struct NativeCapture;
+struct NativeCompletionEvidence;
 
 // Convert DUT actual snapshots only. The borrowed public session owns all REF
 // execution, expected values, store audits, source-order ranks and checking.
 rvwmo::CheckResult capture_architectural_retirements(
     const ConvertedOutput &converted, std::vector<rvwmo::ArchitecturalRetirement> &retirements);
-
-// The native coordinator must prove these facts for the whole configured hart
-// and observation-producer roster. Counts, heartbeat and native finish alone do
-// not establish completion, source closure or cache/coherence drain.
-struct NativeCompletionEvidence {
-  std::optional<uint64_t> completed_cycle;
-  bool all_harts_completed = false;
-  bool observations_drained = false;
-  bool memory_drained = false;
-  PendingState pending;
-};
 
 class SessionAdapter {
 public:
@@ -54,6 +43,9 @@ private:
 
   rvwmo::SessionSubmitResult reject_capture(rvwmo::CheckResult failure);
 };
+
+// The borrowed adapter/session must outlive the native simulation.
+ConversionResult install_native_session(Configuration configuration, SessionAdapter &adapter);
 
 } // namespace blackparrot
 

@@ -51,7 +51,7 @@ rvwmo::CheckResult validate_completion(const NativeCompletionEvidence &evidence)
   if (!evidence.observations_drained)
     return {CheckStatus::Incomplete, 0, "native finalization lacks complete observation delivery and source closure"};
   if (!evidence.memory_drained)
-    return {CheckStatus::Incomplete, 0, "native finalization lacks physical store/cache/coherence drain proof"};
+    return {CheckStatus::Incomplete, 0, "native finalization lacks completion of checked memory effects and their observation sources"};
   const auto &pending = evidence.pending;
   if (pending.instructions || pending.writebacks || pending.load_samples || pending.unpublished_stores)
     return {CheckStatus::Incomplete, 0, "native finalization retains instructions, writebacks, samples or unpublished stores"};
@@ -92,6 +92,7 @@ SessionAdapter::SessionAdapter(rvwmo::ObservationSession &session) : session_(se
 
 rvwmo::SessionSubmitResult SessionAdapter::reject_capture(rvwmo::CheckResult failure) {
   capture_failure_ = std::move(failure);
+  finalized_ = false;
   finalized_ = false;
   rvwmo::SessionSubmitResult result;
   result.transport = {transport_status(capture_failure_.status), capture_failure_.message};
@@ -139,6 +140,17 @@ rvwmo::CheckResult SessionAdapter::finalize(const NativeCompletionEvidence &evid
     return {rvwmo::CheckStatus::Incomplete, result.rule, result.message};
   finalized_ = result.status == rvwmo::CheckStatus::Pass && session_.finalized();
   return result;
+}
+
+ConversionResult install_native_session(Configuration configuration, SessionAdapter &adapter) {
+  return install_native_verifier(std::move(configuration), [&adapter](const NativeCapture &capture) {
+    const auto submitted = adapter.submit(capture);
+    if (!submitted.accepted || (submitted.check.status != rvwmo::CheckStatus::Pass &&
+                               submitted.check.status != rvwmo::CheckStatus::Pending))
+      return NativeVerification{submitted.check, false};
+    const auto result = adapter.finalize(capture.completion);
+    return NativeVerification{result, adapter.finalized()};
+  });
 }
 
 } // namespace blackparrot

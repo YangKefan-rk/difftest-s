@@ -69,6 +69,37 @@ struct NativeCancellationFact {
   uint32_t reason = 0;
 };
 
+struct NativeCoherenceFact {
+  rvwmo::OperationId id;
+  uint32_t attempt = 0;
+  uint64_t source_time = 0;
+  uint64_t address = 0;
+  uint32_t cache_set = 0;
+  uint32_t cache_way = 0;
+  uint32_t coherence_state = 0;
+  uint64_t grant_time = 0;
+  uint32_t proof_flags = 0;
+};
+
+// Evidence is emitted only by the native terminal-WFI protocol after issue is
+// stopped, retained speculative identities are explicitly squashed, and the
+// synchronous source monitors have delivered their complete final prefix.
+struct NativeCompletionEvidence {
+  std::optional<uint64_t> completed_cycle;
+  bool all_harts_completed = false;
+  bool observations_drained = false;
+  // The checked scalar memory effects and their source records are complete.
+  // This does not require dirty cache lines to reach DRAM or every network FIFO
+  // to be empty; maintenance tails cannot create another included instruction.
+  bool memory_drained = false;
+  PendingState pending;
+};
+
+struct NativeVerification {
+  rvwmo::CheckResult check{rvwmo::CheckStatus::Incomplete, 0, "no native semantic verifier installed"};
+  bool finalized = false;
+};
+
 struct NativeSummary {
   uint64_t allocations = 0;
   uint64_t retries = 0;
@@ -82,6 +113,7 @@ struct NativeSummary {
   // Capture success and an installed sink do not constitute a semantic verdict.
   bool incomplete = true;
   std::vector<std::string> gaps;
+  std::optional<NativeVerification> verification;
 };
 
 struct NativeCapture {
@@ -92,13 +124,19 @@ struct NativeCapture {
   std::vector<NativeCancellationFact> cancellation_facts;
   std::vector<NativeForwardFact> forwarding_facts;
   NativeSummary summary;
+  std::vector<NativeCoherenceFact> coherence_facts;
+  NativeCompletionEvidence completion;
 };
+
+using NativeVerifier = std::function<NativeVerification(const NativeCapture &)>;
 
 using NativeSink = std::function<ConversionResult(const NativeCapture &)>;
 
 // Install before probe initialization. The coordinator owns the producer roster,
 // ObservationStream, source-prefix proof, REF, rank resolver and final verdict.
 ConversionResult install_native_sink(Configuration configuration, NativeSink sink);
+// A verifier reports the public session result separately from transport status.
+ConversionResult install_native_verifier(Configuration configuration, NativeVerifier verifier);
 // An explicit fresh session is allowed only before initialization or after finish.
 ConversionResult reset_native_session();
 const NativeCapture &last_native_capture();
@@ -127,6 +165,14 @@ int bp_difftest_s_memory(uint32_t hart, uint64_t epoch, uint64_t uid, uint32_t a
 int bp_difftest_s_forward_byte(uint32_t hart, uint64_t epoch, uint64_t uid, uint32_t attempt,
                               uint32_t byte_index, uint64_t writer_epoch, uint64_t writer_uid);
 int bp_difftest_s_memory_idle(uint32_t hart, uint64_t source_time, uint32_t physically_idle);
+int bp_difftest_s_coherent_drain(uint32_t hart, uint64_t epoch, uint64_t uid, uint32_t attempt,
+                                 uint64_t source_time, uint64_t address, uint32_t cache_set,
+                                 uint32_t cache_way, uint32_t state, uint64_t grant_time, uint32_t proof_flags);
+int bp_difftest_s_terminal_state(uint32_t hart, uint64_t source_time, uint64_t terminal_uid,
+                                uint32_t stopped, uint32_t pending_writebacks);
+int bp_difftest_s_can_end();
+int bp_difftest_s_close_hart(uint32_t hart, uint64_t source_time, uint64_t terminal_uid);
+int bp_difftest_s_close_prefix(uint64_t completed_cycle);
 int bp_difftest_s_finish();
 }
 
