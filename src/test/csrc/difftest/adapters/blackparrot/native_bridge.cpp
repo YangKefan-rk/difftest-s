@@ -22,6 +22,7 @@ constexpr uint32_t kInternalMemoryFlag = 1u << 2;
 constexpr uint32_t kCacheSetCount = 64;
 constexpr uint32_t kCacheWayCount = 8;
 constexpr uint32_t kCacheBankOffsetMask = kCacheWayCount - 1;
+constexpr uint32_t kCacheBankSelectMask = (uint32_t{1} << kCacheWayCount) - 1;
 using DrainKey = std::tuple<rvwmo::OperationId, uint32_t, uint64_t, uint64_t>;
 
 DrainKey drain_key(const rvwmo::OperationId &id, uint32_t attempt, uint64_t time, uint64_t address) {
@@ -507,7 +508,7 @@ public:
                   fact.grant_time < fact.source_time,
               "coherent drain proof lacks the fixed four-hart ownership/write evidence");
       require(fact.bank_select && !(fact.bank_select & (fact.bank_select - 1)) &&
-                  !(fact.bank_select & ~uint32_t{kCacheWayCount - 1}) &&
+                  !(fact.bank_select & ~kCacheBankSelectMask) &&
                   fact.physical_sram_index < kCacheSetCount * kCacheWayCount,
               "coherent drain proof lacks a one-hot physical SRAM location");
       uint32_t physical_bank = 0;
