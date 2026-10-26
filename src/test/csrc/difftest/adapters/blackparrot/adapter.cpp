@@ -2,10 +2,13 @@
 #include "../../rvwmo/stream.h"
 #include <algorithm>
 #include <functional>
+#include <iterator>
 #include <limits>
+#include <list>
 #include <map>
 #include <queue>
 #include <set>
+#include <stdexcept>
 #include <utility>
 
 namespace blackparrot {
@@ -211,6 +214,10 @@ struct Adapter::State {
   std::map<uint32_t, uint64_t> last_retirement;
   std::set<uint32_t> done_harts;
   std::map<rvwmo::OperationId, Instruction> instructions;
+  std::map<uint32_t, std::set<uint64_t>> unretired_uids;
+  using RetirementFrontier = std::list<rvwmo::OperationId>;
+  std::map<uint32_t, RetirementFrontier> retirement_frontiers;
+  std::map<rvwmo::OperationId, RetirementFrontier::iterator> retirement_positions;
   std::map<rvwmo::OperationId, Store> stores;
   std::map<rvwmo::OperationId, rvwmo::StorePublishEvent> early_publications;
   std::set<uint64_t> transactions;
@@ -326,11 +333,16 @@ struct Adapter::State {
   }
 
   void flush_retirements(uint32_t hart) {
-    for (auto instruction = instructions.begin(); instruction != instructions.end();) {
-      if (instruction->first.hart != hart) {
-        ++instruction;
-        continue;
-      }
+    auto frontier = retirement_frontiers.find(hart);
+    if (frontier == retirement_frontiers.end())
+      return;
+
+    auto &ordered_instructions = frontier->second;
+    while (!ordered_instructions.empty()) {
+      const auto id = ordered_instructions.front();
+      auto instruction = instructions.find(id);
+      if (instruction == instructions.end())
+        throw std::logic_error("retirement frontier has no matching live instruction");
       auto &live = instruction->second;
       if (!live.retirement || needs_writeback(*live.retirement) || missing_load_samples(live))
         return;
@@ -386,8 +398,11 @@ struct Adapter::State {
         if (store->second.published)
           stores.erase(store);
       }
-      instruction = instructions.erase(instruction);
+      instructions.erase(instruction);
+      retirement_positions.erase(id);
+      ordered_instructions.pop_front();
     }
+    retirement_frontiers.erase(frontier);
   }
 };
 
@@ -433,6 +448,10 @@ ConversionResult Adapter::allocate(const Origin &origin, const rvwmo::Instructio
   live.allocation = record;
   live.allocated_at = origin;
   state.instructions.emplace(record.id, std::move(live));
+  auto &frontier = state.retirement_frontiers[record.id.hart];
+  frontier.push_back(record.id);
+  state.retirement_positions.emplace(record.id, std::prev(frontier.end()));
+  state.unretired_uids[record.id.hart].insert(record.id.uid);
   state.last_allocation[record.id.hart] = {record.id.epoch, record.id.uid};
   state.append(origin, rvwmo::RuntimeEventKind::InstructionAllocate, record);
   return {};
@@ -596,9 +615,10 @@ ConversionResult Adapter::retire(const Origin &origin, const RetireRecord &recor
   auto last_retired = state.last_retirement.find(record.id.hart);
   if (last_retired != state.last_retirement.end() && record.id.uid <= last_retired->second)
     return invalid("retirement UID is not strictly increasing per hart");
-  for (const auto &earlier : state.instructions)
-    if (earlier.first.hart == record.id.hart && earlier.first.uid < record.id.uid && !earlier.second.retirement)
-      return invalid("retirement bypassed an earlier live instruction in this in-order hart");
+  const auto unretired = state.unretired_uids.find(record.id.hart);
+  if (unretired != state.unretired_uids.end() && !unretired->second.empty() &&
+      *unretired->second.begin() < record.id.uid)
+    return invalid("retirement bypassed an earlier live instruction in this in-order hart");
   if (!record.integer_writeback && record.register_value)
     return invalid("retirement provides a register value without integer writeback");
   if (record.integer_writeback && record.length == 4 && record.rd != ((record.instruction >> 7) & 31))
@@ -663,6 +683,7 @@ ConversionResult Adapter::retire(const Origin &origin, const RetireRecord &recor
     return invalid("retirement omitted a live memory effect or left an uncancelled attempt unselected");
 
   live.retirement = record;
+  state.unretired_uids[record.id.hart].erase(record.id.uid);
   live.retired_at = origin;
   if (live.writeback)
     live.retirement->register_value = live.writeback->value;
@@ -791,6 +812,17 @@ ConversionResult Adapter::squash(const Origin &origin, const rvwmo::OperationId 
       return invalid("instruction squash source time predates a captured load sample");
 
   state.append(origin, rvwmo::RuntimeEventKind::InstructionSquash, rvwmo::InstructionSquashEvent{id});
+  state.unretired_uids[id.hart].erase(id.uid);
+  const auto position = state.retirement_positions.find(id);
+  if (position != state.retirement_positions.end()) {
+    auto frontier = state.retirement_frontiers.find(id.hart);
+    if (frontier == state.retirement_frontiers.end())
+      throw std::logic_error("squashed instruction has no per-hart retirement frontier");
+    frontier->second.erase(position->second);
+    state.retirement_positions.erase(position);
+    if (frontier->second.empty())
+      state.retirement_frontiers.erase(frontier);
+  }
   state.instructions.erase(instruction);
   return {};
 }
