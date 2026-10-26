@@ -8,7 +8,6 @@
 #include <map>
 #include <memory>
 #include <set>
-#include <sstream>
 #include <stdexcept>
 #include <tuple>
 #include <utility>
@@ -170,29 +169,24 @@ public:
       gaps.push_back(message);
   }
 
-  void trace(const std::string &record) {
-    if (!trace_checked_) {
-      trace_checked_ = true;
-      const char *path = std::getenv("BP_DIFFTEST_S_TRACE");
-      if (path && *path) {
-        trace_.open(path);
-        require(trace_.is_open(), "cannot open BP_DIFFTEST_S_TRACE");
-      }
-    }
-    if (trace_.is_open()) {
-      trace_ << record << '\n';
-      trace_.flush();
-      require(static_cast<bool>(trace_), "cannot write BP_DIFFTEST_S_TRACE");
-    }
-  }
-
   template <typename... Fields> void record(const char *kind, const Fields &...fields) {
     require(observations < kMaximumObservations, "native observation buffer limit reached");
     ++observations;
-    std::ostringstream line;
-    line << kind;
-    ((line << '\t' << fields), ...);
-    trace(line.str());
+    auto *output = trace_stream();
+    if (!output)
+      return;
+    *output << kind;
+    ((*output << '\t' << fields), ...);
+    *output << '\n';
+    flush_trace();
+  }
+
+  void trace(const std::string &record) {
+    auto *output = trace_stream();
+    if (!output)
+      return;
+    *output << record << '\n';
+    flush_trace();
   }
 
   Hart &hart(uint32_t id) {
@@ -682,6 +676,23 @@ private:
   bool trace_checked_ = false;
   std::ofstream trace_;
   uint64_t publication_transaction_ = 0;
+
+  std::ostream *trace_stream() {
+    if (!trace_checked_) {
+      trace_checked_ = true;
+      const char *path = std::getenv("BP_DIFFTEST_S_TRACE");
+      if (path && *path) {
+        trace_.open(path);
+        require(trace_.is_open(), "cannot open BP_DIFFTEST_S_TRACE");
+      }
+    }
+    return trace_.is_open() ? &trace_ : nullptr;
+  }
+
+  void flush_trace() {
+    trace_.flush();
+    require(static_cast<bool>(trace_), "cannot write BP_DIFFTEST_S_TRACE");
+  }
 
   const HartChannels &channels(uint32_t id) const {
     return *std::find_if(configuration.harts.begin(), configuration.harts.end(),
