@@ -26,50 +26,31 @@ bool is_memory_event_kind(const RuntimeEvent &event) {
   }
 }
 
-CheckResult validate_memory_rank_order(const std::vector<RuntimeEvent> &events) {
-  struct CycleSources {
-    std::set<uint32_t> producers;
-    std::map<uint16_t, std::set<uint32_t>> phase_producers;
-    bool has_unqualified_source = false;
-  };
-
-  std::map<uint64_t, CycleSources> cycles;
-  for (const auto &event : events) {
-    if (!is_memory_event_kind(event))
-      continue;
-    auto &sources = cycles[event.source.cycle];
-    sources.producers.insert(event.producer_id);
-    if (!event.source.order_qualified) {
-      sources.has_unqualified_source = true;
-      continue;
-    }
-    sources.phase_producers[event.source.qualified_phase].insert(event.producer_id);
-  }
-
-  for (const auto &cycle : cycles) {
-    const auto &sources = cycle.second;
-    if (sources.producers.size() < 2)
-      continue;
-    if (sources.has_unqualified_source)
-      return incomplete("same-cycle memory events lack cross-producer order evidence");
-    for (const auto &phase : sources.phase_producers)
-      if (phase.second.size() > 1)
-        return incomplete("same-cycle memory events share a phase without qualified relative order");
-  }
-  return {};
+bool ordinary_scalar_load(const RuntimeEvent &event) {
+  if (event.kind != RuntimeEventKind::LoadSample)
+    return false;
+  const auto &operation = std::get<LoadSampleEvent>(event.payload).operation;
+  const auto width = operation.byte_mask.size();
+  return operation.load && !operation.store && !operation.atomic && !operation.lr && !operation.sc &&
+         !operation.acquire && !operation.release && !operation.rcsc && !operation.has_paired_lr &&
+         operation.id.subaccess == 0 && (width == 1 || width == 2 || width == 4 || width == 8) &&
+         std::all_of(operation.byte_mask.begin(), operation.byte_mask.end(), [](uint8_t byte) { return byte == 1; });
 }
 } // namespace
 
 ObservationSession::ObservationSession(StreamContract contract, std::vector<ProducerCapability> producers,
                                        Memory::ReadGlobal read_global, Memory::WriteGlobal write_global,
                                        ReferenceStepper reference_stepper,
-                                       size_t max_live_instructions, size_t max_pending_retirements)
+                                       size_t max_live_instructions, size_t max_pending_retirements, size_t max_harts)
     : max_pending_events_(contract.max_pending_events), max_architectural_retirements_(max_pending_retirements),
+      max_harts_(max_harts),
       stream_(std::move(contract), producers),
       consumer_(std::move(read_global), std::move(write_global),
                 [this](const RuntimeEvent &event) { return resolve_current_rank(event); },
                 max_live_instructions, max_pending_retirements),
       reference_stepper_(std::move(reference_stepper)) {
+  if (!max_harts_)
+    throw std::invalid_argument("ObservationSession requires a nonzero hart-statistics bound");
   if (!stream_.configuration())
     failure_ = {CheckStatus::Unsupported, 0, stream_.configuration().message};
 }
@@ -104,16 +85,81 @@ CheckResult ObservationSession::collect_closed_events() {
                                                                            : CheckStatus::Incomplete;
     return remember_failure({status, 0, drained.message});
   }
-  std::vector<RuntimeEvent> rank_window;
-  rank_window.reserve(pending_events_.size() + drained.events.size());
-  for (const auto &pending_event : pending_events_)
-    rank_window.push_back(pending_event.event);
-  rank_window.insert(rank_window.end(), drained.events.begin(), drained.events.end());
-  auto order = validate_memory_rank_order(rank_window);
+  // drain() only releases complete source cycles. A cycle is classified once;
+  // no later batch may append another member after this prefix has closed.
+  std::vector<std::shared_ptr<ReadGroup>> groups(drained.events.size());
+  auto order = classify_read_groups(drained.events, groups);
   if (!order)
     return remember_failure(order);
-  for (const auto &event : drained.events)
-    pending_events_.push_back({event});
+  for (size_t index = 0; index < drained.events.size(); ++index)
+    pending_events_.push_back({drained.events[index], std::move(groups[index])});
+  return {};
+}
+
+CheckResult ObservationSession::classify_read_groups(const std::vector<RuntimeEvent> &events,
+                                                       std::vector<std::shared_ptr<ReadGroup>> &groups) const {
+  for (size_t begin = 0; begin < events.size();) {
+    size_t end = begin + 1;
+    while (end < events.size() && events[end].source.cycle == events[begin].source.cycle)
+      ++end;
+    std::vector<size_t> memory_events;
+    std::set<uint32_t> producers;
+    std::map<uint16_t, std::set<uint32_t>> phase_producers;
+    std::set<uint32_t> harts;
+    bool unqualified = false;
+    bool all_loads = true;
+    bool unique_harts = true;
+    for (size_t index = begin; index < end; ++index) {
+      const auto &event = events[index];
+      if (!is_memory_event(event))
+        continue;
+      memory_events.push_back(index);
+      producers.insert(event.producer_id);
+      if (event.source.order_qualified)
+        phase_producers[event.source.qualified_phase].insert(event.producer_id);
+      else
+        unqualified = true;
+      if (!ordinary_scalar_load(event)) {
+        all_loads = false;
+      } else {
+        unique_harts &= harts.insert(std::get<LoadSampleEvent>(event.payload).operation.id.hart).second;
+      }
+    }
+    begin = end;
+    if (producers.size() < 2)
+      continue;
+
+    bool unordered = unqualified;
+    for (const auto &phase : phase_producers)
+      unordered |= phase.second.size() > 1;
+    if (!unordered)
+      continue;
+    if (!all_loads || !unique_harts || memory_events.size() != producers.size())
+      return incomplete("same-cycle unordered memory requires one ordinary load per hart and producer");
+    if (unqualified && phase_producers.size() > 1)
+      return incomplete("unqualified reads cannot share a rank across distinct qualified phases");
+
+    std::map<uint16_t, std::vector<size_t>> phase_groups;
+    for (const auto index : memory_events)
+      phase_groups[unqualified ? 0 : events[index].source.qualified_phase].push_back(index);
+    for (const auto &phase : phase_groups) {
+      if (phase.second.size() < 2)
+        continue;
+      auto group = std::make_shared<ReadGroup>();
+      group->remaining = phase.second.size();
+      for (const auto index : phase.second)
+        groups[index] = group;
+    }
+  }
+  return {};
+}
+
+CheckResult ObservationSession::ensure_statistics_hart(uint32_t hart) {
+  if (!hart_statistics_.count(hart)) {
+    if (hart_statistics_.size() >= max_harts_)
+      return invalid("session hart-statistics bound exceeded");
+    hart_statistics_.emplace(hart, SessionHartStatistics{});
+  }
   return {};
 }
 
@@ -140,11 +186,21 @@ CheckResult ObservationSession::consume_pending_events() {
         if (next_rank_ == std::numeric_limits<uint64_t>::max())
           return remember_failure(invalid("session memory rank space exhausted"));
         current_rank_event_ = std::make_pair(event.producer_id, event.source.producer_sequence);
-        current_rank_ = {next_rank_, true};
+        if (pending_event->read_group) {
+          if (!pending_event->read_group->time.valid)
+            pending_event->read_group->time = {next_rank_, true};
+          current_rank_ = pending_event->read_group->time;
+        } else {
+          current_rank_ = {next_rank_, true};
+        }
       }
-      auto result = event.kind == RuntimeEventKind::InstructionRetire
-                        ? consume_retirement(event, std::get<InstructionRetireEvent>(event.payload))
-                        : consumer_.consume_closed(event);
+      CheckResult result;
+      if (event.kind == RuntimeEventKind::InstructionRetire)
+        result = consume_retirement(event, std::get<InstructionRetireEvent>(event.payload));
+      else if (pending_event->read_group)
+        result = consumer_.consume_read_group_member(event);
+      else
+        result = consumer_.consume_closed(event);
       current_rank_event_.reset();
       current_rank_ = {};
 
@@ -158,7 +214,7 @@ CheckResult ObservationSession::consume_pending_events() {
       }
       if (!result)
         return remember_failure(result);
-      if (memory_event)
+      if (memory_event && (!pending_event->read_group || --pending_event->read_group->remaining == 0))
         ++next_rank_;
       pending_event = pending_events_.erase(pending_event);
       progress = true;
@@ -198,6 +254,14 @@ CheckResult ObservationSession::step_reference(const InstructionRetireEvent &ret
     loads.push_back({operation.id, operation.attempt, std::move(expected)});
   }
 
+  auto statistics_result = ensure_statistics_hart(retirement.instruction.hart);
+  if (!statistics_result)
+    return statistics_result;
+  auto &statistics = hart_statistics_.at(retirement.instruction.hart);
+  if (statistics.reference_steps == std::numeric_limits<uint64_t>::max() ||
+      statistics.architecture_compared == std::numeric_limits<uint64_t>::max())
+    return invalid("session reference-statistics counter exhausted");
+  ++statistics.reference_steps;
   auto result = reference_stepper_(retirement, snapshot, loads);
   if (result.check.status == CheckStatus::Pending)
     return invalid("reference step callback must finish synchronously once invoked");
@@ -216,6 +280,8 @@ CheckResult ObservationSession::step_reference(const InstructionRetireEvent &ret
   } else if (snapshot.destination_register != 0 || result.integer_write) {
     return {CheckStatus::Violation, 0, "unexpected integer write for a non-writing retirement"};
   }
+
+  ++statistics.architecture_compared;
 
   std::vector<const MemoryOperation *> stores;
   for (const auto &operation : retirement.instruction.memory)
@@ -265,8 +331,20 @@ CheckResult ObservationSession::consume_retirement(const RuntimeEvent &event,
     ++reference->second.audited_stores;
   }
 
+  auto &statistics = hart_statistics_.at(retirement.instruction.hart);
+  const uint64_t loads = std::count_if(retirement.instruction.memory.begin(), retirement.instruction.memory.end(),
+                                      [](const MemoryOperation &operation) { return operation.load; });
+  const uint64_t stores = std::count_if(retirement.instruction.memory.begin(), retirement.instruction.memory.end(),
+                                       [](const MemoryOperation &operation) { return operation.store; });
+  if (statistics.retired_instructions == std::numeric_limits<uint64_t>::max() ||
+      loads > std::numeric_limits<uint64_t>::max() - statistics.retired_load_operations ||
+      stores > std::numeric_limits<uint64_t>::max() - statistics.retired_store_operations)
+    return invalid("session retirement-statistics counter exhausted");
   auto result = consumer_.consume_closed(event);
   if (result) {
+    ++statistics.retired_instructions;
+    statistics.retired_load_operations += loads;
+    statistics.retired_store_operations += stores;
     reference_records_.erase(reference);
     architectural_retirements_.erase(snapshot);
   }

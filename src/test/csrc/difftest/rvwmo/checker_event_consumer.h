@@ -36,6 +36,7 @@ public:
   CheckResult finalize();
 
 private:
+  friend class ObservationSession;
   using LoadKey = std::pair<OperationId, uint32_t>;
   struct Allocation {
     uint64_t pc = 0;
@@ -66,13 +67,24 @@ private:
   std::map<LoadKey, LoadRecord> loads_;
   std::set<LoadKey> cancelled_loads_;
   std::optional<uint64_t> last_memory_rank_;
+  struct ReadGroupReceipt {
+    uint64_t rank = 0;
+    uint64_t cycle = 0;
+    std::set<uint32_t> harts;
+    std::set<uint32_t> producers;
+  };
+  std::optional<ReadGroupReceipt> last_read_group_;
   CheckResult failure_;
 
   static OperationId instruction_id(const OperationId &operation);
-  CheckResult require_rank(const RuntimeEvent &event, ObservationTime &time) const;
+  CheckResult require_rank(const RuntimeEvent &event, ObservationTime &time, bool certified_read_group = false) const;
+  // Only ObservationSession certifies a complete, source-closed group. Public
+  // consume_closed remains strictly ranked, including same-hart load pairs.
+  CheckResult consume_read_group_member(const RuntimeEvent &event);
   CheckResult consume_allocate(const InstructionAllocateEvent &event);
   CheckResult consume_local_store(const LocalStoreEvent &event);
-  CheckResult consume_load_sample(const RuntimeEvent &event, const LoadSampleEvent &sample);
+  CheckResult consume_load_sample(const RuntimeEvent &event, const LoadSampleEvent &sample,
+                                  bool certified_read_group = false);
   CheckResult consume_store_publish(const RuntimeEvent &event, const StorePublishEvent &publish);
   CheckResult consume_cancel(const InstructionCancelAttemptEvent &event);
   CheckResult consume_squash(const InstructionSquashEvent &event);
