@@ -327,12 +327,12 @@ CheckResult EventEmitter::publish_store(const StoreObservation &store, uint64_t 
     return reject(CheckStatus::Invalid, "Rocket publication has no matching store instruction");
   if (!found->second.retired)
     return {CheckStatus::Pending, 0, "Rocket publication awaits architectural store commit"};
-  const auto store_order = compare_source_position(configuration_.producer, found->second.store->source,
-                                                   configuration_.publication_producer, store.source);
-  if (store_order == SourceOrder::After || store_order == SourceOrder::Equal)
-    return reject(CheckStatus::Invalid, "Rocket publication does not follow local store commit");
-  if (store_order == SourceOrder::Unordered)
-    return reject(CheckStatus::Incomplete, "Rocket local commit and publication lack qualified source order");
+  const auto allocation_order = compare_source_position(configuration_.producer, found->second.allocation.source,
+                                                        configuration_.publication_producer, store.source);
+  if (allocation_order == SourceOrder::After || allocation_order == SourceOrder::Equal)
+    return reject(CheckStatus::Invalid, "Rocket publication does not follow its instruction allocation");
+  if (allocation_order == SourceOrder::Unordered)
+    return reject(CheckStatus::Incomplete, "Rocket allocation and publication lack qualified source order");
   if (batch_.events.size() >= configuration_.capacity)
     return {CheckStatus::Pending, 0, "Rocket output batch capacity reached"};
   StorePublishEvent publication;

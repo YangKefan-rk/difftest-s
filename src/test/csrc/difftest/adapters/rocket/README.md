@@ -174,3 +174,12 @@ store. Hart watermark checks inspect only unretired allocations; they still
 inspect every such allocation because native token order alone does not prove
 allocation source-time order. Publication identities and store bytes remain
 live until their real publication is accepted.
+
+
+A caller-qualified store publication may physically precede the WB/LocalStore
+metadata. The emitter retains that original source and exports it only after
+confirmed retirement. Its source must follow the instruction allocation; it
+need not follow the later metadata capture. The released public session defers
+an early publication until its LocalStore record arrives. This does not prove
+that a raw cache drain is a global publication: the embedding collector still
+supplies the actual coherence/publication evidence.
