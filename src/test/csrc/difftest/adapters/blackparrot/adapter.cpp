@@ -12,7 +12,6 @@ namespace blackparrot {
 namespace {
 ConversionResult invalid(const char *message) { return {ConversionStatus::Invalid, message}; }
 ConversionResult waiting(const char *message) { return {ConversionStatus::Waiting, message}; }
-ConversionResult incomplete(const char *message) { return {ConversionStatus::Incomplete, message}; }
 ConversionResult unsupported(const char *message) { return {ConversionStatus::Unsupported, message}; }
 
 rvwmo::OperationId parent_id(const rvwmo::OperationId &id) { return {id.hart, id.epoch, id.uid, 0}; }
@@ -44,6 +43,17 @@ ConversionResult validate_range(uint64_t address, const std::vector<uint8_t> &by
   if (std::any_of(mask.begin(), mask.end(), [](uint8_t byte) { return byte > 1; }) ||
       std::none_of(mask.begin(), mask.end(), [](uint8_t byte) { return byte == 1; }))
     return invalid("byte masks must contain binary lanes and at least one enabled byte");
+  return {};
+}
+
+ConversionResult validate_publication_local(const rvwmo::StorePublishEvent &publication,
+                                            const rvwmo::LocalStoreEvent &local) {
+  if (publication.address != local.address || publication.byte_mask != local.byte_mask ||
+      publication.bytes.size() != local.bytes.size())
+    return invalid("StorePublish address/mask/size differs from its LocalStore");
+  for (size_t byte = 0; byte < publication.bytes.size(); ++byte)
+    if (publication.byte_mask[byte] && publication.bytes[byte] != local.bytes[byte])
+      return invalid("enabled publication byte differs from its LocalStore value");
   return {};
 }
 
@@ -185,7 +195,7 @@ struct Adapter::State {
   };
   struct Store {
     rvwmo::LocalStoreEvent local;
-    Origin local_origin;
+    uint64_t allocated_cycle = 0;
     bool retired = false;
     bool published = false;
   };
@@ -202,6 +212,7 @@ struct Adapter::State {
   std::set<uint32_t> done_harts;
   std::map<rvwmo::OperationId, Instruction> instructions;
   std::map<rvwmo::OperationId, Store> stores;
+  std::map<rvwmo::OperationId, rvwmo::StorePublishEvent> early_publications;
   std::set<uint64_t> transactions;
   ConvertedOutput output;
 
@@ -340,10 +351,6 @@ struct Adapter::State {
                                           "load sample and retirement share a cycle without qualified source order"});
             live.unordered_load_retirement_reported = true;
           }
-        } else if (source_order == rvwmo::SourceOrder::After) {
-          output.diagnostics.push_back({rvwmo::CheckStatus::Incomplete, record.id,
-                                        "load sample occurs after architectural retirement; current source-ordered "
-                                        "consumer requires its sample before retirement"});
         }
       }
 
@@ -448,8 +455,8 @@ ConversionResult Adapter::load_sample(const Origin &origin, const rvwmo::LoadSam
       (!operation.read_sources.empty() && operation.read_sources.size() != record.actual_bytes.size()))
     return invalid("load provenance does not have one entry per byte lane");
   auto &live = state.instructions.at(operation.id);
-  if (state.stores.count(operation.id))
-    return invalid("ordinary instruction cannot contain both a local store and a load sample");
+  if (state.stores.count(operation.id) || state.early_publications.count(operation.id))
+    return invalid("ordinary instruction cannot contain a store publication/local store and a load sample");
   if (live.retirement) {
     const auto &selected = live.retirement->memory;
     if (selected.size() != 1 || !selected[0].load || selected[0].atomic || selected[0].lr || selected[0].sc ||
@@ -476,7 +483,8 @@ ConversionResult Adapter::cancel_load(const Origin &origin, const rvwmo::Instruc
   if (!result)
     return result;
   auto &live = state.instructions.at(record.id);
-  if (state.stores.count(record.id) || live.cancelled.count(record.attempt))
+  if (state.stores.count(record.id) || state.early_publications.count(record.id) ||
+      live.cancelled.count(record.attempt))
     return invalid("attempt cancellation is duplicated or targets an ordinary store");
   live.cancelled.insert(record.attempt);
   live.loads.erase(record.attempt);
@@ -498,9 +506,18 @@ ConversionResult Adapter::local_store(const Origin &origin, const rvwmo::LocalSt
   const auto &live = state.instructions.at(record.id);
   if (state.stores.count(record.id) || !live.loads.empty() || !live.cancelled.empty())
     return invalid("LocalStore is duplicated or shares an ordinary load instruction identity");
-  if (state.stores.size() >= state.options.max_live_instructions)
-    return waiting("outstanding LocalStore limit reached; retain and retry after publication/retirement");
-  state.stores.emplace(record.id, State::Store{record, origin, false, false});
+  const auto early = state.early_publications.find(record.id);
+  if (early != state.early_publications.end()) {
+    result = validate_publication_local(early->second, record);
+    if (!result)
+      return result;
+  } else if (state.stores.size() + state.early_publications.size() >= state.options.max_live_instructions) {
+    return waiting("outstanding store lifecycle limit reached; retry after publication/retirement");
+  }
+  const bool published = early != state.early_publications.end();
+  state.stores.emplace(record.id, State::Store{record, live.allocated_at.source.cycle, false, published});
+  if (published)
+    state.early_publications.erase(early);
   state.append(origin, rvwmo::RuntimeEventKind::LocalStore, record);
   return {};
 }
@@ -525,37 +542,43 @@ ConversionResult Adapter::publish_store(const Origin &origin, const rvwmo::Store
   const auto &member = record.members.front();
   if (!same_position(member.publish_position, origin.source))
     return invalid("single-store publication member must retain the envelope source position");
+  result = state.validate_id(member.id);
+  if (!result)
+    return result;
+  if (member.id.subaccess != 0)
+    return unsupported("split/vector store publication exceeds the scalar adapter profile");
+  for (size_t byte = 0; byte < record.bytes.size(); ++byte)
+    if (record.byte_mask[byte] && record.byte_writers[byte] != member.id)
+      return invalid("enabled publication byte has the wrong writer identity");
   auto store = state.stores.find(member.id);
-  if (store == state.stores.end() || store->second.published)
-    return invalid("publication has no unique unpublished LocalStore identity");
-  const auto &local_origin = store->second.local_origin;
-  if (local_origin.source.cycle > origin.source.cycle)
-    return invalid("StorePublish source time predates its LocalStore");
-  if (local_origin.source.cycle == origin.source.cycle) {
-    if (!local_origin.source.order_qualified || !origin.source.order_qualified)
-      return incomplete("same-cycle LocalStore and StorePublish lack a qualified source order");
-    if (local_origin.source.qualified_phase > origin.source.qualified_phase)
-      return invalid("StorePublish source phase predates its LocalStore phase");
-    if (local_origin.source.qualified_phase == origin.source.qualified_phase) {
-      if (local_origin.producer_id != origin.producer_id)
-        return incomplete("same-cycle LocalStore and StorePublish share a phase across unordered producers");
-      if (local_origin.source.producer_sequence >= origin.source.producer_sequence)
-        return invalid("StorePublish does not follow its LocalStore in their shared producer sequence");
-    }
-  }
-  const auto &local = store->second.local;
-  if (record.address != local.address || record.byte_mask != local.byte_mask ||
-      record.bytes.size() != local.bytes.size())
-    return invalid("StorePublish address/mask/size differs from its LocalStore");
-  for (size_t byte = 0; byte < record.bytes.size(); ++byte) {
-    if (record.byte_mask[byte] && (record.byte_writers[byte] != member.id || record.bytes[byte] != local.bytes[byte]))
-      return invalid("enabled publication byte has the wrong writer identity or LocalStore value");
+  if (state.early_publications.count(member.id) || (store != state.stores.end() && store->second.published))
+    return invalid("store identity already has a physical publication");
+  if (store != state.stores.end()) {
+    if (origin.source.cycle < store->second.allocated_cycle)
+      return invalid("publication source time predates its instruction allocation");
+    result = validate_publication_local(record, store->second.local);
+    if (!result)
+      return result;
+  } else {
+    const auto allocated = state.instructions.find(member.id);
+    if (allocated == state.instructions.end())
+      return invalid("early publication has no live allocated store identity");
+    if (origin.source.cycle < allocated->second.allocated_at.source.cycle)
+      return invalid("early publication source time predates its instruction allocation");
+    if (state.stores.size() + state.early_publications.size() >= state.options.max_live_instructions)
+      return waiting("outstanding store lifecycle limit reached; retry after local match/retirement");
   }
   if (state.transactions.size() >= state.options.max_publication_transactions)
     return unsupported("exact publication transaction history bound exhausted; safe deduplication cannot continue");
-  store->second.published = true;
-  if (store->second.retired)
-    state.stores.erase(store);
+  if (store == state.stores.end()) {
+    // The source event is delivered now, with its original position. The public
+    // session retains it until LocalStore and independent REF audit exist.
+    state.early_publications.emplace(member.id, record);
+  } else {
+    store->second.published = true;
+    if (store->second.retired)
+      state.stores.erase(store);
+  }
   state.transactions.insert(record.transaction_id);
   state.append(origin, rvwmo::RuntimeEventKind::StorePublish, record);
   return {};
@@ -636,7 +659,7 @@ ConversionResult Adapter::retire(const Origin &origin, const RetireRecord &recor
   if ((!selected_load && (!live.loads.empty() || (!atomic_retirement && !record.loads.empty()))) ||
       (selected_load && (live.loads.size() > 1 ||
                          (!live.loads.empty() && live.loads.begin()->first != *selected_attempt))) ||
-      (state.stores.count(record.id) && !selected_store))
+      ((state.stores.count(record.id) || state.early_publications.count(record.id)) && !selected_store))
     return invalid("retirement omitted a live memory effect or left an uncancelled attempt unselected");
 
   live.retirement = record;
@@ -761,8 +784,8 @@ ConversionResult Adapter::squash(const Origin &origin, const rvwmo::OperationId 
     return invalid("architecturally retired instruction cannot be squashed");
   if (origin.source.cycle < instruction->second.allocated_at.source.cycle)
     return invalid("instruction squash source time predates its allocation");
-  if (state.stores.count(id))
-    return invalid("instruction with a committed LocalStore cannot be squashed");
+  if (state.stores.count(id) || state.early_publications.count(id))
+    return invalid("instruction with a LocalStore or physical publication cannot be squashed");
   for (const auto &sample : instruction->second.sampled_at)
     if (origin.source.cycle < sample.second.source.cycle)
       return invalid("instruction squash source time predates a captured load sample");
@@ -782,6 +805,7 @@ ConvertedOutput Adapter::take_output() {
 PendingState Adapter::pending() const {
   PendingState pending;
   pending.instructions = state_->instructions.size();
+  pending.unpublished_stores = state_->early_publications.size();
   for (const auto &instruction : state_->instructions)
     if (instruction.second.retirement && needs_writeback(*instruction.second.retirement))
       ++pending.writebacks;
@@ -797,7 +821,6 @@ std::vector<std::string> Adapter::consumer_gaps() {
   return {"generic atomic/AMO/LRSC lifecycle semantic consumption",
           "generic trap/interrupt and HartDone semantic consumption and memory-drain finalization",
           "epoch transition in an existing checker session",
-          "source-ordered retirement before a physically later load sample (BlackParrot refill miss)",
           "merged multi-store publication, split/vector memory effects and cache-block operations"};
 }
 
