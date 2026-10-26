@@ -1094,5 +1094,5 @@ extern "C" int bp_difftest_s_finish() {
   if (transport)
     return transport;
   const auto &verification = blackparrot::last_native_capture().summary.verification;
-  return verification && (verification->check.status != rvwmo::CheckStatus::Pass || !verification->finalized) ? 2 : 0;
+  return !verification || verification->check.status != rvwmo::CheckStatus::Pass || !verification->finalized ? 2 : 0;
 }
