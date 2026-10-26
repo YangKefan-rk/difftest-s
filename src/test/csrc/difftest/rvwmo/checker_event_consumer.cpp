@@ -41,12 +41,19 @@ CheckResult CheckerEventConsumer::remember_failure(CheckResult result) {
   return result;
 }
 
-CheckResult CheckerEventConsumer::require_rank(const RuntimeEvent &event, ObservationTime &time) const {
+CheckResult CheckerEventConsumer::require_rank(const RuntimeEvent &event, ObservationTime &time,
+                                               bool certified_read_group) const {
   const auto resolved = rank_resolver_(event);
   if (!resolved || !resolved->valid || resolved->rank == 0)
     return incomplete("memory event has no hardware-justified GMO rank");
-  if (last_memory_rank_ && resolved->rank <= *last_memory_rank_)
-    return incomplete("memory event rank is not a strictly increasing observed order");
+  if (last_memory_rank_ && resolved->rank <= *last_memory_rank_) {
+    const auto *sample = std::get_if<LoadSampleEvent>(&event.payload);
+    if (!certified_read_group || !sample || !last_read_group_ || resolved->rank != *last_memory_rank_ ||
+        last_read_group_->rank != resolved->rank || last_read_group_->cycle != event.source.cycle ||
+        last_read_group_->harts.count(sample->operation.id.hart) ||
+        last_read_group_->producers.count(event.producer_id))
+      return incomplete("memory event rank is not a strictly increasing observed order or a certified read group");
+  }
   time = *resolved;
   return {};
 }
@@ -109,7 +116,8 @@ CheckResult CheckerEventConsumer::consume_local_store(const LocalStoreEvent &eve
   return result;
 }
 
-CheckResult CheckerEventConsumer::consume_load_sample(const RuntimeEvent &event, const LoadSampleEvent &sample) {
+CheckResult CheckerEventConsumer::consume_load_sample(const RuntimeEvent &event, const LoadSampleEvent &sample,
+                                                      bool certified_read_group) {
   auto operation = sample.operation;
   const auto parent = instruction_id(operation.id);
   if (!allocations_.count(parent))
@@ -125,7 +133,7 @@ CheckResult CheckerEventConsumer::consume_load_sample(const RuntimeEvent &event,
     return remember_failure(invalid("invalid load sample shape"));
 
   ObservationTime time;
-  auto result = require_rank(event, time);
+  auto result = require_rank(event, time, certified_read_group);
   if (!result)
     return result;
   operation.read_time = time;
@@ -137,8 +145,27 @@ CheckResult CheckerEventConsumer::consume_load_sample(const RuntimeEvent &event,
   if (result.status != CheckStatus::Pass && result.status != CheckStatus::Pending)
     return remember_failure(result);
   last_memory_rank_ = time.rank;
+  if (certified_read_group) {
+    if (!last_read_group_ || last_read_group_->rank != time.rank)
+      last_read_group_ = ReadGroupReceipt{time.rank, event.source.cycle, {}, {}};
+    last_read_group_->harts.insert(operation.id.hart);
+    last_read_group_->producers.insert(event.producer_id);
+  } else {
+    last_read_group_.reset();
+  }
   loads_.emplace(key, LoadRecord{std::move(operation), sample.actual_bytes});
   return result;
+}
+
+CheckResult CheckerEventConsumer::consume_read_group_member(const RuntimeEvent &event) {
+  if (!failure_)
+    return failure_;
+  const auto *sample = std::get_if<LoadSampleEvent>(&event.payload);
+  if (!event.producer_id || event.kind != RuntimeEventKind::LoadSample || !sample ||
+      !sample->operation.load || sample->operation.store || sample->operation.atomic || sample->operation.lr ||
+      sample->operation.sc || sample->operation.acquire || sample->operation.release || sample->operation.rcsc)
+    return remember_failure(invalid("certified read group contains a non-scalar load effect"));
+  return consume_load_sample(event, *sample, true);
 }
 
 CheckResult CheckerEventConsumer::consume_store_publish(const RuntimeEvent &event, const StorePublishEvent &publish) {
@@ -185,6 +212,7 @@ CheckResult CheckerEventConsumer::consume_store_publish(const RuntimeEvent &even
   if (result.status != CheckStatus::Pass && result.status != CheckStatus::Pending)
     return remember_failure(result);
   last_memory_rank_ = time.rank;
+  last_read_group_.reset();
   store->second.published = true;
   collect_store_metadata();
   return result;

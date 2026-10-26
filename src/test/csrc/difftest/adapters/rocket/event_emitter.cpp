@@ -150,9 +150,12 @@ CheckResult EventEmitter::begin(const InstructionObservation &allocation, Operat
   Instruction instruction;
   instruction.id = {configuration_.hart, configuration_.epoch, next_uid_++, 0};
   instruction.allocation = allocation;
+  if (allocation.length == 2)
+    instruction.allocation.instruction &= 0xffff;
   instruction.kind = classified_kind;
   id = instruction.id;
   instructions_.emplace(allocation.token, std::move(instruction));
+  unretired_tokens_.insert(allocation.token);
   last_token_ = allocation.token;
   return {};
 }
@@ -233,9 +236,8 @@ CheckResult EventEmitter::retire(uint64_t token, SourcePosition source) {
   auto found = instructions_.find(token);
   if (found == instructions_.end() || found->second.retired)
     return reject(CheckStatus::Invalid, "Rocket retirement has no live instruction");
-  for (auto older = instructions_.begin(); older != found; ++older)
-    if (!older->second.retired)
-      return {CheckStatus::Pending, 0, "Rocket retirement awaits an older instruction"};
+  if (unretired_tokens_.empty() || *unretired_tokens_.begin() != token)
+    return {CheckStatus::Pending, 0, "Rocket retirement awaits an older instruction"};
   auto &instruction = found->second;
   if (instruction.kind == MemoryKind::Unsupported)
     return reject(CheckStatus::Unsupported, "Retired Rocket instruction exceeds the scalar capture profile");
@@ -300,6 +302,7 @@ CheckResult EventEmitter::retire(uint64_t token, SourcePosition source) {
   }
   append(RuntimeEventKind::InstructionRetire, std::move(retirement), source);
   instruction.retired = true;
+  unretired_tokens_.erase(token);
   if (instruction.kind != MemoryKind::Store)
     instructions_.erase(found);
   return {};
@@ -356,6 +359,7 @@ CheckResult EventEmitter::squash(uint64_t token) {
   if (found->second.retired || found->second.store)
     return reject(CheckStatus::Invalid, "Rocket squash cannot retract a committed instruction");
   instructions_.erase(found);
+  unretired_tokens_.erase(token);
   terminated_tokens_.push_back(token);
   if (terminated_tokens_.size() > pipeline_kill_history)
     terminated_tokens_.pop_front();
@@ -371,8 +375,8 @@ CheckResult EventEmitter::close_through(uint64_t source_cycle) {
     if (event.producer_id == configuration_.producer && event.source.cycle > source_cycle)
       return {CheckStatus::Pending, 0, "Rocket batch contains an event beyond the requested hart watermark"};
   }
-  for (const auto &entry : instructions_)
-    if (!entry.second.retired && entry.second.allocation.source.cycle <= source_cycle)
+  for (const auto token : unretired_tokens_)
+    if (instructions_.at(token).allocation.source.cycle <= source_cycle)
       return {CheckStatus::Pending, 0, "Rocket watermark awaits unresolved speculative instructions"};
   closed_cycle_ = source_cycle;
   batch_.watermarks = {{configuration_.producer, SourcePosition::end_of_cycle(source_cycle)}};

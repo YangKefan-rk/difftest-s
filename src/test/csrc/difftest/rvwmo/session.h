@@ -6,6 +6,7 @@
 #include "stream.h"
 #include <deque>
 #include <map>
+#include <memory>
 #include <optional>
 #include <vector>
 
@@ -56,6 +57,16 @@ struct ReferenceStepResult {
   bool took_trap = false;
 };
 
+struct SessionHartStatistics {
+  uint64_t reference_steps = 0;
+  uint64_t architecture_compared = 0;
+  // Retirement accepted by the consumer; final Pass certifies any deferred PPO
+  // work. These are not counters for already completed PPO checks.
+  uint64_t retired_instructions = 0;
+  uint64_t retired_load_operations = 0;
+  uint64_t retired_store_operations = 0;
+};
+
 // Joins transport closure, source-order ranks, scalar PPO and REF results. The
 // host steps the per-hart REF; this session checks PC/raw/GPR results and audits
 // REF-derived stores against provisional LocalStore events.
@@ -67,7 +78,8 @@ public:
 
   ObservationSession(StreamContract contract, std::vector<ProducerCapability> producers,
                     Memory::ReadGlobal read_global, Memory::WriteGlobal write_global, ReferenceStepper reference_stepper,
-                    size_t max_live_instructions = 65536, size_t max_pending_retirements = 65536);
+                    size_t max_live_instructions = 65536, size_t max_pending_retirements = 65536,
+                    size_t max_harts = 4096);
 
   SessionSubmitResult submit(const EventBatch &batch,
                              const std::vector<ArchitecturalRetirement> &retirements = {});
@@ -75,10 +87,16 @@ public:
   CheckResult finalize(uint64_t completed_cycle);
   size_t pending_events() const { return pending_events_.size(); }
   bool finalized() const { return finalized_; }
+  const std::map<uint32_t, SessionHartStatistics> &hart_statistics() const { return hart_statistics_; }
 
 private:
+  struct ReadGroup {
+    size_t remaining = 0;
+    ObservationTime time;
+  };
   struct PendingEvent {
     RuntimeEvent event;
+    std::shared_ptr<ReadGroup> read_group;
   };
   struct ReferenceRecord {
     std::vector<ReferenceStoreValue> stores;
@@ -87,12 +105,14 @@ private:
 
   size_t max_pending_events_;
   size_t max_architectural_retirements_;
+  size_t max_harts_;
   ObservationStream stream_;
   CheckerEventConsumer consumer_;
   ReferenceStepper reference_stepper_;
   std::deque<PendingEvent> pending_events_;
   std::map<OperationId, ArchitecturalRetirement> architectural_retirements_;
   std::map<OperationId, ReferenceRecord> reference_records_;
+  std::map<uint32_t, SessionHartStatistics> hart_statistics_;
   std::optional<std::pair<uint32_t, uint64_t>> current_rank_event_;
   ObservationTime current_rank_;
   uint64_t next_rank_ = 1;
@@ -102,6 +122,9 @@ private:
   static bool is_memory_event(const RuntimeEvent &event);
   std::optional<ObservationTime> resolve_current_rank(const RuntimeEvent &event) const;
   CheckResult collect_closed_events();
+  CheckResult classify_read_groups(const std::vector<RuntimeEvent> &events,
+                                   std::vector<std::shared_ptr<ReadGroup>> &groups) const;
+  CheckResult ensure_statistics_hart(uint32_t hart);
   CheckResult consume_pending_events();
   CheckResult consume_retirement(const RuntimeEvent &event, const InstructionRetireEvent &retirement);
   CheckResult step_reference(const InstructionRetireEvent &retirement, const ArchitecturalRetirement &snapshot);

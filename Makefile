@@ -93,7 +93,7 @@ $(error Unsupported DIFFTEST_S_DUT '$(DIFFTEST_S_DUT)'; choose one of $(DIFFTEST
 endif
 
 DIFFTEST_ADAPTER_DIR = $(DIFFTEST_CSRC_DIR)/adapters/$(DIFFTEST_S_DUT)
-DIFFTEST_SPIKE_SOURCES = $(addprefix $(DIFFTEST_CSRC_DIR)/rvwmo/,spike_reference_stepper.cpp spike_reference_pool.cpp)
+DIFFTEST_SPIKE_SOURCES = $(addprefix $(DIFFTEST_CSRC_DIR)/rvwmo/,spike_reference_stepper.cpp spike_reference_pool.cpp host_session.cpp)
 DIFFTEST_COMMON_CXXFILES = $(filter-out $(DIFFTEST_SPIKE_SOURCES),$(shell find $(DIFFTEST_CSRC_DIR) -path "$(DIFFTEST_CSRC_DIR)/adapters" -prune -o -name "*.cpp" -print))
 DIFFTEST_ADAPTER_CXXFILES =
 ifneq ($(DIFFTEST_S_DUT),nanhu)
