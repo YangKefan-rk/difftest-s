@@ -93,8 +93,8 @@ $(error Unsupported DIFFTEST_S_DUT '$(DIFFTEST_S_DUT)'; choose one of $(DIFFTEST
 endif
 
 DIFFTEST_ADAPTER_DIR = $(DIFFTEST_CSRC_DIR)/adapters/$(DIFFTEST_S_DUT)
-DIFFTEST_SPIKE_STEPPER = $(DIFFTEST_CSRC_DIR)/rvwmo/spike_reference_stepper.cpp
-DIFFTEST_COMMON_CXXFILES = $(shell find $(DIFFTEST_CSRC_DIR) -path "$(DIFFTEST_CSRC_DIR)/adapters" -prune -o -path "$(DIFFTEST_SPIKE_STEPPER)" -prune -o -name "*.cpp" -print)
+DIFFTEST_SPIKE_SOURCES = $(addprefix $(DIFFTEST_CSRC_DIR)/rvwmo/,spike_reference_stepper.cpp spike_reference_pool.cpp)
+DIFFTEST_COMMON_CXXFILES = $(filter-out $(DIFFTEST_SPIKE_SOURCES),$(shell find $(DIFFTEST_CSRC_DIR) -path "$(DIFFTEST_CSRC_DIR)/adapters" -prune -o -name "*.cpp" -print))
 DIFFTEST_ADAPTER_CXXFILES =
 ifneq ($(DIFFTEST_S_DUT),nanhu)
 DIFFTEST_ADAPTER_CXXFILES = $(shell find $(DIFFTEST_ADAPTER_DIR) -name "*.cpp" 2>/dev/null)
@@ -125,7 +125,7 @@ $(error Spike reference library not found: $(DIFFTEST_S_SPIKE_LIBRARY); build Sp
 endif
 SIM_CXXFLAGS += -I$(DIFFTEST_S_SPIKE_HOME)
 SIM_LDFLAGS += $(DIFFTEST_S_SPIKE_LIBRARY) -Wl,-rpath,$(DIFFTEST_S_SPIKE_BUILD_DIR)
-DIFFTEST_SPIKE_CXXFILES = $(DIFFTEST_SPIKE_STEPPER)
+DIFFTEST_SPIKE_CXXFILES = $(DIFFTEST_SPIKE_SOURCES)
 endif
 endif
 
