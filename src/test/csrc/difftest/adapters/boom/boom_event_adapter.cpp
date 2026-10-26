@@ -486,7 +486,7 @@ CheckResult BoomEventAdapter::commit_store(const StoreCommit &record) {
   if (!result)
     return result;
   auto found = instructions_.find(record.id);
-  if (found == instructions_.end() || !found->second.allocation.stq ||
+  if (found == instructions_.end() || found->second.retired || !found->second.allocation.stq ||
       found->second.store || found->second.allocation.stq->index != record.stq.index ||
       found->second.allocation.stq->generation != record.stq.generation)
     return invalid("BOOM store commit has no matching live STQ instruction or is duplicated");
