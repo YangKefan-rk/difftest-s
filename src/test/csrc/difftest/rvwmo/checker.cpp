@@ -1,6 +1,7 @@
 #include "checker.h"
 #include <limits>
 #include <algorithm>
+#include <stdexcept>
 
 namespace rvwmo {
 namespace {
@@ -34,7 +35,54 @@ bool memory_free_dependencies(const RetiredInstruction &instruction, DependencyM
   return metadata.provided && metadata.complete && !metadata.fence && metadata.address_sources.empty() &&
          metadata.data_sources.empty();
 }
+
+bool statistics_fit(const CheckMemoryStatistics &current, const CheckMemoryStatistics &delta) {
+  constexpr auto maximum = std::numeric_limits<uint64_t>::max();
+  return delta.verified_load_operations <= maximum - current.verified_load_operations &&
+         delta.verified_store_operations <= maximum - current.verified_store_operations &&
+         delta.cross_hart_reads <= maximum - current.cross_hart_reads &&
+         delta.store_audits <= maximum - current.store_audits;
+}
 } // namespace
+
+Checker::Checker(Memory &memory, size_t max_statistics_harts)
+    : memory_(memory), max_statistics_harts_(max_statistics_harts) {
+  if (!max_statistics_harts_ || max_statistics_harts_ > 4096)
+    throw std::invalid_argument("Checker statistics require a hart bound in 1..4096");
+}
+
+CheckResult Checker::ensure_statistics_hart(uint32_t hart) {
+  if (!memory_statistics_.count(hart)) {
+    if (memory_statistics_.size() >= max_statistics_harts_)
+      return invalid("checker memory-statistics hart bound exceeded");
+    memory_statistics_.emplace(hart, CheckMemoryStatistics{});
+  }
+  return {};
+}
+
+CheckResult Checker::verified_memory_delta(const RetiredInstruction &instruction,
+                                            CheckMemoryStatistics &delta) const {
+  for (const auto &operation : instruction.memory) {
+    if (operation.store)
+      ++delta.verified_store_operations;
+    if (!operation.load)
+      continue;
+    ++delta.verified_load_operations;
+    const auto &snapshot = loads_.at({operation.id, operation.attempt}).snapshot;
+    for (size_t byte = 0; byte < operation.byte_mask.size(); ++byte) {
+      if (!operation.byte_mask[byte] || !snapshot.bytes[byte].writer)
+        continue;
+      const auto source = writers_.find(*snapshot.bytes[byte].writer);
+      if (source == writers_.end())
+        return invalid("verified load snapshot lost its canonical store identity");
+      if (source->second.hart != operation.id.hart) {
+        ++delta.cross_hart_reads;
+        break;
+      }
+    }
+  }
+  return {};
+}
 
 CheckResult Checker::remember_failure(CheckResult result) {
   if (result.status != CheckStatus::Pass && result.status != CheckStatus::Pending)
@@ -49,6 +97,9 @@ OperationId Checker::initialization_writer(uint64_t address) {
 CheckResult Checker::memory_writer(const OperationId &operation, MemoryWriter &writer) {
   if (!failure_)
     return failure_;
+  auto statistics = ensure_statistics_hart(operation.hart);
+  if (!statistics)
+    return remember_failure(statistics);
   auto found = operation_writers_.find(operation);
   if (found != operation_writers_.end()) {
     writer = found->second;
@@ -87,6 +138,9 @@ CheckResult Checker::record_store(const MemoryStore &store, const MemoryOperatio
   if (stores_.count(operation.id) || (prior_writer != writers_.end() && prior_writer->second != operation.id) ||
       (prior_operation != operation_writers_.end() && !(prior_operation->second == store.writer)))
     return remember_failure(invalid("duplicate store identity or MemoryWriter identity collision"));
+  auto statistics = ensure_statistics_hart(operation.id.hart);
+  if (!statistics)
+    return remember_failure(statistics);
   auto error = memory_.commit_local(store);
   if (!error.empty())
     return remember_failure(invalid(error));
@@ -123,7 +177,11 @@ CheckResult Checker::verify_store(const OperationId &operation, const MemoryStor
     return remember_failure({CheckStatus::Violation, 0,
                              "REF store differs from provisional store hart " + std::to_string(operation.hart) +
                                  " uid " + std::to_string(operation.uid)});
+  auto &statistics = memory_statistics_.at(operation.hart);
+  if (statistics.store_audits == std::numeric_limits<uint64_t>::max())
+    return remember_failure(invalid("checker store-audit counter exhausted"));
   unverified_stores_.erase(found);
+  ++statistics.store_audits;
   return accepted_event(poll());
 }
 
@@ -238,6 +296,9 @@ CheckResult Checker::observe_load(const MemoryOperation &operation, uint64_t po,
   LoadKey key{operation.id, operation.attempt};
   if (loads_.count(key))
     return remember_failure(invalid("duplicate load attempt observation"));
+  auto statistics = ensure_statistics_hart(operation.id.hart);
+  if (!statistics)
+    return remember_failure(statistics);
   MemorySnapshot snapshot;
   auto error = memory_.sample(operation.id.hart, po, operation.read_time.rank, operation.address, operation.byte_mask,
                               forwarded, snapshot);
@@ -428,6 +489,14 @@ CheckResult Checker::drain(uint32_t hart) {
     auto result = prepare(front);
     if (!result)
       return remember_failure(result);
+    CheckMemoryStatistics delta;
+    if (!front.instruction.memory.empty()) {
+      result = verified_memory_delta(front.instruction, delta);
+      if (!result)
+        return remember_failure(result);
+      if (!statistics_fit(memory_statistics_.at(hart), delta))
+        return remember_failure(invalid("checker verified-memory counter exhausted"));
+    }
     // Bind the most recent LR in architectural order. SC evidence was captured
     // at the write point, so unrelated later writes cannot alter this decision.
     for (auto &operation : front.instruction.memory) {
@@ -519,6 +588,12 @@ CheckResult Checker::drain(uint32_t hart) {
         reserved_lr_.erase(prior);
       }
     }
+    if (!front.instruction.memory.empty()) {
+      auto &statistics = memory_statistics_.at(hart);
+      statistics.verified_load_operations += delta.verified_load_operations;
+      statistics.verified_store_operations += delta.verified_store_operations;
+      statistics.cross_hart_reads += delta.cross_hart_reads;
+    }
     queue.pop_front();
   }
   return {};
@@ -527,6 +602,11 @@ CheckResult Checker::drain(uint32_t hart) {
 CheckResult Checker::retire(const RetiredInstruction &instruction, const std::vector<RetiredLoad> &loads) {
   if (!failure_)
     return failure_;
+  if (!instruction.memory.empty()) {
+    auto statistics = ensure_statistics_hart(instruction.hart);
+    if (!statistics)
+      return remember_failure(statistics);
+  }
   auto last = last_enqueued_.find(instruction.hart);
   if (last != last_enqueued_.end() &&
       (last->second.first != instruction.epoch || last->second.second >= instruction.uid))

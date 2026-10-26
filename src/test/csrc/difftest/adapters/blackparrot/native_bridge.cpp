@@ -69,22 +69,34 @@ std::vector<uint8_t> bytes(uint64_t value) {
   return lanes;
 }
 
-std::vector<uint8_t> mask_lanes(uint32_t mask) {
-  std::vector<uint8_t> lanes(8);
-  for (size_t lane = 0; lane < lanes.size(); ++lane)
-    lanes[lane] = (mask >> lane) & 1;
-  return lanes;
+struct ScalarSpan {
+  unsigned first = 0;
+  unsigned size = 0;
+};
+
+ScalarSpan scalar_span(uint32_t mask) {
+  ScalarSpan span;
+  while (span.first < 8 && !(mask & (1u << span.first)))
+    ++span.first;
+  while (span.first + span.size < 8 && (mask & (1u << (span.first + span.size))))
+    ++span.size;
+  if (!span.size || mask != (((1u << span.size) - 1) << span.first))
+    throw std::runtime_error("ordinary scalar byte mask is not contiguous");
+  return span;
+}
+
+std::vector<uint8_t> span_bytes(uint64_t aligned_data, ScalarSpan span) {
+  std::vector<uint8_t> result(span.size);
+  for (unsigned byte = 0; byte < span.size; ++byte)
+    result[byte] = static_cast<uint8_t>(aligned_data >> (8 * (span.first + byte)));
+  return result;
 }
 
 std::vector<uint8_t> architectural_load_bytes(uint64_t writeback, uint32_t mask) {
-  std::vector<uint8_t> lanes(8);
-  unsigned source_byte = 0;
-  for (unsigned lane = 0; lane < 8; ++lane)
-    if ((mask >> lane) & 1) {
-      lanes[lane] = static_cast<uint8_t>(writeback >> (8 * source_byte));
-      ++source_byte;
-    }
-  return lanes;
+  const auto span = scalar_span(mask);
+  // Architectural integer loads place the addressed bytes in the low bits,
+  // regardless of their SRAM word lanes. Sign extension is checked by REF.
+  return span_bytes(writeback, {0, span.size});
 }
 
 bool is_load(uint32_t instruction) { return (instruction & 0x7f) == 0x03; }
@@ -481,12 +493,14 @@ private:
     rvwmo::LoadSampleEvent result;
     result.operation.id = fact.id;
     result.operation.attempt = fact.attempt;
-    result.operation.address = fact.address;
-    result.operation.byte_mask = mask_lanes(fact.mask);
+    const auto span = scalar_span(fact.mask);
+    result.operation.address = fact.address + span.first;
+    result.operation.byte_mask.assign(span.size, 1);
     result.operation.load = true;
     result.operation.source_kind = rvwmo::ReadSourceKind::Unavailable;
-    result.actual_bytes = bytes(fact.aligned_data);
-    result.forwarded_writers.assign(fact.forwarded_writers.begin(), fact.forwarded_writers.end());
+    result.actual_bytes = span_bytes(fact.aligned_data, span);
+    result.forwarded_writers.assign(fact.forwarded_writers.begin() + span.first,
+                                   fact.forwarded_writers.begin() + span.first + span.size);
     return result;
   }
 
@@ -571,7 +585,9 @@ private:
           continue;
         }
         const auto &store = *execution.store;
-        const rvwmo::LocalStoreEvent local{id, store.address, bytes(store.aligned_data), mask_lanes(store.mask)};
+        const auto span = scalar_span(store.mask);
+        const rvwmo::LocalStoreEvent local{id, store.address + span.first, span_bytes(store.aligned_data, span),
+                                          std::vector<uint8_t>(span.size, 1)};
         planned.push_back({id.hart, fact.source_time, channel.memory, false,
                            [local](Adapter &target, const Origin &origin) { return target.local_store(origin, local); }});
         rvwmo::MemoryOperation operation;

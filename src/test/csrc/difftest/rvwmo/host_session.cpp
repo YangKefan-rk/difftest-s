@@ -1,6 +1,8 @@
 #include "host_session.h"
 #include "producer_ids.h"
 #include <algorithm>
+#include <iomanip>
+#include <sstream>
 #include <stdexcept>
 #include <utility>
 
@@ -8,6 +10,33 @@ namespace rvwmo {
 namespace {
 CheckResult invalid(const char *message) { return {CheckStatus::Invalid, 0, message}; }
 CheckResult incomplete(const char *message) { return {CheckStatus::Incomplete, 0, message}; }
+
+const char *status_name(CheckStatus status) {
+  switch (status) {
+  case CheckStatus::Pass: return "Pass";
+  case CheckStatus::Violation: return "Violation";
+  case CheckStatus::Pending: return "Pending";
+  case CheckStatus::Incomplete: return "Incomplete";
+  case CheckStatus::Unsupported: return "Unsupported";
+  case CheckStatus::Invalid: return "Invalid";
+  }
+  return "Invalid";
+}
+
+std::string quote_json(const std::string &text) {
+  std::ostringstream output;
+  output << '"';
+  for (const unsigned char byte : text) {
+    if (byte == '"' || byte == '\\')
+      output << '\\' << byte;
+    else if (byte < 0x20)
+      output << "\\u" << std::hex << std::setw(4) << std::setfill('0') << unsigned(byte) << std::dec;
+    else
+      output << byte;
+  }
+  output << '"';
+  return output.str();
+}
 
 std::vector<uint32_t> event_harts(const RuntimeEvent &event) {
   switch (event.kind) {
@@ -47,7 +76,8 @@ HostSession::HostSession(GlobalMem &memory, HostSessionConfiguration configurati
     failure_ = references_.configuration();
     return;
   }
-  if (configuration_.platform.empty() || configuration_.stream.required_producers.empty()) {
+  if (configuration_.platform.empty() || configuration_.verification_scope.empty() ||
+      configuration_.stream.required_producers.empty()) {
     failure_ = invalid("host session needs a platform name and explicit required producer roster");
     return;
   }
@@ -60,6 +90,7 @@ HostSession::HostSession(GlobalMem &memory, HostSessionConfiguration configurati
       return;
     }
   }
+  const auto step_reference = references_.callback();
   session_ = std::make_unique<ObservationSession>(
       configuration_.stream, configuration_.producers,
       [this](uint64_t address) {
@@ -71,7 +102,24 @@ HostSession::HostSession(GlobalMem &memory, HostSessionConfiguration configurati
       [this](uint64_t address, uint8_t byte) {
         if (!memory_.write(address, &byte, 1))
           throw std::runtime_error("host session publication outside independent initialized memory");
-      }, references_.callback());
+      },
+      [this, step_reference](const InstructionRetireEvent &retirement,
+                             const ArchitecturalRetirement &snapshot,
+                             const std::vector<ReferenceLoadValue> &loads) {
+        auto result = step_reference(retirement, snapshot, loads);
+        if (!result.check || !configuration_.reference_store_observer)
+          return result;
+        for (const auto &store : result.stores) {
+          auto observed = configuration_.reference_store_observer(store);
+          if (observed.status == CheckStatus::Pending)
+            observed = incomplete("reference store observer must complete synchronously after REF execution");
+          if (!observed) {
+            result.check = std::move(observed);
+            break;
+          }
+        }
+        return result;
+      });
 }
 
 bool HostSession::registered_hart(uint32_t hart) const {
@@ -199,8 +247,12 @@ CheckResult HostSession::poll() {
 CheckResult HostSession::finalize(uint64_t completed_cycle) {
   if (!failure_)
     return failure_;
-  if (finalized_)
+  if (finalized_) {
+    if (completed_cycle != final_cycle_)
+      return reject(invalid("final source boundary differs from the already finalized run"));
     return {};
+  }
+  final_cycle_ = completed_cycle;
   if (completed_harts_.size() != configuration_.initial_harts.size())
     return reject(incomplete("host session finalized before every required hart completed"));
   for (const auto &hart : completed_harts_)
@@ -230,6 +282,61 @@ CheckResult HostSession::finalize(uint64_t completed_cycle) {
   }
   finalized_ = true;
   return {};
+}
+
+std::string HostSession::final_report() const {
+  auto result = failure_;
+  if (result && !finalized_)
+    result = incomplete("host session was not finalized");
+  std::ostringstream output;
+  output << "{\"schema_version\":1,\"platform\":" << quote_json(configuration_.platform)
+         << ",\"verification_scope\":" << quote_json(configuration_.verification_scope)
+         << ",\"hart_count\":" << configuration_.initial_harts.size()
+         << ",\"verdict\":" << quote_json(status_name(result.status))
+         << ",\"rule\":" << result.rule << ",\"message\":" << quote_json(result.message)
+         << ",\"completed_cycle\":" << final_cycle_ << ",\"harts\":[";
+  for (uint32_t hart = 0; hart < configuration_.initial_harts.size(); ++hart) {
+    if (hart) output << ',';
+    SessionHartStatistics statistics;
+    if (session_) {
+      const auto found = session_->hart_statistics().find(hart);
+      if (found != session_->hart_statistics().end()) statistics = found->second;
+    }
+    CheckMemoryStatistics memory_statistics;
+    if (session_) {
+      const auto found = session_->memory_statistics().find(hart);
+      if (found != session_->memory_statistics().end()) memory_statistics = found->second;
+    }
+    output << "{\"hart\":" << hart << ",\"dut_retired\":" << statistics.retired_instructions
+           << ",\"ref_steps\":" << statistics.reference_steps
+           << ",\"arch_compares\":" << statistics.architecture_compared
+           << ",\"accepted_load_operations\":" << statistics.retired_load_operations
+           << ",\"accepted_store_operations\":" << statistics.retired_store_operations
+           << ",\"load_compares\":" << memory_statistics.verified_load_operations
+           << ",\"store_audits\":" << memory_statistics.store_audits
+           << ",\"verified_store_operations\":" << memory_statistics.verified_store_operations
+           << ",\"ppo_load_checks\":" << memory_statistics.verified_load_operations
+           << ",\"ppo_store_checks\":" << memory_statistics.verified_store_operations
+           << ",\"cross_hart_reads\":" << memory_statistics.cross_hart_reads << '}';
+  }
+  output << "],\"producer_closure\":[";
+  bool first = true;
+  for (const auto &producer : configuration_.stream.required_producers) {
+    if (!first) output << ',';
+    first = false;
+    const auto closed = source_watermarks_.find(producer.producer_id);
+    const auto drained = drained_producers_.find(producer.producer_id);
+    output << "{\"producer_id\":" << producer.producer_id << ",\"closed_through\":";
+    if (closed == source_watermarks_.end()) output << "null"; else output << closed->second.cycle;
+    output << ",\"delivered_through\":";
+    if (drained == drained_producers_.end()) output << "null"; else output << drained->second.source_cycle;
+    output << ",\"physically_drained\":" << (drained != drained_producers_.end() ? "true" : "false") << '}';
+  }
+  output << "],\"pending\":{\"semantic_events\":" << (session_ ? session_->pending_events() : 0)
+         << ",\"harts_without_completion\":" << configuration_.initial_harts.size() - completed_harts_.size()
+         << ",\"producers_without_drain\":"
+         << configuration_.stream.required_producers.size() - drained_producers_.size() << "}}";
+  return output.str();
 }
 
 } // namespace rvwmo

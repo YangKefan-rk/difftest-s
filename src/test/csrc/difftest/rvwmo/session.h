@@ -88,6 +88,7 @@ public:
   size_t pending_events() const { return pending_events_.size(); }
   bool finalized() const { return finalized_; }
   const std::map<uint32_t, SessionHartStatistics> &hart_statistics() const { return hart_statistics_; }
+  const std::map<uint32_t, CheckMemoryStatistics> &memory_statistics() const { return consumer_.memory_statistics(); }
 
 private:
   struct ReadGroup {

@@ -34,6 +34,7 @@ public:
                           const std::vector<uint8_t> &mask);
   CheckResult poll();
   CheckResult finalize();
+  const std::map<uint32_t, CheckMemoryStatistics> &memory_statistics() const { return checker_.memory_statistics(); }
 
 private:
   friend class ObservationSession;
@@ -70,8 +71,7 @@ private:
   struct ReadGroupReceipt {
     uint64_t rank = 0;
     uint64_t cycle = 0;
-    std::set<uint32_t> harts;
-    std::set<uint32_t> producers;
+    std::set<LoadKey> members;
   };
   std::optional<ReadGroupReceipt> last_read_group_;
   CheckResult failure_;
@@ -79,7 +79,8 @@ private:
   static OperationId instruction_id(const OperationId &operation);
   CheckResult require_rank(const RuntimeEvent &event, ObservationTime &time, bool certified_read_group = false) const;
   // Only ObservationSession certifies a complete, source-closed group. Public
-  // consume_closed remains strictly ranked, including same-hart load pairs.
+  // consume_closed remains strictly ranked. A certified read-prefix group may
+  // contain multiple same-hart members, but never duplicate operation attempts.
   CheckResult consume_read_group_member(const RuntimeEvent &event);
   CheckResult consume_allocate(const InstructionAllocateEvent &event);
   CheckResult consume_local_store(const LocalStoreEvent &event);

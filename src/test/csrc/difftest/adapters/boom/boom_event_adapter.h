@@ -145,7 +145,6 @@ struct AdapterLimits {
   size_t live_instructions = 4096;
   size_t attempts_per_load = 64;
   size_t queued_events = 65536;
-  size_t open_source_sequences = 65536;
   size_t producers = 64;
   size_t captured_retirements = 4096;
 };
@@ -165,6 +164,9 @@ public:
   CheckResult publish_store(const StorePublication &record);
   CheckResult retire(const Retirement &record);
   CheckResult audit_reference_store(CheckerEventConsumer &consumer, const ReferenceStoreAudit &record);
+  // Checks an independent REF store without requiring access to a session's
+  // private consumer. The common session must still perform its own audit.
+  CheckResult audit_reference_store(const ReferenceStoreAudit &record);
 
   // Whole-instruction discard is separate from cancellation of one attempt.
   CheckResult squash(const OperationId &id, const SlotGeneration &rob, const EventSource &source);
@@ -185,6 +187,7 @@ private:
   };
   struct Instruction {
     InstructionAllocation allocation;
+    bool unsupported_memory = false;
     std::map<uint32_t, Attempt> attempts;
     std::optional<uint32_t> latest_attempt;
     std::optional<MemoryOperation> store;
@@ -211,7 +214,6 @@ private:
   std::map<uint32_t, SourcePosition> watermarks_;
   EventBatch batch_;
   std::vector<CapturedRetirement> captured_retirements_;
-  std::map<std::pair<uint32_t, uint64_t>, SourcePosition> seen_source_sequences_;
   std::map<uint32_t, uint64_t> highest_source_sequences_;
 
   CheckResult validate_id(const OperationId &id) const;
