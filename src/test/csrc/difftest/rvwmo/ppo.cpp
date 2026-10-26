@@ -21,9 +21,14 @@ CheckResult require_before(const DependencySummary &before, const MemoryOperatio
   std::ostringstream text;
   text << "PPO rule " << rule << ": hart " << after.id.hart << " uid " << before.source.uid << " rank " << before.rank
        << " must precede uid " << after.id.uid << " rank " << after_rank;
-  if (before.rank == after_rank && after.load && !after.store && !after.atomic && !after.lr && !after.sc &&
-      !after.acquire && !after.release && !after.rcsc && !after.has_paired_lr && after.read_time.unordered_read_group)
-    return {CheckStatus::Incomplete, rule, text.str() + "; the shared read prefix lacks intra-group order evidence"};
+  const bool ordinary = !after.atomic && !after.lr && !after.sc && !after.acquire && !after.release &&
+                        !after.rcsc && !after.has_paired_lr;
+  const bool load = ordinary && after.load && !after.store;
+  const bool store = ordinary && after.store && !after.load;
+  const bool unordered = (load && (after.read_time.unordered_read_group || after.read_time.unordered_effect_group)) ||
+                         (store && after.write_time.unordered_effect_group);
+  if (before.rank == after_rank && unordered)
+    return {CheckStatus::Incomplete, rule, text.str() + "; the certified group lacks intra-group order evidence"};
   return {CheckStatus::Violation, rule, text.str()};
 }
 } // namespace

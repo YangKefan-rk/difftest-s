@@ -68,25 +68,34 @@ private:
   std::map<LoadKey, LoadRecord> loads_;
   std::set<LoadKey> cancelled_loads_;
   std::optional<uint64_t> last_memory_rank_;
-  struct ReadGroupReceipt {
+  enum class RankCertificate { None, ReadOnly, IndependentEffects };
+  struct GroupReceipt {
     uint64_t rank = 0;
     uint64_t cycle = 0;
+    RankCertificate certificate = RankCertificate::None;
     std::set<LoadKey> members;
+    std::set<uint32_t> harts;
+    std::set<uint32_t> producers;
   };
-  std::optional<ReadGroupReceipt> last_read_group_;
+  std::optional<GroupReceipt> last_group_;
   CheckResult failure_;
 
   static OperationId instruction_id(const OperationId &operation);
-  CheckResult require_rank(const RuntimeEvent &event, ObservationTime &time, bool certified_read_group = false) const;
+  CheckResult require_rank(const RuntimeEvent &event, ObservationTime &time,
+                            RankCertificate certificate = RankCertificate::None) const;
+  void remember_rank(const RuntimeEvent &event, ObservationTime time, RankCertificate certificate,
+                     const OperationId &id, uint32_t attempt);
   // Only ObservationSession certifies a complete, source-closed group. Public
   // consume_closed remains strictly ranked. A certified read-prefix group may
   // contain multiple same-hart members, but never duplicate operation attempts.
   CheckResult consume_read_group_member(const RuntimeEvent &event);
+  CheckResult consume_independent_group_member(const RuntimeEvent &event);
   CheckResult consume_allocate(const InstructionAllocateEvent &event);
   CheckResult consume_local_store(const LocalStoreEvent &event);
   CheckResult consume_load_sample(const RuntimeEvent &event, const LoadSampleEvent &sample,
-                                  bool certified_read_group = false);
-  CheckResult consume_store_publish(const RuntimeEvent &event, const StorePublishEvent &publish);
+                                  RankCertificate certificate = RankCertificate::None);
+  CheckResult consume_store_publish(const RuntimeEvent &event, const StorePublishEvent &publish,
+                                    RankCertificate certificate = RankCertificate::None);
   CheckResult consume_cancel(const InstructionCancelAttemptEvent &event);
   CheckResult consume_squash(const InstructionSquashEvent &event);
   CheckResult consume_retire(const InstructionRetireEvent &event);

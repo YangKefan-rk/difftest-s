@@ -42,21 +42,51 @@ CheckResult CheckerEventConsumer::remember_failure(CheckResult result) {
 }
 
 CheckResult CheckerEventConsumer::require_rank(const RuntimeEvent &event, ObservationTime &time,
-                                               bool certified_read_group) const {
+                                               RankCertificate certificate) const {
   const auto resolved = rank_resolver_(event);
   if (!resolved || !resolved->valid || resolved->rank == 0)
     return incomplete("memory event has no hardware-justified GMO rank");
-  if (resolved->unordered_read_group != certified_read_group)
-    return incomplete("read-prefix rank certificate is unavailable outside its private session group");
+  if (resolved->unordered_read_group != (certificate == RankCertificate::ReadOnly) ||
+      resolved->unordered_effect_group != (certificate == RankCertificate::IndependentEffects))
+    return incomplete("memory-group rank certificate is unavailable outside its private session group");
   if (last_memory_rank_ && resolved->rank <= *last_memory_rank_) {
-    const auto *sample = std::get_if<LoadSampleEvent>(&event.payload);
-    if (!certified_read_group || !sample || !last_read_group_ || resolved->rank != *last_memory_rank_ ||
-        last_read_group_->rank != resolved->rank || last_read_group_->cycle != event.source.cycle ||
-        last_read_group_->members.count({sample->operation.id, sample->operation.attempt}))
-      return incomplete("memory event rank is not a strictly increasing observed order or a certified read group");
+    if (certificate == RankCertificate::None || !last_group_ || resolved->rank != *last_memory_rank_ ||
+        last_group_->rank != resolved->rank || last_group_->cycle != event.source.cycle ||
+        last_group_->certificate != certificate)
+      return incomplete("memory event rank is not strictly increasing or part of one certified group");
+    OperationId id;
+    uint32_t attempt = 0;
+    if (const auto *sample = std::get_if<LoadSampleEvent>(&event.payload)) {
+      id = sample->operation.id;
+      attempt = sample->operation.attempt;
+    } else if (const auto *publish = std::get_if<StorePublishEvent>(&event.payload)) {
+      if (certificate != RankCertificate::IndependentEffects || publish->members.size() != 1)
+        return incomplete("equal-rank publication is not a certified independent effect");
+      id = publish->members.front().id;
+    } else {
+      return incomplete("certified memory group contains an unsupported event kind");
+    }
+    if (last_group_->members.count({id, attempt}) ||
+        (certificate == RankCertificate::IndependentEffects &&
+         (last_group_->harts.count(id.hart) || last_group_->producers.count(event.producer_id))))
+      return invalid("certified memory group repeats an operation, hart or producer");
   }
   time = *resolved;
   return {};
+}
+
+void CheckerEventConsumer::remember_rank(const RuntimeEvent &event, ObservationTime time,
+                                         RankCertificate certificate, const OperationId &id, uint32_t attempt) {
+  last_memory_rank_ = time.rank;
+  if (certificate == RankCertificate::None) {
+    last_group_.reset();
+    return;
+  }
+  if (!last_group_ || last_group_->rank != time.rank)
+    last_group_ = GroupReceipt{time.rank, event.source.cycle, certificate, {}, {}, {}};
+  last_group_->members.insert({id, attempt});
+  last_group_->harts.insert(id.hart);
+  last_group_->producers.insert(event.producer_id);
 }
 
 CheckResult CheckerEventConsumer::consume_allocate(const InstructionAllocateEvent &event) {
@@ -118,7 +148,7 @@ CheckResult CheckerEventConsumer::consume_local_store(const LocalStoreEvent &eve
 }
 
 CheckResult CheckerEventConsumer::consume_load_sample(const RuntimeEvent &event, const LoadSampleEvent &sample,
-                                                      bool certified_read_group) {
+                                                      RankCertificate certificate) {
   auto operation = sample.operation;
   const auto parent = instruction_id(operation.id);
   if (!allocations_.count(parent))
@@ -134,7 +164,7 @@ CheckResult CheckerEventConsumer::consume_load_sample(const RuntimeEvent &event,
     return remember_failure(invalid("invalid load sample shape"));
 
   ObservationTime time;
-  auto result = require_rank(event, time, certified_read_group);
+  auto result = require_rank(event, time, certificate);
   if (!result)
     return result;
   operation.read_time = time;
@@ -145,14 +175,7 @@ CheckResult CheckerEventConsumer::consume_load_sample(const RuntimeEvent &event,
   result = checker_.observe_load(operation, operation.id.uid, {});
   if (result.status != CheckStatus::Pass && result.status != CheckStatus::Pending)
     return remember_failure(result);
-  last_memory_rank_ = time.rank;
-  if (certified_read_group) {
-    if (!last_read_group_ || last_read_group_->rank != time.rank)
-      last_read_group_ = ReadGroupReceipt{time.rank, event.source.cycle, {}};
-    last_read_group_->members.insert(key);
-  } else {
-    last_read_group_.reset();
-  }
+  remember_rank(event, time, certificate, operation.id, operation.attempt);
   loads_.emplace(key, LoadRecord{std::move(operation), sample.actual_bytes});
   return result;
 }
@@ -165,10 +188,32 @@ CheckResult CheckerEventConsumer::consume_read_group_member(const RuntimeEvent &
       !sample->operation.load || sample->operation.store || sample->operation.atomic || sample->operation.lr ||
       sample->operation.sc || sample->operation.acquire || sample->operation.release || sample->operation.rcsc)
     return remember_failure(invalid("certified read group contains a non-scalar load effect"));
-  return consume_load_sample(event, *sample, true);
+  return consume_load_sample(event, *sample, RankCertificate::ReadOnly);
 }
 
-CheckResult CheckerEventConsumer::consume_store_publish(const RuntimeEvent &event, const StorePublishEvent &publish) {
+CheckResult CheckerEventConsumer::consume_independent_group_member(const RuntimeEvent &event) {
+  if (!failure_)
+    return failure_;
+  if (!event.producer_id)
+    return remember_failure(invalid("independent memory group has no producer"));
+  if (event.kind == RuntimeEventKind::LoadSample) {
+    const auto *sample = std::get_if<LoadSampleEvent>(&event.payload);
+    if (!sample || !sample->operation.load || sample->operation.store || sample->operation.atomic ||
+        sample->operation.lr || sample->operation.sc || sample->operation.acquire || sample->operation.release ||
+        sample->operation.rcsc || sample->operation.has_paired_lr)
+      return remember_failure(invalid("independent memory group contains a non-ordinary load"));
+    return consume_load_sample(event, *sample, RankCertificate::IndependentEffects);
+  }
+  if (event.kind == RuntimeEventKind::StorePublish) {
+    const auto *publish = std::get_if<StorePublishEvent>(&event.payload);
+    if (publish)
+      return consume_store_publish(event, *publish, RankCertificate::IndependentEffects);
+  }
+  return remember_failure(invalid("independent memory group contains an unsupported effect"));
+}
+
+CheckResult CheckerEventConsumer::consume_store_publish(const RuntimeEvent &event, const StorePublishEvent &publish,
+                                                        RankCertificate certificate) {
   if (publish.members.empty())
     return remember_failure(invalid("store publication has no logical store member"));
   if (publish.members.size() != 1)
@@ -199,7 +244,7 @@ CheckResult CheckerEventConsumer::consume_store_publish(const RuntimeEvent &even
       publish.byte_mask != store->second.operation.byte_mask || publish.byte_writers.size() != publish.bytes.size())
     return remember_failure(invalid("StorePublish differs from its LocalStore record"));
   ObservationTime time;
-  auto result = require_rank(event, time);
+  auto result = require_rank(event, time, certificate);
   if (!result)
     return result;
   MemoryWriter writer;
@@ -211,8 +256,7 @@ CheckResult CheckerEventConsumer::consume_store_publish(const RuntimeEvent &even
                                    std::vector<ObservationTime>{time});
   if (result.status != CheckStatus::Pass && result.status != CheckStatus::Pending)
     return remember_failure(result);
-  last_memory_rank_ = time.rank;
-  last_read_group_.reset();
+  remember_rank(event, time, certificate, member.id, 0);
   store->second.published = true;
   collect_store_metadata();
   return result;

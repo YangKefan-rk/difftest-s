@@ -244,6 +244,14 @@ CheckResult HostSession::poll() {
   }
 }
 
+CheckResult HostSession::report_source_failure(CheckResult failure) {
+  if (!failure_)
+    return failure_;
+  if (failure.status == CheckStatus::Pass || failure.status == CheckStatus::Pending)
+    return reject(invalid("source failure report must contain a terminal rejection"));
+  return reject(std::move(failure));
+}
+
 CheckResult HostSession::finalize(uint64_t completed_cycle) {
   if (!failure_)
     return failure_;
