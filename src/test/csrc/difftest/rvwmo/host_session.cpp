@@ -127,8 +127,10 @@ bool HostSession::registered_hart(uint32_t hart) const {
 }
 
 CheckResult HostSession::reject(CheckResult result) {
-  if (result.status != CheckStatus::Pass && result.status != CheckStatus::Pending)
+  if (result.status != CheckStatus::Pass && result.status != CheckStatus::Pending) {
     failure_ = result;
+    finalized_ = false;
+  }
   return result;
 }
 
