@@ -19,6 +19,8 @@ public:
   rvwmo::SessionSubmitResult submit_closed(
       const rvwmo::EventBatch &batch, const std::vector<rvwmo::ArchitecturalRetirement> &retirements);
   rvwmo::CheckResult finalize(const NativeCompletionEvidence &evidence);
+  // Relay terminal source rejections to the public owner; Pending is retryable.
+  rvwmo::CheckResult report_source_failure(rvwmo::CheckResult failure);
   bool finalized() const { return finalized_; }
 
 private:

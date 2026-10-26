@@ -9,8 +9,7 @@ namespace blackparrot {
 HostSessionAdapter::HostSessionAdapter(rvwmo::HostSession &session) : session_(session) {}
 
 rvwmo::SessionSubmitResult HostSessionAdapter::reject_capture(rvwmo::CheckResult result) {
-  failure_ = std::move(result);
-  finalized_ = false;
+  report_source_failure(std::move(result));
   rvwmo::SessionSubmitResult rejected;
   rejected.check = failure_;
   const auto status = failure_.status == rvwmo::CheckStatus::Unsupported ? rvwmo::EventValidationStatus::Unsupported
@@ -18,6 +17,16 @@ rvwmo::SessionSubmitResult HostSessionAdapter::reject_capture(rvwmo::CheckResult
                                                                         : rvwmo::EventValidationStatus::Invalid;
   rejected.transport = {status, failure_.message};
   return rejected;
+}
+
+rvwmo::CheckResult HostSessionAdapter::report_source_failure(rvwmo::CheckResult failure) {
+  if (!failure_)
+    return failure_;
+  if (failure.status == rvwmo::CheckStatus::Pass || failure.status == rvwmo::CheckStatus::Pending)
+    return failure;
+  finalized_ = false;
+  failure_ = session_.report_source_failure(std::move(failure));
+  return failure_;
 }
 
 rvwmo::SessionSubmitResult HostSessionAdapter::submit(const NativeCapture &capture) {
@@ -43,6 +52,7 @@ rvwmo::SessionSubmitResult HostSessionAdapter::submit_closed(
       watermarks_[watermark.producer_id] = watermark.closed_through;
   if (result.check.status != rvwmo::CheckStatus::Pass)
     finalized_ = false;
+  report_source_failure(result.check);
   return result;
 }
 
@@ -52,20 +62,21 @@ rvwmo::CheckResult HostSessionAdapter::finalize(const NativeCompletionEvidence &
     return failure_;
   const auto valid = validate_native_completion(evidence);
   if (!valid)
-    return valid;
+    return report_source_failure(valid);
   if (!boundaries_submitted_) {
     if (evidence.harts.empty())
-      return {rvwmo::CheckStatus::Incomplete, 0, "native host has no observed per-hart completion records"};
+      return report_source_failure(
+          {rvwmo::CheckStatus::Incomplete, 0, "native host has no observed per-hart completion records"});
     std::set<uint32_t> harts;
     for (const auto &hart : evidence.harts)
       if (!hart.terminal_uid || hart.source_cycle > *evidence.completed_cycle || !harts.insert(hart.hart).second) {
-        failure_ = {rvwmo::CheckStatus::Invalid, 0, "native hart completion identity or source boundary is invalid"};
-        return failure_;
+        return report_source_failure(
+            {rvwmo::CheckStatus::Invalid, 0, "native hart completion identity or source boundary is invalid"});
       }
     for (const auto &hart : evidence.harts) {
       const auto complete = session_.complete_hart({hart.hart, hart.source_cycle, 0});
       if (!complete)
-        return complete;
+        return report_source_failure(complete);
     }
     // Each separately observed producer closes its own prefix. Hart completion
     // cannot close a cache source or invent a memory ordering rank.
@@ -73,7 +84,7 @@ rvwmo::CheckResult HostSessionAdapter::finalize(const NativeCompletionEvidence &
       const auto drain = session_.drain_producer(
           {watermark.first, watermark.second.cycle, evidence.memory_drained, evidence.observations_drained});
       if (!drain)
-        return drain;
+        return report_source_failure(drain);
     }
     boundaries_submitted_ = true;
   }
@@ -81,7 +92,7 @@ rvwmo::CheckResult HostSessionAdapter::finalize(const NativeCompletionEvidence &
   if (result.status == rvwmo::CheckStatus::Pending)
     result.status = rvwmo::CheckStatus::Incomplete;
   finalized_ = result.status == rvwmo::CheckStatus::Pass && session_.finalized();
-  return result;
+  return report_source_failure(result);
 }
 
 ConversionResult install_native_host_session(Configuration configuration, HostSessionAdapter &adapter) {
@@ -92,7 +103,7 @@ ConversionResult install_native_host_session(Configuration configuration, HostSe
       return NativeVerification{submitted.check, false};
     const auto result = adapter.finalize(capture.completion);
     return NativeVerification{result, adapter.finalized()};
-  });
+  }, [&adapter](const rvwmo::CheckResult &failure) { adapter.report_source_failure(failure); });
 }
 
 } // namespace blackparrot
