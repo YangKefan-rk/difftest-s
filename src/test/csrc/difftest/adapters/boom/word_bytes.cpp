@@ -129,9 +129,8 @@ CheckResult merge_retirement(uint32_t hart, const ProbeInstruction &core,
 
 CheckResult convert_allocation(uint32_t hart, const ProbeInstruction &probe, const EventSource &source,
                                 InstructionAllocation &result) {
-  auto status = unsupported_atomic(probe.atomic);
-  if (!status)
-    return status;
+  // Allocations may be speculative. Confirm unsupported memory semantics only
+  // at architectural commit/retirement; whole-instruction squash is supported.
   InstructionAllocation converted;
   converted.id = operation_id(hart, probe.identity);
   converted.rob = {probe.rob_index, probe.identity.rob_generation};
@@ -186,6 +185,10 @@ CheckResult convert_single_store_publication(uint32_t hart, const ProbeStore &pr
   auto status = unsupported_atomic(probe.atomic);
   if (!status)
     return status;
+  if (evidence != StorePublicationEvidence::Unavailable &&
+      evidence != StorePublicationEvidence::ExclusiveCacheDataWrite &&
+      evidence != StorePublicationEvidence::CoherentRefillDataWrite)
+    return {CheckStatus::Invalid, 0, "BOOM publication converter has an unknown evidence kind"};
   if (!single_writer_complete || evidence == StorePublicationEvidence::Unavailable)
     return {CheckStatus::Incomplete, 0, "BOOM publication needs explicit cache-effect and single-writer evidence"};
   if (!transaction_id)

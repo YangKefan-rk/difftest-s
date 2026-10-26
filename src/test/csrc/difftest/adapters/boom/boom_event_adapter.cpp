@@ -191,7 +191,7 @@ BoomEventAdapter::BoomEventAdapter(uint32_t hart, uint64_t epoch, AdapterLimits 
     : hart_(hart), epoch_(epoch), limits_(limits), rob_(limits.rob_slots), ldq_(limits.ldq_slots),
       stq_(limits.stq_slots) {
   if (!limits.rob_slots || !limits.ldq_slots || !limits.stq_slots || !limits.live_instructions ||
-      !limits.attempts_per_load || !limits.queued_events || !limits.open_source_sequences || !limits.producers ||
+      !limits.attempts_per_load || !limits.queued_events || !limits.producers ||
       !limits.captured_retirements)
     throw std::invalid_argument("BOOM adapter requires nonzero lifecycle and transport limits");
 }
@@ -236,8 +236,6 @@ CheckResult BoomEventAdapter::reserve_source_sequence(const EventSource &source)
     return incomplete("BOOM producer source history bound reached");
   if (highest != highest_source_sequences_.end() && source.position.producer_sequence <= highest->second)
     return invalid("BOOM producer source sequence is not strictly increasing");
-  if (seen_source_sequences_.size() >= limits_.open_source_sequences)
-    return pending("BOOM open source-sequence history is full; advance caller watermarks before retrying");
   highest_source_sequences_[source.producer_id] = source.position.producer_sequence;
   return {};
 }
@@ -289,14 +287,10 @@ CheckResult BoomEventAdapter::append(const EventSource &source, RuntimeEventKind
     return result;
   if (batch_.events.size() >= limits_.queued_events)
     return pending("BOOM event queue is full; submit the existing batch before retrying");
-  const auto sequence_key = std::make_pair(source.producer_id, source.position.producer_sequence);
-  if (seen_source_sequences_.count(sequence_key))
-    return invalid("BOOM producer source sequence was reused");
   result = reserve_source_sequence(source);
   if (!result)
     return result;
   batch_.events.push_back({source.producer_id, source.position, kind, std::move(payload)});
-  seen_source_sequences_.emplace(sequence_key, source.position);
   return {};
 }
 
@@ -314,16 +308,16 @@ CheckResult BoomEventAdapter::allocate(const InstructionAllocation &record) {
   const unsigned opcode = record.instruction & 0x7f;
   const unsigned quadrant = record.instruction & 3;
   const unsigned compressed_function = (record.instruction >> 13) & 7;
-  if ((record.length == 4 && (opcode == 0x2f || opcode == 0x07 || opcode == 0x27)) ||
+  const bool unsupported_memory =
+      (record.length == 4 && (opcode == 0x2f || opcode == 0x07 || opcode == 0x27)) ||
       (record.length == 2 && (quadrant == 0 || quadrant == 2) &&
-       (compressed_function == 1 || compressed_function == 5)))
-    return unsupported("BOOM atomic/floating/vector memory needs a richer public consumer");
+       (compressed_function == 1 || compressed_function == 5));
   const bool load = record.length == 4 ? opcode == 0x03 :
       (quadrant == 0 || quadrant == 2) && (compressed_function == 2 || compressed_function == 3);
   const bool store = record.length == 4 ? opcode == 0x23 :
       (quadrant == 0 || quadrant == 2) && (compressed_function == 6 || compressed_function == 7);
-  if (load != record.ldq.has_value() ||
-      (store != record.stq.has_value() && !(record.stq && fence_instruction(record.instruction))))
+  if (!unsupported_memory && (load != record.ldq.has_value() ||
+      (store != record.stq.has_value() && !(record.stq && fence_instruction(record.instruction)))))
     return invalid("BOOM raw scalar opcode does not match its LDQ/STQ allocation");
   if (load && !scalar_memory_log2_size(record.instruction, record.length, true))
     return unsupported("BOOM load encoding is not a supported scalar integer width");
@@ -352,6 +346,7 @@ CheckResult BoomEventAdapter::allocate(const InstructionAllocation &record) {
     return result;
   Instruction state;
   state.allocation = record;
+  state.unsupported_memory = unsupported_memory;
   instructions_.emplace(record.id, std::move(state));
   claim_slot(rob_, record.rob, record.id);
   if (record.ldq)
@@ -395,9 +390,11 @@ CheckResult BoomEventAdapter::begin_load_attempt(const LoadAttempt &record, cons
   }
   if (source_lower_bound.producer_id != hart_producer_id(hart_))
     return invalid("BOOM load attempt lower bound must use its hart-private producer");
-  result = reserve_source_sequence(source_lower_bound);
-  if (!result)
-    return result;
+  if (source_lower_bound.position.cycle < instruction->allocation.source.position.cycle)
+    return invalid("BOOM load attempt precedes its instruction allocation");
+  // A begin is a private sampling lower bound, not a public stream event. Its
+  // eventual sample can return after other observations with the same source
+  // cycle and receives its public sequence only when that prefix is complete.
   instruction->attempts.emplace(record.attempt, Attempt{AttemptState::Executing, {}, source_lower_bound});
   instruction->latest_attempt = record.attempt;
   return {};
@@ -414,12 +411,26 @@ CheckResult BoomEventAdapter::sample_load(const LoadObservation &record) {
   const auto &lower_bound = attempt->second.source_lower_bound;
   if (record.source.producer_id != lower_bound.producer_id)
     return incomplete("BOOM load attempt and sample do not share their negotiated source channel");
-  const auto sample_order = compare_source_position(record.source.producer_id, record.source.position,
-                                                    lower_bound.producer_id, lower_bound.position);
-  if (sample_order == SourceOrder::Before)
+  if (record.source.position.cycle < lower_bound.position.cycle)
     return invalid("BOOM load source sample precedes its execution-attempt lower bound");
-  if (!record.source_complete || record.sampling_point == LoadSamplingPoint::Unavailable)
+  switch (record.sampling_point) {
+  case LoadSamplingPoint::Unavailable:
+    return incomplete("BOOM load sample lacks source-side sampling evidence");
+  case LoadSamplingPoint::CacheDataArray:
+  case LoadSamplingPoint::StoreForwarding:
+  case LoadSamplingPoint::RefillData:
+    break;
+  default:
+    return invalid("BOOM load sample has an unknown sampling-evidence kind");
+  }
+  if (!record.source_complete)
     return incomplete("BOOM load sample lacks complete source-side sampling evidence");
+  if (instruction->unsupported_memory) {
+    // Keep speculative identities so a later branch squash is harmless. No
+    // unsupported memory value becomes a public sample or reference oracle.
+    attempt->second.state = AttemptState::Sampled;
+    return {};
+  }
   const auto expected_size = scalar_memory_log2_size(instruction->allocation.instruction,
                                                        instruction->allocation.length, true);
   if (!expected_size || record.bytes.size() != (size_t{1} << *expected_size) ||
@@ -476,6 +487,8 @@ CheckResult BoomEventAdapter::commit_store(const StoreCommit &record) {
   auto found = instructions_.find(record.id);
   if (found == instructions_.end() || found->second.retired || !found->second.allocation.stq || found->second.store)
     return invalid("BOOM store commit has no matching live STQ instruction or is duplicated");
+  if (found->second.unsupported_memory)
+    return unsupported("BOOM committed memory instruction exceeds the scalar consumer profile");
   if (fence_instruction(found->second.allocation.instruction))
     return invalid("BOOM fence STQ entry has no LocalStore memory effect");
   if (!record.architecturally_committed)
@@ -529,8 +542,15 @@ CheckResult BoomEventAdapter::publish_store(const StorePublication &record) {
     if (!result)
       return result;
   }
-  if (record.evidence == StorePublicationEvidence::Unavailable)
+  switch (record.evidence) {
+  case StorePublicationEvidence::Unavailable:
     return incomplete("BOOM store lacks cache/coherence evidence for global publication");
+  case StorePublicationEvidence::ExclusiveCacheDataWrite:
+  case StorePublicationEvidence::CoherentRefillDataWrite:
+    break;
+  default:
+    return invalid("BOOM store publication has an unknown evidence kind");
+  }
   const auto &store = *found->second.store;
   if (!record.transaction_id || record.address != store.address || record.byte_mask != store.byte_mask ||
       !valid_bytes(record.address, record.bytes, record.byte_mask) || record.byte_writers.size() != record.bytes.size())
@@ -560,6 +580,8 @@ CheckResult BoomEventAdapter::retire(const Retirement &record) {
   auto found = instructions_.find(record.id);
   if (found == instructions_.end() || found->second.retired || record.id.uid <= last_retired_uid_)
     return invalid("BOOM retirement is stale, duplicated or out of architectural program order");
+  if (found->second.unsupported_memory)
+    return unsupported("BOOM retired memory instruction exceeds the scalar consumer profile");
   if (captured_retirements_.size() >= limits_.captured_retirements)
     return pending("BOOM architectural result queue is full; retrieve captured retirements and retry");
   if (record.destination_type > IntegerDestinationType::Zero || record.logical_destination > 31)
@@ -666,6 +688,24 @@ CheckResult BoomEventAdapter::audit_reference_store(CheckerEventConsumer &consum
   return {};
 }
 
+CheckResult BoomEventAdapter::audit_reference_store(const ReferenceStoreAudit &record) {
+  auto result = validate_id(record.id);
+  if (!result)
+    return result;
+  auto found = instructions_.find(record.id);
+  if (found == instructions_.end() || !found->second.store)
+    return pending("BOOM reference store audit awaits LocalStore conversion");
+  if (found->second.audited)
+    return invalid("BOOM reference store was already audited");
+  const auto &store = *found->second.store;
+  if (record.address != store.address || record.byte_mask != store.byte_mask ||
+      !selected_bytes_equal(found->second.store_bytes, record.bytes, store.byte_mask))
+    return {CheckStatus::Violation, 0, "BOOM independent REF store differs from LocalStore"};
+  found->second.audited = true;
+  collect(record.id);
+  return {};
+}
+
 void BoomEventAdapter::collect(const OperationId &id) {
   auto found = instructions_.find(id);
   if (found == instructions_.end() || !found->second.retired)
@@ -747,22 +787,6 @@ CheckResult BoomEventAdapter::close_prefix(const ProducerWatermark &watermark) {
   else
     *queued = watermark;
   watermarks_[watermark.producer_id] = watermark.closed_through;
-  for (auto sequence = seen_source_sequences_.begin(); sequence != seen_source_sequences_.end();) {
-    if (sequence->first.first != watermark.producer_id) {
-      ++sequence;
-      continue;
-    }
-    const auto &position = sequence->second;
-    const bool whole_cycle_closed = watermark.closed_through.order_qualified &&
-        watermark.closed_through.qualified_phase == SourcePosition::cycle_closed_phase &&
-        position.cycle == watermark.closed_through.cycle;
-    const auto order = compare_source_position(watermark.producer_id, position,
-                                               watermark.producer_id, watermark.closed_through);
-    if (whole_cycle_closed || order == SourceOrder::Before || order == SourceOrder::Equal)
-      sequence = seen_source_sequences_.erase(sequence);
-    else
-      ++sequence;
-  }
   return {};
 }
 
