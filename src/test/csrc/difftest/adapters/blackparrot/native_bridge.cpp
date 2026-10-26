@@ -10,6 +10,7 @@
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include <tuple>
 #include <utility>
 
 namespace blackparrot {
@@ -18,6 +19,14 @@ constexpr size_t kMaximumInstructions = 65536;
 constexpr size_t kMaximumObservations = 1048576;
 constexpr uint32_t kKnownMemoryFlags = 0x3f;
 constexpr uint32_t kInternalMemoryFlag = 1u << 2;
+constexpr uint32_t kCacheSetCount = 64;
+constexpr uint32_t kCacheWayCount = 8;
+constexpr uint32_t kCacheBankOffsetMask = kCacheWayCount - 1;
+using DrainKey = std::tuple<rvwmo::OperationId, uint32_t, uint64_t, uint64_t>;
+
+DrainKey drain_key(const rvwmo::OperationId &id, uint32_t attempt, uint64_t time, uint64_t address) {
+  return {id, attempt, time, address};
+}
 
 struct Attempt {
   uint64_t allocated_at = 0;
@@ -125,6 +134,9 @@ public:
   size_t observations = 0;
   std::map<uint32_t, Hart> harts;
   std::map<rvwmo::OperationId, Instruction> instructions;
+  std::map<DrainKey, size_t> physical_drain_counts;
+  std::map<DrainKey, size_t> coherent_drain_indices;
+  std::map<std::tuple<rvwmo::OperationId, uint32_t, uint32_t>, size_t> forwarding_fact_indices;
 
   void reject_transport() {
     failed = true;
@@ -351,6 +363,7 @@ public:
                   "physical store drain data differs from its store-buffer input");
         execution.drained = true;
         execution.drained_at = fact.source_time;
+        ++physical_drain_counts[drain_key(fact.id, fact.attempt, fact.source_time, fact.address)];
       } else if (fact.kind == 3) {
         require(!execution.sample, "duplicate successful load sample");
         for (size_t lane = 0; lane < 8; ++lane) {
@@ -358,13 +371,10 @@ public:
           require(forwarded || !execution.forwarding_seen[lane], "writer identity supplied for a nonforwarded byte");
           if (forwarded) {
             require(execution.forwarding_seen[lane], "forwarded byte lacks its source writer callback");
-            auto forward = std::find_if(capture.forwarding_facts.rbegin(), capture.forwarding_facts.rend(),
-                                        [&](const NativeForwardFact &entry) {
-                                          return entry.reader == fact.id && entry.attempt == fact.attempt &&
-                                                 entry.byte_index == lane;
-                                        });
-            require(forward != capture.forwarding_facts.rend(), "forwarded writer callback was not retained");
-            forward->source_time = fact.forwarding_time;
+            const auto forward_index = forwarding_fact_indices.find({fact.id, fact.attempt, lane});
+            require(forward_index != forwarding_fact_indices.end(), "forwarded writer callback was not retained");
+            auto &forward = capture.forwarding_facts[forward_index->second];
+            forward.source_time = fact.forwarding_time;
             if (!execution.forwarding_candidates[lane]) {
               fact.forwarded_writers[lane].reset();
               gap("forwarded byte has no observed logical writer identity");
@@ -390,7 +400,7 @@ public:
             }
             require(observed_writer_byte, "forwarded writer does not own the captured address/byte lane");
             if (eligible_attempts.size() == 1) {
-              forward->resolved_writer_attempt = eligible_attempts.front();
+              forward.resolved_writer_attempt = eligible_attempts.front();
             } else {
               fact.forwarded_writers[lane].reset();
               gap(eligible_attempts.empty()
@@ -434,6 +444,7 @@ public:
     require(lane < 8 && !execution.sample && !execution.forwarding_seen[lane], "duplicate/late/invalid forwarding byte");
     execution.forwarding_seen[lane] = true;
     capture.forwarding_facts.push_back({id, number, lane, writer});
+    forwarding_fact_indices.emplace(std::make_tuple(id, number, lane), capture.forwarding_facts.size() - 1);
     if (!writer.uid) {
       gap("forwarded byte has no observed logical writer identity");
       record("FORWARD_UNKNOWN", id.hart, id.epoch, id.uid, number, lane, writer.epoch);
@@ -483,20 +494,36 @@ public:
                   (fact.coherence_state == 2 || fact.coherence_state == 6) && fact.grant_time &&
                   fact.grant_time < fact.source_time,
               "coherent drain proof lacks the fixed four-hart ownership/write evidence");
+      require(fact.bank_select && !(fact.bank_select & (fact.bank_select - 1)) &&
+                  !(fact.bank_select & ~uint32_t{kCacheWayCount - 1}) &&
+                  fact.physical_sram_index < kCacheSetCount * kCacheWayCount,
+              "coherent drain proof lacks a one-hot physical SRAM location");
+      uint32_t physical_bank = 0;
+      while ((fact.bank_select & (uint32_t{1} << physical_bank)) == 0)
+        ++physical_bank;
+      const uint32_t physical_set = fact.physical_sram_index / kCacheWayCount;
+      const uint32_t bank_offset = fact.physical_sram_index & kCacheBankOffsetMask;
+      const uint32_t expected_set = static_cast<uint32_t>((fact.address >> 6) & (kCacheSetCount - 1));
+      const uint32_t expected_way = (physical_bank + kCacheWayCount - bank_offset) &
+                                    (kCacheWayCount - 1);
+      require(physical_set == expected_set && fact.cache_set == expected_set &&
+                  fact.cache_way == expected_way,
+              "coherence proof set/way differs from the observed PA and physical SRAM write location");
     } else {
       require(!(fact.proof_flags & 1u), "ordinary coherent drain has incomplete ownership/write evidence");
       gap("coherence monitor retained a drain outside the ordinary scalar proof");
     }
     require(hart_count == 4, "coherent publication proof requires the audited four-hart profile");
-    require(std::none_of(capture.coherence_facts.begin(), capture.coherence_facts.end(), [&](const auto &previous) {
-      return previous.id == fact.id && previous.attempt == fact.attempt;
-    }), "duplicate coherent drain proof");
+    const auto key = drain_key(fact.id, fact.attempt, fact.source_time, fact.address);
+    require(!coherent_drain_indices.count(key), "duplicate coherent drain proof");
     // The two source monitors run in separate SV processes. Match their facts
     // after delivery, without assuming which DPI callback arrives first.
     capture.coherence_facts.push_back(fact);
+    coherent_drain_indices.emplace(key, capture.coherence_facts.size() - 1);
     record("COHERENT_DRAIN", fact.id.hart, fact.id.epoch, fact.id.uid, fact.attempt,
            fact.source_time, fact.address, fact.cache_set, fact.cache_way,
-           fact.coherence_state, fact.grant_time, fact.proof_flags);
+           fact.coherence_state, fact.grant_time, fact.proof_flags, fact.bank_select,
+           fact.physical_sram_index);
   }
 
   bool can_end() const {
@@ -684,12 +711,13 @@ private:
         stop_at[id] = time;
     };
     for (const auto &proof : capture.coherence_facts) {
-      const auto match = std::find_if(capture.memory_facts.begin(), capture.memory_facts.end(), [&](const auto &fact) {
-        return fact.kind == 2 && fact.id == proof.id && fact.attempt == proof.attempt &&
-               fact.source_time == proof.source_time && fact.address == proof.address;
-      });
-      require(match != capture.memory_facts.end(), "coherent proof has no exact physical drain fact");
+      const auto key = drain_key(proof.id, proof.attempt, proof.source_time, proof.address);
+      if (physical_drain_counts[key] != 1)
+        gap("coherence location proof has no unique exact physical store drain fact");
     }
+    for (const auto &drain : physical_drain_counts)
+      if (drain.second != 1 || !coherent_drain_indices.count(drain.first))
+        gap("physical store drain has no unique coherence/location proof");
     for (const auto &entry : instructions) {
       const auto &id = entry.first;
       const auto &live = entry.second;
@@ -706,13 +734,12 @@ private:
         if (execution.store && !execution.drained)
           gap("store-buffer input has no matching physical drain candidate");
         if (execution.drained) {
-          const auto proof = std::find_if(capture.coherence_facts.begin(), capture.coherence_facts.end(),
-              [&](const auto &fact) { return fact.id == id && fact.attempt == attempt_entry.first &&
-                                            fact.source_time == execution.drained_at &&
-                                            execution.store && fact.address == execution.store->address; });
-          if (proof == capture.coherence_facts.end()) {
+          const auto key = drain_key(id, attempt_entry.first, execution.drained_at, execution.store->address);
+          const auto proof_index = coherent_drain_indices.find(key);
+          if (proof_index == coherent_drain_indices.end()) {
             gap("physical SRAM store drain is an unqualified publication candidate, not StorePublish");
-          } else if (proof->proof_flags != 0x1f || (execution.memory_flags & ~uint32_t{1u << 3})) {
+          } else if (capture.coherence_facts[proof_index->second].proof_flags != 0x1f ||
+                     (execution.memory_flags & ~uint32_t{1u << 3})) {
             gap("coherent drain belongs to an unsupported memory lifecycle");
           } else if (!live.retirement || live.retirement->attempt != attempt_entry.first || execution.cancelled) {
             gap("coherent physical store drain has no final committed instruction");
@@ -730,7 +757,8 @@ private:
             // Transaction IDs identify actual per-instruction drains and do not
             // establish an order among simultaneous cache producers.
             publish.transaction_id = ++publication_transaction_;
-            planned.push_back({id.hart, proof->source_time, producer, false,
+            planned.push_back({id.hart, capture.coherence_facts[proof_index->second].source_time,
+                producer, false,
                 [publish, id](Adapter &target, const Origin &origin) mutable {
                   publish.members = {{id, origin.source}};
                   return target.publish_store(origin, publish);
@@ -1014,10 +1042,11 @@ extern "C" int bp_difftest_s_memory_idle(uint32_t hart, uint64_t time, uint32_t 
 extern "C" int bp_difftest_s_coherent_drain(uint32_t hart, uint64_t epoch, uint64_t uid, uint32_t attempt,
                                               uint64_t time, uint64_t address, uint32_t cache_set,
                                               uint32_t cache_way, uint32_t state, uint64_t grant_time,
-                                              uint32_t proof_flags) {
+                                              uint32_t proof_flags, uint32_t bank_select,
+                                              uint32_t physical_sram_index) {
   return blackparrot::invoke("coherent_drain", [&](auto &bridge) {
     bridge.coherent_drain({{hart, epoch, uid, 0}, attempt, time, address, cache_set, cache_way,
-                           state, grant_time, proof_flags});
+                           state, grant_time, proof_flags, bank_select, physical_sram_index});
   });
 }
 extern "C" int bp_difftest_s_terminal_state(uint32_t hart, uint64_t time, uint64_t uid,
