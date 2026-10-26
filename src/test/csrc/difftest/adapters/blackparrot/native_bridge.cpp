@@ -547,6 +547,7 @@ public:
               "native hart closure retains an unsquashed instruction allocation");
     }
     source.closed_at = time;
+    capture.completion.harts.push_back({id, time, uid});
     record("CLOSE_HART", id, time, uid);
   }
 

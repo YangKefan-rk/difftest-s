@@ -59,6 +59,11 @@ rvwmo::CheckResult validate_completion(const NativeCompletionEvidence &evidence)
 }
 } // namespace
 
+rvwmo::CheckResult validate_native_capture(const NativeCapture &capture) { return validate_capture(capture); }
+rvwmo::CheckResult validate_native_completion(const NativeCompletionEvidence &evidence) {
+  return validate_completion(evidence);
+}
+
 rvwmo::CheckResult capture_architectural_retirements(
     const ConvertedOutput &converted, std::vector<rvwmo::ArchitecturalRetirement> &retirements) {
   retirements.clear();
@@ -104,7 +109,7 @@ rvwmo::SessionSubmitResult SessionAdapter::reject_capture(rvwmo::CheckResult fai
 rvwmo::SessionSubmitResult SessionAdapter::submit(const NativeCapture &capture) {
   if (!capture_failure_)
     return reject_capture(capture_failure_);
-  const auto valid = validate_capture(capture);
+  const auto valid = validate_native_capture(capture);
   if (!valid)
     return reject_capture(valid);
   std::vector<rvwmo::ArchitecturalRetirement> retirements;
@@ -132,7 +137,7 @@ rvwmo::CheckResult SessionAdapter::finalize(const NativeCompletionEvidence &evid
   const auto progress = session_.poll();
   if (progress.status != rvwmo::CheckStatus::Pass && progress.status != rvwmo::CheckStatus::Pending)
     return progress;
-  const auto complete = validate_completion(evidence);
+  const auto complete = validate_native_completion(evidence);
   if (!complete)
     return complete;
   auto result = session_.finalize(*evidence.completed_cycle);

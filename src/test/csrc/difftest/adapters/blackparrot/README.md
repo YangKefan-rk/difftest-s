@@ -14,10 +14,13 @@ The adapter does not implement another Runtime, REF or event ABI.
   pairs physical facts, and converts complete captures. `NativeSink` supports
   capture consumers; it cannot provide a semantic Pass. `NativeVerifier` keeps
   semantic status separate from malformed transport.
-- `session_adapter.h/.cpp` borrows a public session. Install it before the first
-  probe initialization with `install_native_session(configuration, adapter)`.
-  The adapter, session, reference pool and backing memory must outlive the run.
-  A final Pass requires both native completion evidence and public finalization.
+- `session_adapter.h/.cpp` supports a borrowed `ObservationSession` and common
+  capture validation. `host_session_adapter.h/.cpp` connects the native end facts
+  to the public `HostSession`, which owns the fixed hart roster, reference pool,
+  source drains and final checks. Install the native host before probe startup
+  with `install_native_host_session(configuration, adapter)`. The adapter, public
+  host and backing memory must outlive the run. A final Pass requires native
+  completion evidence and successful public host finalization.
 - RTL probes live beside BlackParrot's existing nonsynth monitors. The opt-in
   native build entry is `black-parrot-sim/Makefile.difftest-s`.
 
@@ -28,8 +31,9 @@ Qualified publications and terminal completion use the fixed synchronous
 Core and inverted cache edges retain their common even/odd half-cycle ticks.
 Each cache has its own publication producer. Equal-tick cross-producer memory
 observations remain unqualified; producer IDs, callback order, UID order and
-conversion order never establish their GMO order. The public session rejects
-runs without the relative-order evidence it requires.
+conversion order never establish their GMO order. The public session can group
+certified concurrent ordinary reads without inventing their relative order.
+Ambiguous groups containing writes remain Incomplete.
 
 Ordinary scalar loads retain the actual SRAM or forwarding sample tick. Raw
 word-aligned facts keep byte masks and forwarding writer identities; public
@@ -52,10 +56,10 @@ it does not retime publication or trust DUT bytes as expected data.
 ## Reference and completion contract
 
 The embedding initializes independent memory from its program image, creates
-one matching BlackParrot reference per hart through the public
-`SpikeReferencePool`, and supplies its callback to `ObservationSession`.
-`SessionAdapter` compares the captured PC/raw/integer result through that
-session. Ordinary stores are audited against REF-derived address/data/mask.
+a public `HostSession` with one matching BlackParrot reference per hart.
+The host owns `SpikeReferencePool` and its `ObservationSession`.
+The private host adapter submits captured PC/raw/integer snapshots through
+that same public session. Ordinary stores are audited against REF-derived address/data/mask.
 The native build accepts an explicit embedding source and matching Spike
 headers/library; no hidden factory guesses initial architectural state.
 

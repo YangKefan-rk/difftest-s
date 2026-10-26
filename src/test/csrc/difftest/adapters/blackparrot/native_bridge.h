@@ -84,6 +84,12 @@ struct NativeCoherenceFact {
 // Evidence is emitted only by the native terminal-WFI protocol after issue is
 // stopped, retained speculative identities are explicitly squashed, and the
 // synchronous source monitors have delivered their complete final prefix.
+struct NativeHartCompletion {
+  uint32_t hart = 0;
+  uint64_t source_cycle = 0;
+  uint64_t terminal_uid = 0;
+};
+
 struct NativeCompletionEvidence {
   std::optional<uint64_t> completed_cycle;
   bool all_harts_completed = false;
@@ -93,6 +99,7 @@ struct NativeCompletionEvidence {
   // to be empty; maintenance tails cannot create another included instruction.
   bool memory_drained = false;
   PendingState pending;
+  std::vector<NativeHartCompletion> harts;
 };
 
 struct NativeVerification {
