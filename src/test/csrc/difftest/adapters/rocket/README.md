@@ -183,3 +183,51 @@ need not follow the later metadata capture. The released public session defers
 an early publication until its LocalStore record arrives. This does not prove
 that a raw cache drain is a global publication: the embedding collector still
 supplies the actual coherence/publication evidence.
+
+
+## Native fact joining
+
+`NativeAdapter` composes the three private components for one hart. Its input
+methods accept existing typed Rocket records, not a second public transport.
+The embedding shared frame decoder supplies real source positions and the
+registered requestor/hart configuration. In particular, `bind_request` checks
+the token, attempt, memory decode, command, scalar width and core/cache tag
+agreement before retaining an association. Unsupported speculative extensions
+remain opaque until squash or confirmed unsupported retirement.
+
+Every input returns `CaptureResult{check, consumed}`. Only `consumed=false`
+with Pending permits retrying the same input: capacity was unavailable and
+state did not change. `consumed=true` with Pending means the adapter owns the
+copied fact; do not resend it. Continue independent facts and call `poll()`.
+All other failures latch. A late WB delivered before its retirement record is
+retained; it is validated against that record before any snapshot is emitted.
+
+`NativeRetireFact` supplies the original WB record and, for stores, a separate
+`local_store_source` from that same physical WB cycle with an earlier event
+ordinal. Store acceptance or final load data may arrive later on the host;
+the join never substitutes their arrival time for the original source time.
+Cancellation releases the exact request/attempt. Whole-token squash is a
+separate operation; committed accepted stores cannot be silently retracted.
+
+`publish(QualifiedStorePublication)` requires the caller's hardware publication
+proof. It copies actual drain bytes and transaction identity while waiting for
+store acceptance/retirement. It does not infer publication from a raw SRAM
+write or construct a rank. All harts sharing a fabric producer need the
+coordinator's common monotonic source sequence; per-hart counters are insufficient.
+
+`output()` exposes immutable public `EventBatch` and existing
+`ArchitecturalRetirement` sidebands under one serial. Keep that output until
+the public session accepts it, then call `acknowledge_output(serial)`. The
+acknowledgement clears that serial before polling later work, so a returned
+Pending still means the acknowledgement succeeded; do not repeat it. Polling
+and new input leave the exposed output unchanged. Acknowledgement can expose
+another output immediately, including a later sample/retirement after an
+earlier snapshot. Drain every output before finalizing.
+
+`close_hart_prefix` closes semantic hart events only; it does not prove that
+late architectural values or fabric observations are complete. The adapter
+retains unresolved captures independently. `finalize` remains Pending while
+any instruction, request, store publication, late value or output is live.
+The coordinator must additionally complete public-session checks, all-hart
+completion and fabric watermarks. A private successful call is not an RVWMO
+verdict.
