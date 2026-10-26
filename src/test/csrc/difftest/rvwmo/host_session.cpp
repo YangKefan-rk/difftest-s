@@ -253,14 +253,15 @@ CheckResult HostSession::report_source_failure(CheckResult failure) {
 }
 
 CheckResult HostSession::finalize(uint64_t completed_cycle) {
+  if (!final_cycle_)
+    final_cycle_ = completed_cycle;
   if (!failure_)
     return failure_;
   if (finalized_) {
-    if (completed_cycle != final_cycle_)
+    if (completed_cycle != *final_cycle_)
       return reject(invalid("final source boundary differs from the already finalized run"));
     return {};
   }
-  final_cycle_ = completed_cycle;
   if (completed_harts_.size() != configuration_.initial_harts.size())
     return reject(incomplete("host session finalized before every required hart completed"));
   for (const auto &hart : completed_harts_)
@@ -302,7 +303,7 @@ std::string HostSession::final_report() const {
          << ",\"hart_count\":" << configuration_.initial_harts.size()
          << ",\"verdict\":" << quote_json(status_name(result.status))
          << ",\"rule\":" << result.rule << ",\"message\":" << quote_json(result.message)
-         << ",\"completed_cycle\":" << final_cycle_ << ",\"harts\":[";
+         << ",\"completed_cycle\":" << final_cycle_.value_or(0) << ",\"harts\":[";
   for (uint32_t hart = 0; hart < configuration_.initial_harts.size(); ++hart) {
     if (hart) output << ',';
     SessionHartStatistics statistics;

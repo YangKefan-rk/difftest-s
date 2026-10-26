@@ -4,6 +4,7 @@
 #include "spike_reference_pool.h"
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -71,7 +72,7 @@ private:
   std::map<uint32_t, uint64_t> last_architectural_cycles_;
   CheckResult failure_;
   bool finalized_ = false;
-  uint64_t final_cycle_ = 0;
+  std::optional<uint64_t> final_cycle_;
 
   CheckResult reject(CheckResult result);
   CheckResult validate_batch(const EventBatch &batch) const;
