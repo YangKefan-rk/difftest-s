@@ -272,8 +272,13 @@ CheckResult BoomEventAdapter::available_slot(const std::vector<SlotOwner> &slots
 CheckResult BoomEventAdapter::owned_slot(const std::vector<SlotOwner> &slots, const SlotGeneration &slot,
                                         const OperationId &id) const {
   if (slot.index >= slots.size() || !slots[slot.index].id || slots[slot.index].generation != slot.generation ||
-      *slots[slot.index].id != id)
-    return invalid("BOOM packet names a stale slot generation or the wrong instruction");
+      *slots[slot.index].id != id) {
+    std::string message = "BOOM packet names a stale slot generation or the wrong instruction";
+    message += " id=" + std::to_string(id.uid) + " slot=" + std::to_string(slot.index) + ":" + std::to_string(slot.generation);
+    if (slot.index < slots.size() && slots[slot.index].id)
+      message += " owner=" + std::to_string(slots[slot.index].id->uid) + ":" + std::to_string(slots[slot.index].generation);
+    return {CheckStatus::Invalid, 0, std::move(message)};
+  }
   return {};
 }
 
@@ -520,14 +525,18 @@ CheckResult BoomEventAdapter::release_store_slot(const OperationId &id, const Sl
   auto result = validate_id(id);
   if (!result)
     return result;
-  result = owned_slot(stq_, stq, id);
-  if (!result)
-    return result;
   auto found = instructions_.find(id);
-  if (found == instructions_.end() || found->second.stq_released ||
+  if (found == instructions_.end() || !found->second.allocation.stq ||
+      *found->second.allocation.stq != stq)
+    return invalid("BOOM STQ release has no matching original allocation generation");
+  if (found->second.stq_released ||
       (!found->second.store && !fence_instruction(found->second.allocation.instruction)))
     return invalid("BOOM STQ release has no committed store/fence or was already released");
-  release_slot(stq_, stq);
+  // The release packet may be observed after a physical slot has already been
+  // reused. Only clear the current owner when it is still this instruction.
+  if (stq.index < stq_.size() && stq_[stq.index].id &&
+      stq_[stq.index].generation == stq.generation && *stq_[stq.index].id == id)
+    release_slot(stq_, stq);
   found->second.stq_released = true;
   collect(id);
   return {};
