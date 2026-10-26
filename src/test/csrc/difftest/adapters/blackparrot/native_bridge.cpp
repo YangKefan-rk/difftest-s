@@ -1,4 +1,5 @@
 #include "native_bridge.h"
+#include "cache_geometry.h"
 #include "../../rvwmo/producer_ids.h"
 #include <algorithm>
 #include <cstdlib>
@@ -18,10 +19,6 @@ constexpr size_t kMaximumInstructions = 65536;
 constexpr size_t kMaximumObservations = 1048576;
 constexpr uint32_t kKnownMemoryFlags = 0x3f;
 constexpr uint32_t kInternalMemoryFlag = 1u << 2;
-constexpr uint32_t kCacheSetCount = 64;
-constexpr uint32_t kCacheWayCount = 8;
-constexpr uint32_t kCacheBankOffsetMask = kCacheWayCount - 1;
-constexpr uint32_t kCacheBankSelectMask = (uint32_t{1} << kCacheWayCount) - 1;
 using DrainKey = std::tuple<rvwmo::OperationId, uint32_t, uint64_t, uint64_t>;
 
 DrainKey drain_key(const rvwmo::OperationId &id, uint32_t attempt, uint64_t time, uint64_t address) {
@@ -496,25 +493,20 @@ public:
     auto &source = hart(fact.id.hart);
     source.latest_memory_time = std::max(source.latest_memory_time, fact.source_time);
     require(!(fact.address & 7) && !(fact.proof_flags & ~0x1fu) && (fact.source_time & 1) &&
-                fact.cache_set < 64 && fact.cache_way < 8,
+                fact.cache_set < cache_geometry::kSetCount && fact.cache_way < cache_geometry::kWayCount,
             "coherent drain record has an invalid source position, address or proof shape");
     if (fact.proof_flags == 0x1f) {
       require(fact.id.epoch && fact.id.uid && fact.attempt &&
                   (fact.coherence_state == 2 || fact.coherence_state == 6) && fact.grant_time &&
                   fact.grant_time < fact.source_time,
               "coherent drain proof lacks the fixed four-hart ownership/write evidence");
-      require(fact.bank_select && !(fact.bank_select & (fact.bank_select - 1)) &&
-                  !(fact.bank_select & ~kCacheBankSelectMask) &&
-                  fact.physical_sram_index < kCacheSetCount * kCacheWayCount,
+      require(cache_geometry::is_one_hot_bank(fact.bank_select) &&
+                  fact.physical_sram_index < cache_geometry::kPhysicalEntryCount,
               "coherent drain proof lacks a one-hot physical SRAM location");
-      uint32_t physical_bank = 0;
-      while ((fact.bank_select & (uint32_t{1} << physical_bank)) == 0)
-        ++physical_bank;
-      const uint32_t physical_set = fact.physical_sram_index / kCacheWayCount;
-      const uint32_t bank_offset = fact.physical_sram_index & kCacheBankOffsetMask;
-      const uint32_t expected_set = static_cast<uint32_t>((fact.address >> 6) & (kCacheSetCount - 1));
-      const uint32_t expected_way = (physical_bank + kCacheWayCount - bank_offset) &
-                                    (kCacheWayCount - 1);
+      const uint32_t physical_set = cache_geometry::set_for_physical_index(fact.physical_sram_index);
+      const uint32_t expected_set = cache_geometry::set_for_address(fact.address);
+      const uint32_t expected_way = cache_geometry::way_for_location(fact.bank_select,
+                                                                     fact.physical_sram_index);
       require(physical_set == expected_set && fact.cache_set == expected_set &&
                   fact.cache_way == expected_way,
               "coherence proof set/way differs from the observed PA and physical SRAM write location");
