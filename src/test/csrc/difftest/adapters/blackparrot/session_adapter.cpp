@@ -6,6 +6,7 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <optional>
 #include <set>
 #include <string>
 #include <tuple>
@@ -13,6 +14,74 @@
 
 namespace blackparrot {
 namespace {
+// A speculative SRAM read is not an irrevocable GMO witness. In particular,
+// reversing W->R FENCE edges in those timestamps alone does not establish an
+// illegal architectural execution. Reject this known certificate gap before
+// the public session interprets the physical observations as model order.
+rvwmo::CheckResult validate_fenced_array_samples(const NativeCapture &capture) {
+  using AttemptKey = std::pair<rvwmo::OperationId, uint32_t>;
+  std::map<AttemptKey, const NativeMemoryFact *> samples;
+  std::map<AttemptKey, uint64_t> publications;
+  std::map<rvwmo::OperationId, uint32_t> final_attempts;
+  for (const auto &fact : capture.retirement_facts)
+    final_attempts.emplace(fact.id, fact.attempt);
+  for (const auto &fact : capture.memory_facts)
+    if (fact.kind == 3)
+      samples.emplace(AttemptKey{fact.id, fact.attempt}, &fact);
+  for (const auto &proof : capture.coherence_facts)
+    if (proof.proof_flags == 0x1f)
+      publications.emplace(AttemptKey{proof.id, proof.attempt}, proof.source_time);
+
+  std::map<rvwmo::OperationId, const RetireRecord *> retired;
+  for (const auto &captured : capture.converted.retirements)
+    retired.emplace(captured.architectural.id, &captured.architectural);
+  uint64_t latest_store = 0;
+  uint64_t fenced_stores = 0;
+  std::optional<std::pair<uint32_t, uint64_t>> current_hart_epoch;
+  for (const auto &entry : retired) {
+    const auto &instruction = *entry.second;
+    const auto hart_epoch = std::make_pair(entry.first.hart, entry.first.epoch);
+    if (!current_hart_epoch || *current_hart_epoch != hart_epoch) {
+      current_hart_epoch = hart_epoch;
+      latest_store = 0;
+      fenced_stores = 0;
+    }
+    const uint32_t encoding = instruction.instruction;
+    const bool fence = instruction.length == 4 && (encoding & 0xf000707f) == 0x000f;
+    const bool orders_write_read = fence && (encoding & (1u << 24)) && (encoding & (1u << 21));
+    if (orders_write_read)
+      fenced_stores = std::max(fenced_stores, latest_store);
+    for (const auto &operation : instruction.memory) {
+      const auto selected = final_attempts.find(instruction.id);
+      if (selected == final_attempts.end() || selected->second != operation.attempt)
+        return {rvwmo::CheckStatus::Incomplete, 0,
+                "native memory effect lacks its final retired attempt for FENCE sampling validation"};
+      const AttemptKey key{instruction.id, selected->second};
+      if (operation.store) {
+        const auto publication = publications.find(key);
+        if (publication == publications.end())
+          return {rvwmo::CheckStatus::Incomplete, 0,
+                  "retired store lacks a qualified publication for FENCE sampling validation"};
+        // Every preceding store matters, including disjoint addresses and an
+        // earlier store that publishes later than the immediately preceding one.
+        latest_store = std::max(latest_store, publication->second);
+      }
+      if (!operation.load || !fenced_stores)
+        continue;
+      const auto sample = samples.find(key);
+      if (sample == samples.end())
+        return {rvwmo::CheckStatus::Incomplete, 0,
+                "retired load lacks its final byte sample for FENCE sampling validation"};
+      const auto &fact = *sample->second;
+      const uint32_t array_bytes = fact.mask & ~fact.forwarded_mask;
+      if (array_bytes && (!fact.array_time || fact.array_time <= fenced_stores))
+        return {rvwmo::CheckStatus::Incomplete, 0,
+                "SRAM load sample crosses a W->R FENCE without an irrevocable or interval order certificate"};
+    }
+  }
+  return {};
+}
+
 rvwmo::CheckResult validate_capture(const NativeCapture &capture) {
   using rvwmo::CheckStatus;
   if (capture.summary.malformed_transport)
@@ -73,7 +142,7 @@ rvwmo::CheckResult validate_capture(const NativeCapture &capture) {
     return {CheckStatus::Incomplete, 0, capture.summary.gaps.front()};
   if (capture.summary.incomplete)
     return {CheckStatus::Incomplete, 0, "native capture lacks complete observation and source-prefix evidence"};
-  return {};
+  return validate_fenced_array_samples(capture);
 }
 
 rvwmo::EventValidationStatus transport_status(rvwmo::CheckStatus status) {
