@@ -1,4 +1,5 @@
 #include "session_adapter.h"
+#include "cache_geometry.h"
 #include "native_bridge.h"
 #include <algorithm>
 #include <map>
@@ -34,18 +35,16 @@ rvwmo::CheckResult validate_capture(const NativeCapture &capture) {
       return {CheckStatus::Incomplete, 0, "coherence proof has no unique matching physical store drain"};
     if (proof.proof_flags != 0x1f)
       continue;
-    if (!(proof.address & 7) || proof.cache_set >= 64 || proof.cache_way >= 8 ||
-        !proof.bank_select || (proof.bank_select & (proof.bank_select - 1)) ||
-        (proof.bank_select & ~uint32_t{0xff}) || proof.physical_sram_index >= 64 * 8)
+    if ((proof.address & 7) || proof.cache_set >= cache_geometry::kSetCount ||
+        proof.cache_way >= cache_geometry::kWayCount ||
+        !cache_geometry::is_one_hot_bank(proof.bank_select) ||
+        proof.physical_sram_index >= cache_geometry::kPhysicalEntryCount)
       return {CheckStatus::Invalid, 0, "ordinary coherence proof has malformed cache or SRAM geometry"};
 
-    uint32_t physical_bank = 0;
-    while ((proof.bank_select & (uint32_t{1} << physical_bank)) == 0)
-      ++physical_bank;
-    const uint32_t physical_set = proof.physical_sram_index / 8;
-    const uint32_t bank_offset = proof.physical_sram_index & 7;
-    const uint32_t expected_set = static_cast<uint32_t>((proof.address >> 6) & 63);
-    const uint32_t expected_way = (physical_bank + 8 - bank_offset) & 7;
+    const uint32_t physical_set = cache_geometry::set_for_physical_index(proof.physical_sram_index);
+    const uint32_t expected_set = cache_geometry::set_for_address(proof.address);
+    const uint32_t expected_way = cache_geometry::way_for_location(proof.bank_select,
+                                                                   proof.physical_sram_index);
     if (physical_set != expected_set || proof.cache_set != expected_set || proof.cache_way != expected_way)
       return {CheckStatus::Invalid, 0,
               "coherence proof cache set/way differs from its PA and physical SRAM write location"};
