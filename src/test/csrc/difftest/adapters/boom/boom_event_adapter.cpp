@@ -485,11 +485,9 @@ CheckResult BoomEventAdapter::commit_store(const StoreCommit &record) {
   auto result = validate_id(record.id);
   if (!result)
     return result;
-  result = owned_slot(stq_, record.stq, record.id);
-  if (!result)
-    return result;
   auto found = instructions_.find(record.id);
-  if (found == instructions_.end() || found->second.retired || !found->second.allocation.stq || found->second.store)
+  if (found == instructions_.end() || found->second.retired || !found->second.allocation.stq ||
+      found->second.store || *found->second.allocation.stq != record.stq)
     return invalid("BOOM store commit has no matching live STQ instruction or is duplicated");
   if (found->second.unsupported_memory)
     return unsupported("BOOM committed memory instruction exceeds the scalar consumer profile");
