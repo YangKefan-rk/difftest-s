@@ -47,7 +47,8 @@ CaptureResult NativeCollector::capture(const NativeFrame &frame) {
     return {remember_failure(invalid("BOOM source frame is missing, repeated or from another hart/epoch")), false};
   const size_t facts = frame.allocations.size() + frame.begins.size() + frame.cancellations.size() +
       frame.completions.size() + frame.local_stores.size() + frame.retirements.size() +
-      frame.store_releases.size() + frame.squashes.size() + frame.publications.size();
+      frame.store_releases.size() + frame.squashes.size() + frame.publications.size() +
+      frame.merged_publications.size();
   if (facts > configuration_.staged_events - std::min(configuration_.staged_events, staged_events_.size()))
     return {pending("BOOM source staging is full; retain the complete frame and drain before retrying"), false};
   if (facts > std::numeric_limits<uint64_t>::max() - capture_sequence_)
@@ -89,6 +90,13 @@ CheckResult NativeCollector::capture_frame(const NativeFrame &frame) {
     auto result = convert_single_store_publication(configuration_.hart, publication.probe, publication.source,
         publication.transaction_id, publication.evidence, publication.single_writer_complete, converted);
     if (!result || !(result = adapter_.publish_store(converted)))
+      return result;
+  }
+  for (const auto &publication : frame.merged_publications) {
+    if (publication.source.position.cycle > frame.cycle)
+      return invalid("BOOM merged publication claims a future source cycle");
+    auto result = adapter_.publish_merged_stores(publication);
+    if (!result)
       return result;
   }
   return {};

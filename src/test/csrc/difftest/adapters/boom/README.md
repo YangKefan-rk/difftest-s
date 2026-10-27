@@ -66,6 +66,28 @@ transaction identity and the fabric source supplied by the common integration.
 Store retirement, native slot release, publication and independent REF audit
 are separate obligations.
 
+`publish_merged_stores` accepts a complete, same-hart coalesced cache effect
+with every logical member's original STQ generation and the final writer of
+each enabled byte. Keep fully overwritten stores in the member list. The
+adapter validates every LocalStore, the byte-mask union and the newest
+program-order writer, then emits one certified `StorePublishEvent`. It does
+not assign a separate hardware time to a member: `coalesced_program_order`
+certifies that the complete group first becomes externally visible at one
+indivisible source point, and the common checker chooses its internal
+program-order linearization. Missing that certificate or qualified source
+order is Incomplete. A producer must establish group completeness; final
+bytes alone cannot identify omitted, fully overwritten stores. Such omitted
+stores retain their independent publication/completion obligations.
+
+A typed integration can supply these records through
+`NativeFrame::merged_publications`. The current BOOM RTL/native decoder still
+reports one scalar writer per actual DCache data-array write and leaves this
+field empty. Merging old bytes into one SRAM word is not a multi-instruction
+coalesced publication. The additional host entry does not claim hardware
+support or validation of another store-buffer design. It is limited to one
+native 64-byte cache line; split, atomic and vector stores remain outside this
+adapter profile.
+
 Independent tile caches must not be combined into one fabric producer whose
 sequence is assigned by hart traversal. That would impose host order on
 simultaneous independent publications. Register the actual source channels or
