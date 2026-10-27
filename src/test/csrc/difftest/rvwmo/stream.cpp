@@ -453,8 +453,6 @@ StreamResult ObservationStream::validate_transaction(const ObservationStream &st
             position.producer_sequence != event.source.producer_sequence ||
             position.order_qualified != event.source.order_qualified)
           return incomplete("per-member store publish ordering is not supported by the single-point stream contract");
-        if (coalesced && !position.order_qualified)
-          return incomplete("merged store members lack a qualified common publication point");
       }
     }
   }

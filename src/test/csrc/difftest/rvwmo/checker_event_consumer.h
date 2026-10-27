@@ -100,6 +100,7 @@ private:
   CheckResult consume_store_publish(const RuntimeEvent &event, const StorePublishEvent &publish,
                                     RankCertificate certificate = RankCertificate::None);
   CheckResult consume_coalesced_store_publish(const RuntimeEvent &event, const StorePublishEvent &publish);
+  CheckResult audit_physical_write(const StorePublishEvent &publish);
   CheckResult consume_cancel(const InstructionCancelAttemptEvent &event);
   CheckResult consume_squash(const InstructionSquashEvent &event);
   CheckResult consume_retire(const InstructionRetireEvent &event);

@@ -412,7 +412,7 @@ CheckResult EventEmitter::publish_store_group(const StorePublicationGroup &group
   publication.address = group.address;
   publication.bytes = group.bytes;
   publication.byte_mask = group.mask;
-  publication.same_hart_group_linearization = grouped;
+  publication.coalesced_program_order = grouped;
   publication.physical_write = group.physical_write;
   for (size_t index = 0; index < members.size(); ++index)
     publication.members.push_back({members[index]->id, group.source});

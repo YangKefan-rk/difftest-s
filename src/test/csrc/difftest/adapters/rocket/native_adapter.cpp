@@ -314,7 +314,7 @@ CheckResult NativeAdapter::flush_publications() {
     publication.byte_writer_tokens.resize(interval);
     publication.source = group.observation.source;
     if (group.observation.physical_mask & ~group.observation.logical_mask) {
-      PhysicalStoreWrite physical;
+      rvwmo::PhysicalStoreWrite physical;
       physical.address = group.observation.word_address;
       physical.bytes.assign(group.observation.actual_bytes.begin(), group.observation.actual_bytes.end());
       for (size_t lane = 0; lane < physical.bytes.size(); ++lane)

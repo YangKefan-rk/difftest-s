@@ -76,6 +76,10 @@ public:
   // from same-address program order. This is never a consistency certificate;
   // final retirement must resolve_modeled and check PPO and actual bytes.
   std::string resolve_candidate(MemorySnapshot &snapshot) const;
+  // Checks physical ECC preservation lanes against the independent GlobalMem
+  // prefix without changing their logical writer identities.
+  std::string compare_global_bytes(uint64_t address, const std::vector<uint8_t> &actual,
+                                   const std::vector<uint8_t> &mask) const;
   std::vector<MemoryWriter> unpublished_sources(const MemorySnapshot &snapshot) const;
   std::string compare(MemorySnapshot &snapshot, const std::vector<uint8_t> &actual) const;
   // Release on retirement or cancellation. Double release is an error.

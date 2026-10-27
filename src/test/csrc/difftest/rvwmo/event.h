@@ -41,6 +41,8 @@ struct ObservationTime {
   // Independent effects commute on their enabled bytes; this certificate
   // preserves a partial order without inventing order inside the group.
   bool unordered_effect_group = false;
+  // A physical coalesced store was the only memory effect in its closed cycle.
+  bool isolated_store_group = false;
 };
 
 enum class CheckStatus {
@@ -187,6 +189,12 @@ struct StorePublishMember {
   SourcePosition publish_position;
 };
 
+struct PhysicalStoreWrite {
+  uint64_t address = 0;
+  std::vector<uint8_t> bytes;
+  std::vector<uint8_t> byte_mask;
+};
+
 struct StorePublishEvent {
   uint64_t transaction_id = 0;
   uint64_t address = 0;
@@ -199,6 +207,8 @@ struct StorePublishEvent {
   // may linearize its members in program order at that point. This is a model
   // witness, not independently observed hardware timestamps for each member.
   bool coalesced_program_order = false;
+  // ECC may physically rewrite preserved lanes outside the logical byte union.
+  std::optional<PhysicalStoreWrite> physical_write = std::nullopt;
 };
 
 struct AtomicLifecycleEvent {

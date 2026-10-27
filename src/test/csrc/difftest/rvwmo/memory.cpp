@@ -486,6 +486,20 @@ void Memory::retain_candidate(SnapshotRecord &snapshot, const MemoryWriter &writ
     ++references_[writer];
 }
 
+std::string Memory::compare_global_bytes(uint64_t address, const std::vector<uint8_t> &actual,
+                                         const std::vector<uint8_t> &mask) const {
+  auto error = check_range(address, actual.size());
+  if (!error.empty())
+    return error;
+  if (mask.size() != actual.size() ||
+      std::any_of(mask.begin(), mask.end(), [](uint8_t enabled) { return enabled > 1; }))
+    return "physical preservation byte-mask size or value is invalid";
+  for (size_t byte = 0; byte < actual.size(); ++byte)
+    if (mask[byte] && actual[byte] != read_(address + byte))
+      return byte_error("physical store preservation differs from independent GlobalMem prefix", address + byte);
+  return {};
+}
+
 std::string Memory::compare(MemorySnapshot &snapshot, const std::vector<uint8_t> &actual) const {
   if (actual.size() != snapshot.bytes.size())
     return "load value size mismatch";

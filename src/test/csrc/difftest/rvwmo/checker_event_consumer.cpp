@@ -251,6 +251,9 @@ CheckResult CheckerEventConsumer::consume_store_publish(const RuntimeEvent &even
   auto result = require_rank(event, time, certificate);
   if (!result)
     return result;
+  result = audit_physical_write(publish);
+  if (!result)
+    return result;
   MemoryWriter writer;
   result = checker_.memory_writer(member.id, writer);
   if (!result)
@@ -266,12 +269,38 @@ CheckResult CheckerEventConsumer::consume_store_publish(const RuntimeEvent &even
   return result;
 }
 
+CheckResult CheckerEventConsumer::audit_physical_write(const StorePublishEvent &publish) {
+  if (!publish.physical_write)
+    return {};
+  const auto &physical = *publish.physical_write;
+  if (physical.bytes.empty() || physical.bytes.size() > 8 ||
+      physical.bytes.size() != physical.byte_mask.size() ||
+      physical.bytes.size() - 1 > std::numeric_limits<uint64_t>::max() - physical.address ||
+      std::any_of(physical.byte_mask.begin(), physical.byte_mask.end(), [](uint8_t byte) { return byte > 1; }))
+    return remember_failure(invalid("physical store write has an invalid extent or mask"));
+
+  auto preserved_mask = physical.byte_mask;
+  for (size_t byte = 0; byte < publish.byte_mask.size(); ++byte) {
+    if (!publish.byte_mask[byte])
+      continue;
+    const uint64_t address = publish.address + byte;
+    if (address < physical.address || address - physical.address >= physical.bytes.size())
+      return remember_failure(invalid("physical store write omits a logical store byte"));
+    const size_t lane = static_cast<size_t>(address - physical.address);
+    if (!physical.byte_mask[lane] || physical.bytes[lane] != publish.bytes[byte])
+      return remember_failure(invalid("physical store write differs from logical store bytes"));
+    preserved_mask[lane] = 0;
+  }
+  const auto error = memory_.compare_global_bytes(physical.address, physical.bytes, preserved_mask);
+  if (!error.empty())
+    return remember_failure({CheckStatus::Violation, 0, error});
+  return {};
+}
+
 CheckResult CheckerEventConsumer::consume_coalesced_store_publish(const RuntimeEvent &event,
                                                                   const StorePublishEvent &publish) {
   if (!publish.coalesced_program_order)
     return remember_failure(unsupported("merged publication lacks a complete coalesced program-order certificate"));
-  if (!event.source.order_qualified)
-    return remember_failure(incomplete("coalesced publication lacks a qualified common source point"));
   if (!publish.transaction_id || publish.bytes.empty() || publish.bytes.size() != publish.byte_mask.size() ||
       publish.byte_writers.size() != publish.bytes.size() ||
       publish.bytes.size() - 1 > std::numeric_limits<uint64_t>::max() - publish.address ||
@@ -292,8 +321,13 @@ CheckResult CheckerEventConsumer::consume_coalesced_store_publish(const RuntimeE
         position.order_qualified != event.source.order_qualified)
       return remember_failure(incomplete("coalesced publication member differs from the common source point"));
     auto found = stores_.find(member.id);
-    if (found == stores_.end())
+    if (found == stores_.end()) {
+      const auto retired = last_retired_.find(member.id.hart);
+      if (retired != last_retired_.end() && retired->second.first == member.id.epoch &&
+          member.id.uid <= retired->second.second)
+        return remember_failure(invalid("coalesced publication repeats or names an unknown retired member"));
       return pending("coalesced publication awaits every LocalStore member");
+    }
     if (found->second.published || !members.emplace(member.id, &found->second).second)
       return remember_failure(invalid("coalesced publication repeats an already published or duplicate member"));
   }
@@ -324,11 +358,17 @@ CheckResult CheckerEventConsumer::consume_coalesced_store_publish(const RuntimeE
       return remember_failure(invalid("coalesced byte writer is not the latest enabled program-order member"));
     const auto &store = members.at(*final_writers[byte])->store;
     if (publish.bytes[byte] != store.bytes[publish.address + byte - store.address])
-      return remember_failure(invalid("coalesced publication byte differs from its final LocalStore writer"));
+      return remember_failure({CheckStatus::Violation, 0,
+                               "coalesced publication byte differs from its final LocalStore writer"});
   }
 
   ObservationTime first_time;
   auto result = require_rank(event, first_time);
+  if (!result)
+    return result;
+  if (!first_time.isolated_store_group)
+    return remember_failure(incomplete("coalesced store publication is not isolated in its closed source cycle"));
+  result = audit_physical_write(publish);
   if (!result)
     return result;
   if (members.size() - 1 > std::numeric_limits<uint64_t>::max() - first_time.rank)

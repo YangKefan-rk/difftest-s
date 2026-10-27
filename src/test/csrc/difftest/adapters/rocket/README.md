@@ -288,14 +288,17 @@ are carried separately and checked against the independent GlobalMem prefix;
 they retain their existing writer identities.
 
 A merged publication contains one observed drain edge. Its
-`same_hart_group_linearization` flag requests a modeled expansion in strictly
+`coalesced_program_order` flag requests a modeled expansion in strictly
 increasing same-hart UID order. ObservationSession grants the corresponding
 `isolated_store_group` rank certificate only when the complete source cycle
 contains this single memory effect. It reserves one consecutive logical rank
 per member before processing any later memory effect. These ranks express a
 model witness; they are not separate hardware timestamps. Any other memory
-effect in that cycle leaves the merged transaction Incomplete. All required
-producer watermarks must close the cycle before this decision is made.
+effect in that cycle leaves the merged transaction Incomplete, including an
+effect reported at another qualified phase. The closed source cycle, rather
+than a producer-local sequence or an inferred phase order, establishes this
+isolation. All required producer watermarks must close the cycle before the
+decision is made.
 
 The native decoder reads `eccBytes` from the selected DCache configuration and
 uses `storeAdvanceMaintenance` to distinguish ECC correction from logical store

@@ -147,8 +147,15 @@ CheckResult ObservationSession::collect_closed_events() {
   auto order = classify_memory_groups(drained.events, groups);
   if (!order)
     return remember_failure(order);
+  std::map<uint64_t, size_t> memory_effects_per_cycle;
+  for (const auto &event : drained.events)
+    if (is_memory_event(event))
+      ++memory_effects_per_cycle[event.source.cycle];
   for (size_t index = 0; index < drained.events.size(); ++index)
-    pending_events_.push_back({drained.events[index], std::move(groups[index])});
+    pending_events_.push_back({drained.events[index], std::move(groups[index]),
+        drained.events[index].kind == RuntimeEventKind::StorePublish &&
+        std::get<StorePublishEvent>(drained.events[index].payload).coalesced_program_order &&
+        memory_effects_per_cycle[drained.events[index].source.cycle] == 1});
   return {};
 }
 
@@ -255,6 +262,12 @@ CheckResult ObservationSession::consume_pending_events() {
           current_rank_ = pending_event->memory_group->time;
         } else {
           current_rank_ = {next_rank_, true};
+          if (event.kind == RuntimeEventKind::StorePublish &&
+              std::get<StorePublishEvent>(event.payload).coalesced_program_order) {
+            if (!pending_event->isolated_store_group)
+              return remember_failure(incomplete("coalesced publication shares its source cycle with another memory effect"));
+            current_rank_.isolated_store_group = true;
+          }
         }
       }
       CheckResult result;
