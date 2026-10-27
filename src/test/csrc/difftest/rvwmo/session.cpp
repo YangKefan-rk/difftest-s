@@ -242,7 +242,9 @@ CheckResult ObservationSession::consume_pending_events() {
       }
 
       if (memory_event) {
-        if (next_rank_ == std::numeric_limits<uint64_t>::max())
+        const size_t ranks = event.kind == RuntimeEventKind::StorePublish
+                                 ? std::get<StorePublishEvent>(event.payload).members.size() : 1;
+        if (ranks == 0 || ranks > std::numeric_limits<uint64_t>::max() - next_rank_)
           return remember_failure(invalid("session memory rank space exhausted"));
         current_rank_event_ = std::make_pair(event.producer_id, event.source.producer_sequence);
         if (pending_event->memory_group) {
@@ -260,12 +262,12 @@ CheckResult ObservationSession::consume_pending_events() {
         result = consume_retirement(event, std::get<InstructionRetireEvent>(event.payload));
       else if (pending_event->memory_group) {
         if (pending_event->memory_group->independent_effects)
-          result = consumer_.consume_independent_group_member(event);
+          result = consumer_.consume_independent_group_member(event, true);
         else
-          result = consumer_.consume_read_group_member(event);
+          result = consumer_.consume_read_group_member(event, true);
       }
       else
-        result = consumer_.consume_closed(event);
+        result = consumer_.consume_closed(event, true);
       current_rank_event_.reset();
       current_rank_ = {};
 
@@ -279,8 +281,12 @@ CheckResult ObservationSession::consume_pending_events() {
       }
       if (!result)
         return remember_failure(result);
-      if (memory_event && (!pending_event->memory_group || --pending_event->memory_group->remaining == 0))
-        ++next_rank_;
+      if (memory_event && (!pending_event->memory_group || --pending_event->memory_group->remaining == 0)) {
+        // A certified coalesced physical publication expands to consecutive
+        // logical stores; reserve every rank before a later effect can consume it.
+        next_rank_ += event.kind == RuntimeEventKind::StorePublish
+                          ? std::get<StorePublishEvent>(event.payload).members.size() : 1;
+      }
       pending_event = pending_events_.erase(pending_event);
       progress = true;
     }
