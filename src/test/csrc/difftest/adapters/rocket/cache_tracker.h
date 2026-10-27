@@ -46,6 +46,14 @@ struct CacheStoreValue {
   rvwmo::SourcePosition source;
 };
 
+// Captured after CacheTracker accepted the original scalar store. Neither a
+// physical pstore anchor nor a final byte writer replaces this logical member.
+struct CacheStoreMember {
+  uint64_t request_id = 0;
+  uint32_t attempt = 0;
+  StoreObservation store;
+};
+
 // Associates same-source-edge core/cache handshakes without treating rd/tag as
 // a dynamic identity. Accept only native probe valid facts from the supported
 // RV64 blocking cache. This is a private converter, not another transport ABI.
@@ -55,6 +63,7 @@ public:
   rvwmo::CheckResult bind(const CoreRequest &core, const CacheRequest &cache);
   rvwmo::CheckResult load_sample(const CacheLoadResult &result, LoadObservation &load);
   rvwmo::CheckResult accept_store(const CacheStoreValue &store);
+  rvwmo::CheckResult store_member(uint64_t request_id, CacheStoreMember &member) const;
   rvwmo::CheckResult local_store(uint64_t token, rvwmo::SourcePosition commit, StoreObservation &store);
   rvwmo::CheckResult publication(const CacheStoreValue &value, StoreObservation &store);
   rvwmo::CheckResult observe_merge();
