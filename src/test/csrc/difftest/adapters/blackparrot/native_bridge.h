@@ -2,6 +2,7 @@
 #define DIFFTEST_BLACKPARROT_NATIVE_BRIDGE_H
 
 #include "adapter.h"
+#include "../../rvwmo/session.h"
 #include <array>
 #include <cstdint>
 #include <functional>
@@ -121,6 +122,9 @@ struct NativeSummary {
   bool malformed_transport = false;
   // Capture success and an installed sink do not constitute a semantic verdict.
   bool incomplete = true;
+  uint64_t online_prefixes = 0;
+  size_t live_instructions = 0;
+  size_t peak_live_instructions = 0;
   std::vector<std::string> gaps;
   std::optional<NativeVerification> verification;
 };
@@ -139,9 +143,10 @@ struct NativeCapture {
 
 using NativeVerifier = std::function<NativeVerification(const NativeCapture &)>;
 
+using NativePrefixConsumer = std::function<rvwmo::SessionSubmitResult(const ConvertedOutput &)>;
 using NativeSink = std::function<ConversionResult(const NativeCapture &)>;
-// Receives the first native transport failure without rerunning semantic checks.
-// The observer and any objects it borrows must outlive the native session.
+// The callback receives the first transport rejection. It must remain alive
+// with any objects it borrows until the native session is reset or destroyed.
 using NativeFailureObserver = std::function<void(const rvwmo::CheckResult &)>;
 
 // Install before probe initialization. The coordinator owns the producer roster,
@@ -151,6 +156,10 @@ ConversionResult install_native_sink(Configuration configuration, NativeSink sin
 // A verifier reports the public session result separately from transport status.
 ConversionResult install_native_verifier(Configuration configuration, NativeVerifier verifier,
                                          NativeFailureObserver failure_observer = {});
+// Private online embedding: callback delivery barriers only trigger progress.
+// The bridge derives a source-safe frontier from unresolved instruction facts.
+ConversionResult install_native_online_verifier(Configuration configuration, NativePrefixConsumer consume,
+    NativeVerifier finalize, NativeFailureObserver failure_observer = {});
 // An explicit fresh session is allowed only before initialization or after finish.
 ConversionResult reset_native_session();
 const NativeCapture &last_native_capture();
@@ -188,6 +197,7 @@ int bp_difftest_s_terminal_state(uint32_t hart, uint64_t source_time, uint64_t t
 int bp_difftest_s_can_end();
 int bp_difftest_s_close_hart(uint32_t hart, uint64_t source_time, uint64_t terminal_uid);
 int bp_difftest_s_close_prefix(uint64_t completed_cycle);
+int bp_difftest_s_advance(uint64_t delivered_through_tick);
 int bp_difftest_s_finish();
 }
 

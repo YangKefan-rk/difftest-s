@@ -221,6 +221,7 @@ struct Adapter::State {
   std::map<rvwmo::OperationId, Store> stores;
   std::map<rvwmo::OperationId, rvwmo::StorePublishEvent> early_publications;
   std::set<uint64_t> transactions;
+  std::map<uint32_t, uint64_t> publication_frontiers;
   ConvertedOutput output;
 
   explicit State(Configuration configuration) : options(std::move(configuration)) {
@@ -587,8 +588,12 @@ ConversionResult Adapter::publish_store(const Origin &origin, const rvwmo::Store
     if (state.stores.size() + state.early_publications.size() >= state.options.max_live_instructions)
       return waiting("outstanding store lifecycle limit reached; retry after local match/retirement");
   }
-  if (state.transactions.size() >= state.options.max_publication_transactions)
+  if (state.options.monotonic_publication_transactions) {
+    if (record.transaction_id <= state.publication_frontiers[origin.producer_id])
+      return invalid("native publication transaction does not advance its producer frontier");
+  } else if (state.transactions.size() >= state.options.max_publication_transactions) {
     return unsupported("exact publication transaction history bound exhausted; safe deduplication cannot continue");
+  }
   if (store == state.stores.end()) {
     // The source event is delivered now, with its original position. The public
     // session retains it until LocalStore and independent REF audit exist.
@@ -598,7 +603,10 @@ ConversionResult Adapter::publish_store(const Origin &origin, const rvwmo::Store
     if (store->second.retired)
       state.stores.erase(store);
   }
-  state.transactions.insert(record.transaction_id);
+  if (state.options.monotonic_publication_transactions)
+    state.publication_frontiers[origin.producer_id] = record.transaction_id;
+  else
+    state.transactions.insert(record.transaction_id);
   state.append(origin, rvwmo::RuntimeEventKind::StorePublish, record);
   return {};
 }

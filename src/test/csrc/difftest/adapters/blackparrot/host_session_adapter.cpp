@@ -42,6 +42,27 @@ rvwmo::SessionSubmitResult HostSessionAdapter::submit(const NativeCapture &captu
   return submit_closed(capture.converted.batch, snapshots);
 }
 
+rvwmo::SessionSubmitResult HostSessionAdapter::submit_complete_capture(const NativeCapture &capture) {
+  finalized_ = false;
+  if (!failure_)
+    return reject_capture(failure_);
+  const auto valid = validate_native_capture(capture);
+  if (!valid)
+    return reject_capture(valid);
+  const auto completion = validate_native_completion(capture.completion);
+  if (!completion)
+    return reject_capture(completion);
+  auto result = submit_converted_prefixes(
+      capture.converted, kMaximumCompleteCaptureBatchEvents,
+      [this](const rvwmo::EventBatch &batch, const std::vector<rvwmo::ArchitecturalRetirement> &retirements) {
+        return submit_closed(batch, retirements);
+      },
+      [this]() { return session_.poll(); });
+  if (!result.accepted && result.check.status != rvwmo::CheckStatus::Pass)
+    return reject_capture(result.check);
+  return result;
+}
+
 rvwmo::SessionSubmitResult HostSessionAdapter::submit_closed(
     const rvwmo::EventBatch &batch, const std::vector<rvwmo::ArchitecturalRetirement> &retirements) {
   if (!failure_)
@@ -54,6 +75,12 @@ rvwmo::SessionSubmitResult HostSessionAdapter::submit_closed(
     finalized_ = false;
   report_source_failure(result.check);
   return result;
+}
+
+rvwmo::CheckResult HostSessionAdapter::poll() {
+  if (!failure_)
+    return failure_;
+  return session_.poll();
 }
 
 rvwmo::CheckResult HostSessionAdapter::finalize(const NativeCompletionEvidence &evidence) {
@@ -97,13 +124,35 @@ rvwmo::CheckResult HostSessionAdapter::finalize(const NativeCompletionEvidence &
 
 ConversionResult install_native_host_session(Configuration configuration, HostSessionAdapter &adapter) {
   return install_native_verifier(std::move(configuration), [&adapter](const NativeCapture &capture) {
-    const auto submitted = adapter.submit(capture);
+    const auto submitted = adapter.submit_complete_capture(capture);
     if (!submitted.accepted || (submitted.check.status != rvwmo::CheckStatus::Pass &&
                                submitted.check.status != rvwmo::CheckStatus::Pending))
       return NativeVerification{submitted.check, false};
     const auto result = adapter.finalize(capture.completion);
     return NativeVerification{result, adapter.finalized()};
   }, [&adapter](const rvwmo::CheckResult &failure) { adapter.report_source_failure(failure); });
+}
+
+ConversionResult install_native_online_session(Configuration configuration, HostSessionAdapter &adapter) {
+  return install_native_online_verifier(std::move(configuration),
+      [&adapter](const ConvertedOutput &converted) {
+        std::vector<rvwmo::ArchitecturalRetirement> snapshots;
+        const auto mapped = capture_architectural_retirements(converted, snapshots);
+        if (!mapped) {
+          rvwmo::SessionSubmitResult result;
+          result.check = adapter.report_source_failure(mapped);
+          return result;
+        }
+        return adapter.submit_closed(converted.batch, snapshots);
+      },
+      [&adapter](const NativeCapture &capture) {
+        if (!capture.summary.gaps.empty())
+          return NativeVerification{adapter.report_source_failure(
+              {rvwmo::CheckStatus::Incomplete, 0, capture.summary.gaps.front()}), false};
+        const auto result = adapter.finalize(capture.completion);
+        return NativeVerification{result, adapter.finalized()};
+      },
+      [&adapter](const rvwmo::CheckResult &failure) { adapter.report_source_failure(failure); });
 }
 
 } // namespace blackparrot
