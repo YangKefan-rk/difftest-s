@@ -45,6 +45,7 @@ public:
   CaptureResult cancel_request(uint64_t request_id);
   CaptureResult sample_load(const CacheLoadResult &load);
   CaptureResult accept_store(const CacheStoreValue &store);
+  rvwmo::CheckResult store_member(uint64_t request_id, CacheStoreMember &member) const;
   CaptureResult retire(const NativeRetireFact &fact);
   CaptureResult late_write(const NativeLateWrite &write);
   CaptureResult squash(uint64_t token);

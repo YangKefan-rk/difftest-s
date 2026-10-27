@@ -150,6 +150,12 @@ CaptureResult NativeAdapter::accept_store(const CacheStoreValue &store) {
   return finish_input(std::move(result));
 }
 
+CheckResult NativeAdapter::store_member(uint64_t request_id, CacheStoreMember &member) const {
+  if (!failure_)
+    return failure_;
+  return cache_.store_member(request_id, member);
+}
+
 CaptureResult NativeAdapter::retire(const NativeRetireFact &fact) {
   if (!failure_)
     return {failure_, false};
