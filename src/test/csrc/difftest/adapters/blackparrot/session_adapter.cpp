@@ -14,11 +14,12 @@
 
 namespace blackparrot {
 namespace {
-// A speculative SRAM read is not an irrevocable GMO witness. In particular,
-// reversing W->R FENCE edges in those timestamps alone does not establish an
-// illegal architectural execution. Reject this known certificate gap before
-// the public session interprets the physical observations as model order.
-rvwmo::CheckResult validate_fenced_array_samples(const NativeCapture &capture) {
+// A speculative SRAM read or local forwarding sample is not an irrevocable
+// GMO witness. Crossing W->R FENCE edges in those timestamps alone does not
+// establish an illegal architectural execution. The terminal-capture path
+// has no interval certificate, so reject missing order evidence before the
+// public session interprets these physical observations as model order.
+rvwmo::CheckResult validate_fenced_load_samples(const NativeCapture &capture) {
   using AttemptKey = std::pair<rvwmo::OperationId, uint32_t>;
   std::map<AttemptKey, const NativeMemoryFact *> samples;
   std::map<AttemptKey, uint64_t> publications;
@@ -73,6 +74,9 @@ rvwmo::CheckResult validate_fenced_array_samples(const NativeCapture &capture) {
         return {rvwmo::CheckStatus::Incomplete, 0,
                 "retired load lacks its final byte sample for FENCE sampling validation"};
       const auto &fact = *sample->second;
+      if (fact.forwarded_mask && (!fact.forwarding_time || fact.forwarding_time <= fenced_stores))
+        return {rvwmo::CheckStatus::Incomplete, 0,
+                "forwarded load sample crosses a W->R FENCE without a model-order certificate"};
       const uint32_t array_bytes = fact.mask & ~fact.forwarded_mask;
       if (array_bytes && (!fact.array_time || fact.array_time <= fenced_stores))
         return {rvwmo::CheckStatus::Incomplete, 0,
@@ -142,7 +146,7 @@ rvwmo::CheckResult validate_capture(const NativeCapture &capture) {
     return {CheckStatus::Incomplete, 0, capture.summary.gaps.front()};
   if (capture.summary.incomplete)
     return {CheckStatus::Incomplete, 0, "native capture lacks complete observation and source-prefix evidence"};
-  return validate_fenced_array_samples(capture);
+  return validate_fenced_load_samples(capture);
 }
 
 rvwmo::EventValidationStatus transport_status(rvwmo::CheckStatus status) {
