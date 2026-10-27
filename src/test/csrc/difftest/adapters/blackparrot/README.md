@@ -49,6 +49,16 @@ retirement on the same source tick remain an explicit incomplete lifecycle.
 A load mixing SRAM and forwarding bytes sampled at different ticks also
 remains Incomplete until the public contract supports that source shape.
 
+The fixed two-entry WBUF drains one logical store at a time. Its byte merge is
+load bypass, with current input before el0 before el1; it is not multi-store
+publication coalescing. For the final retired load attempt, the bridge audits
+each declared forwarding writer against the captured store byte and rejects a
+skipped younger active older store covering that lane. This check runs after
+the raw interval closes, including delayed store-input callbacks. Cancelled
+attempts remain provisional. These physical-source tags never supply REF
+expected values or a cross-hart memory rank; inconsistent tags are Invalid,
+while missing or ambiguous source evidence remains incomplete.
+
 Store publication requires the matching physical SRAM drain, logical final
 UID/attempt, exact byte data/mask and the coherence monitor's five proof bits:
 ordinary scalar access, known matching tag, observed M/E ownership, the actual
@@ -178,6 +188,10 @@ complete handling for every FENCE predecessor/successor combination.
 The raw `NativeMemoryFact` keeps its actual array/forwarding and callback times.
 A derived `LOAD_ORDER_WINDOW` record separately identifies the original interval
 and selected model point; that point is not a new observed hardware timestamp.
+Terminal capture/replay does not generate interval certificates. Its raw
+validation rejects an uncertified SRAM or forwarded W-to-R crossing as
+Incomplete before public PPO checking, matching the online evidence boundary.
+
 The public session still checks independent REF bytes, store audits and every
 supported PPO condition at retirement. The private certificate never constructs
 expected values from DUT actual data, and it does not change the public checker
