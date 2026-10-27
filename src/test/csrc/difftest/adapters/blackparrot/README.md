@@ -22,10 +22,12 @@ The adapter does not implement another Runtime, REF or event ABI.
   with `install_native_host_session(configuration, adapter)`. The adapter, public
   host and backing memory must outlive the run. For continuous execution use
   `install_native_online_session(configuration, adapter)` before probe startup.
-  A final Pass requires native
-  completion evidence and successful public host finalization.
+  A final Pass requires native completion evidence and successful public host
+  finalization.
 - RTL probes live beside BlackParrot's existing nonsynth monitors. The opt-in
-  native build entry is `black-parrot-sim/Makefile.difftest-s`.
+  native build entry is `Makefile.difftest-s` in the BlackParrot repository root.
+  That repository's `docs/difftest-s.md` documents standalone dependencies,
+  reference-library builds and the caller bootstrap contract.
 
 ## Supported native profile
 
@@ -95,22 +97,46 @@ are not disabled to conceal these limits.
 
 ## Native build and bounds
 
-`DIFFTEST_S=1` enables capture. `DIFFTEST_S_SEMANTIC=1` also requires
+The BlackParrot root `Makefile.difftest-s` delegates to `bp_top/verilator`.
+`DIFFTEST_S=0` is the default native baseline. `DIFFTEST_S=1` enables capture;
+a run without an installed, finalized semantic verifier is rejected by the
+native finish API. Capture alone cannot provide Pass.
+
+`DIFFTEST_S_SEMANTIC=1` requires `CFG=e_bp_multicore_4_cfg`,
 `DIFFTEST_S_BOOTSTRAP_SOURCE`, `DIFFTEST_S_SPIKE_HOME` and the matching
 `DIFFTEST_S_SPIKE_LIBRARY`; it enables the audited coherence and terminal
-protocols. Test workloads, oracles, fault fixtures and runners live outside
-production repositories.
+protocols. Pass absolute paths for these inputs, `DIFFTEST_S_DIR` and
+`SIM_PROG`, because the entry changes directory before invoking the native
+Makefile. The Spike dependency must provide `difftest/ref_api.h`, the
+BlackParrot profile ID 7 and the versioned external-memory, scalar-state and
+retirement-observer APIs. A compatible Spike tree can build the library with
+`CPU=BLACKPARROT MULTICORE_DIFF=1 EXTERNAL_MEMORY=1 PURE_API=1 DEBUG=` in a
+fresh absolute `BUILD_DIR`; use the resulting `riscv64-spike-ref-api.so`.
+
+The caller bootstrap is one C++ translation unit defining
+`extern "C" int bp_difftest_s_session_start(const char *elf, uint32_t harts)`.
+The testbench calls it before probe startup with the independent program path
+and hart count. The caller supplies its ELF loader and initial architectural
+state, constructs and validates a four-hart public `HostSession` and borrowed
+`HostSessionAdapter`, then installs `install_native_online_session` for
+`DIFFTEST_S_ONLINE=1` or `install_native_host_session` for terminal replay.
+Return zero only after successful installation. The backing memory, host,
+adapter and borrowed callback objects must survive until simulation finishes;
+they cannot be startup-function stack objects. Test workloads, oracles, fault
+fixtures and runners live outside production repositories.
 
 Enabled builds default to direct compiler invocations. Use a fresh generated
-model directory when changing probes or moving artifacts; an explicit
+model directory when changing probes, bootstrap dependencies or build options,
+or when moving artifacts; an explicit
 `OBJCACHE=ccache` opt-in needs an isolated, validated cache. The wrapper checks
 native exit status and the BSG verdict in both capture and semantic modes.
 
 `Configuration` bounds live instructions, outstanding stores and exact
 publication deduplication history. History exhaustion returns Unsupported.
 Callers retain inputs on Waiting and deliver queued prefixes with
-`take_output()` before adding observations on that producer. The terminal-capture path has session bounds of 65,536 allocated instructions
-and 1,048,576 observations. The online path instead bounds unresolved work:
+`take_output()` before adding observations on that producer. The terminal
+capture path has session bounds of 65,536 allocated instructions and 1,048,576
+observations. The online path instead bounds unresolved work:
 65,536 live native identities and 32,768 events in one ready source prefix.
 Already consumed facts are released; publication transaction IDs use monotonic
 producer frontiers instead of lifetime history. A genuinely unbounded unresolved
