@@ -15,6 +15,12 @@ clock, a global ordering algorithm, or a final RVWMO verdict.
   retirement and its observations are available, so squash does not leave an
   allocation stranded in the semantic consumer.
 
+- `StoreGroupTracker` retains the original accepted members of the blocking
+  DCache pstore slots, including fully overwritten stores, and derives the final
+  byte writer from their masks and native order. It preserves one physical drain
+  source position and does not assign per-member global ranks. It is a private
+  collector; the shared decoder and consumer still reject merged publications.
+
 Unsupported speculative instructions remain opaque until confirmed retirement;
 a wrong-path FP/AMO allocation can be squashed without rejecting a valid scalar
 execution. Keeping such an identity is not support for its memory semantics.
@@ -231,3 +237,50 @@ any instruction, request, store publication, late value or output is live.
 The coordinator must additionally complete public-session checks, all-hart
 completion and fabric watermarks. A private successful call is not an RVWMO
 verdict.
+
+## Pending-store groups and ECC lanes
+
+The optional Rocket probe provides `storeAdvanceRequestId` for the source
+pstore1 request, `storeMergeTargetRequestId` for the existing pstore2 anchor,
+and `storeDrain.bits.physicalMask` for the actual ECC-expanded SRAM lanes.
+The original `store.mask` remains the logical byte union. These additional
+leaves require a newly generated shared native layout before decoder use.
+
+`CacheTracker::store_member()` and `NativeAdapter::store_member()` copy the
+accepted original request ID, attempt, token, physical address, normalized
+bytes, mask and source position without replacing them with final drain data.
+A decoder can pass that record to `StoreGroupTracker::accept()` and process
+actual `advance`, `merge` and `capture_drain` facts. In one source edge, capture
+the old-slot drain before installing an advancing new first-slot member. A
+merge targets an existing second slot and excludes drain/advance on that edge.
+The collector requires nondecreasing source cycles, including across physical
+slot reuse; equal cycles describe slot dataflow, not a new memory ordering.
+
+Every merged member remains retained even if no final byte names it. The
+collector checks final enabled logical bytes against the retained originals,
+while preserving the actual full word and separate physical mask. ECC
+preservation bytes do not gain a logical writer. Checking their values against
+an independent memory prefix remains a downstream obligation; the collector
+has no independent SRAM/global memory. Its internal consistency checks do not
+replace independent REF address/data/mask audits for **every** member.
+
+The physical slot is freed when its drain is captured. The captured members
+remain bounded, immutable output until `acknowledge_drain()` transfers lossless
+ownership downstream. An acknowledgement is not a publication certificate or
+a checker Pass. Default one-byte ECC granules do not permit a merge; larger
+granules must be supplied from the actual selected cache configuration.
+
+At the fixed common baseline, `CheckerEventConsumer::consume_store_publish()`
+requires a singleton and the shared Rocket native decoder rejects a merge.
+This implementation intentionally leaves those guards intact. Full merged
+support requires coordinated decoder wiring, complete member mapping to
+OperationId, independent REF audit, per-member LocalMem/PPO completion and a
+justified model linearization or partial-order certificate. One observed drain
+edge must not be described as separately observed member timestamps. Fences,
+loads and other-hart coherence interactions are not established by a standalone
+DCache fixture or by the collector host tests.
+
+The existing normal four-hart scalar path is unchanged. A production native
+build using an explicit adapter source list must add `store_groups.cpp` when
+it first connects this optional collector; this source-list change belongs to
+the shared integration owner.
