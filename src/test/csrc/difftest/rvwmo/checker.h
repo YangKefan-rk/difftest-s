@@ -56,7 +56,8 @@ public:
   // caller-provided identities are ignored in that case. Actual load bytes are
   // still compared independently after PPO succeeds at architectural retirement.
   CheckResult observe_load(const MemoryOperation &operation, uint64_t po,
-                           const std::vector<std::optional<MemoryWriter>> &forwarded);
+                           const std::vector<std::optional<MemoryWriter>> &forwarded,
+                           bool source_prefix_closed = false);
   CheckResult cancel_load(const OperationId &operation, uint32_t attempt);
   // Caller must prove that caches/observers cannot reference this writer again.
   // Local pending, snapshot and queued-retirement references are checked here.
@@ -66,6 +67,8 @@ public:
   size_t tracked_stores() const {
     return stores_.size();
   }
+  // Retired ordinary stores may retain only their publication/PPO obligation;
+  // unrelated loads and their snapshots can complete in the meantime.
   // Enqueues retirement without blocking event acquisition. Pending is not an
   // error: poll after later global-completion or source-store events arrive.
   CheckResult retire(const RetiredInstruction &instruction, const std::vector<RetiredLoad> &loads);
@@ -103,6 +106,7 @@ private:
   std::map<OperationId, MemoryStore> unverified_stores_;
   std::set<OperationId> checked_stores_;
   std::set<OperationId> completed_stores_;
+  std::set<OperationId> retired_pending_publication_;
   std::set<MemoryWriter> reclaim_candidates_;
   std::vector<OperationId> released_stores_;
   std::map<LoadKey, LoadSample> loads_;

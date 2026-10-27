@@ -36,6 +36,11 @@ bool memory_free_dependencies(const RetiredInstruction &instruction, DependencyM
          metadata.data_sources.empty();
 }
 
+bool ordinary_store(const MemoryOperation &operation) {
+  return operation.store && !operation.load && !operation.atomic && !operation.lr && !operation.sc &&
+         !operation.acquire && !operation.release && !operation.rcsc;
+}
+
 bool statistics_fit(const CheckMemoryStatistics &current, const CheckMemoryStatistics &delta) {
   constexpr auto maximum = std::numeric_limits<uint64_t>::max();
   return delta.verified_load_operations <= maximum - current.verified_load_operations &&
@@ -63,7 +68,7 @@ CheckResult Checker::ensure_statistics_hart(uint32_t hart) {
 CheckResult Checker::verified_memory_delta(const RetiredInstruction &instruction,
                                             CheckMemoryStatistics &delta) const {
   for (const auto &operation : instruction.memory) {
-    if (operation.store)
+    if (operation.store && operation.write_time.valid)
       ++delta.verified_store_operations;
     if (!operation.load)
       continue;
@@ -261,6 +266,17 @@ CheckResult Checker::observe_global(uint64_t address, const std::vector<uint8_t>
     const auto &operation = writers_.at(completed[i]);
     stores_.at(operation).write_time = completion_times[i];
     completed_stores_.insert(operation);
+    auto deferred = retired_pending_publication_.find(operation);
+    if (deferred != retired_pending_publication_.end()) {
+      auto resolved = ppo_.observe_store(operation, completion_times[i]);
+      if (!resolved)
+        return remember_failure(resolved);
+      auto &statistics = memory_statistics_.at(operation.hart);
+      if (statistics.verified_store_operations == std::numeric_limits<uint64_t>::max())
+        return remember_failure(invalid("verified-store counter exhausted"));
+      ++statistics.verified_store_operations;
+      retired_pending_publication_.erase(deferred);
+    }
   }
   std::vector<size_t> ordered(completed.size());
   for (size_t i = 0; i < ordered.size(); ++i)
@@ -286,7 +302,7 @@ CheckResult Checker::observe_global(uint64_t address, const std::vector<uint8_t>
 }
 
 CheckResult Checker::observe_load(const MemoryOperation &operation, uint64_t po,
-                                  const std::vector<std::optional<MemoryWriter>> &forwarded) {
+                                  const std::vector<std::optional<MemoryWriter>> &forwarded, bool source_prefix_closed) {
   if (!failure_)
     return failure_;
   if (!operation.load)
@@ -301,7 +317,7 @@ CheckResult Checker::observe_load(const MemoryOperation &operation, uint64_t po,
     return remember_failure(statistics);
   MemorySnapshot snapshot;
   auto error = memory_.sample(operation.id.hart, po, operation.read_time.rank, operation.address, operation.byte_mask,
-                              forwarded, snapshot);
+                              forwarded, snapshot, source_prefix_closed);
   if (!error.empty())
     return remember_failure(invalid(error));
   loads_.emplace(key, LoadSample{operation, std::move(snapshot)});
@@ -326,6 +342,8 @@ CheckResult Checker::release_store(const OperationId &operation) {
     return failure_;
   if (unverified_stores_.count(operation))
     return pending("store still awaits independent REF verification");
+  if (ppo_.has_pending_reference(operation))
+    return pending("store still participates in deferred PPO obligations");
   if (!checked_stores_.count(operation) || !completed_stores_.count(operation))
     return remember_failure(invalid("writer release requires global completion and checked retirement"));
   if (memory_.has_global_reference(operation_writers_.at(operation)))
@@ -371,7 +389,7 @@ CheckResult Checker::collect_garbage() {
       continue;
     }
     const auto operation = writer->second;
-    if (unverified_stores_.count(operation) || !checked_stores_.count(operation) ||
+    if (ppo_.has_pending_reference(operation) || unverified_stores_.count(operation) || !checked_stores_.count(operation) ||
         !completed_stores_.count(operation) || memory_.has_global_reference(*candidate) ||
         memory_.has_snapshot_reference(*candidate)) {
       ++candidate;
@@ -418,7 +436,7 @@ CheckResult Checker::prepare(Retirement &retirement) {
       if (unverified_stores_.count(operation.id))
         return pending("retired store awaits independent REF verification");
       operation.write_time = store->second.write_time;
-      if (!operation.write_time.valid)
+      if (!operation.write_time.valid && !ordinary_store(operation))
         return pending("retired store awaits global-completion timestamp");
     }
     if (!operation.load)
@@ -446,6 +464,18 @@ CheckResult Checker::prepare(Retirement &retirement) {
     auto verified = require_verified_sources(load->second.snapshot);
     if (!verified)
       return verified;
+    if (!operation.atomic && !operation.lr && !operation.sc) {
+      for (const auto &writer : memory_.unpublished_sources(load->second.snapshot)) {
+        auto source = writers_.find(writer);
+        if (source == writers_.end())
+          return invalid("certified local source has no canonical operation identity");
+        if (ppo_.has_pending_reference(source->second)) {
+          auto ordered = ppo_.observe_store_after(source->second, operation.read_time);
+          if (!ordered)
+            return ordered;
+        }
+      }
+    }
     if (operation.lr)
       for (size_t byte = 0; byte < operation.byte_mask.size(); ++byte)
         if (operation.byte_mask[byte] && !load->second.snapshot.bytes[byte].writer_time)
@@ -536,7 +566,7 @@ CheckResult Checker::drain(uint32_t hart) {
     }
     // PPO must succeed before any value comparison. A value failure is terminal;
     // retry never applies already accepted PPO state a second time.
-    result = ppo_.retire(front.instruction);
+    result = ppo_.retire_deferred(front.instruction);
     if (!result)
       return remember_failure(result);
     for (const auto &operation: front.instruction.memory) {
@@ -573,8 +603,11 @@ CheckResult Checker::drain(uint32_t hart) {
       loads_.erase(found);
     }
     for (const auto &operation: front.instruction.memory)
-      if (operation.store)
+      if (operation.store) {
         checked_stores_.insert(operation.id);
+        if (!operation.write_time.valid)
+          retired_pending_publication_.insert(operation.id);
+      }
     bool consumed_reservation = front.instruction.failed_sc;
     for (const auto &operation : front.instruction.memory)
       if (operation.sc) {

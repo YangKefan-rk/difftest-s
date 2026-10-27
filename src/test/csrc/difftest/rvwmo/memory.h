@@ -65,15 +65,18 @@ public:
                             const std::vector<MemoryWriter> &writers, const std::vector<MemoryWriter> &completed,
                             const std::vector<uint64_t> &completion_times = {});
   std::string sample(uint32_t hart, uint64_t po, uint64_t time, uint64_t address, const std::vector<uint8_t> &mask,
-                     const std::vector<std::optional<MemoryWriter>> &forwarded, MemorySnapshot &snapshot);
+                     const std::vector<std::optional<MemoryWriter>> &forwarded, MemorySnapshot &snapshot,
+                     bool source_prefix_closed = false);
   std::string resolve(MemorySnapshot &snapshot) const;
   // Derives a specification witness independently of observed forwarding tags.
-  // All candidate stores need a global rank before this can complete.
+  // A complete ordered source prefix may certify a pending local writer after
+  // the sample. Other candidates still need their actual publication rank.
   std::string resolve_modeled(MemorySnapshot &snapshot) const;
   // Provisional REF input only: unknown local write ranks may be estimated
   // from same-address program order. This is never a consistency certificate;
   // final retirement must resolve_modeled and check PPO and actual bytes.
   std::string resolve_candidate(MemorySnapshot &snapshot) const;
+  std::vector<MemoryWriter> unpublished_sources(const MemorySnapshot &snapshot) const;
   std::string compare(MemorySnapshot &snapshot, const std::vector<uint8_t> &actual) const;
   // Release on retirement or cancellation. Double release is an error.
   std::string release(uint64_t snapshot_id);
@@ -106,6 +109,10 @@ private:
     std::vector<MemoryByte> global_bytes;
     std::vector<std::optional<uint64_t>> global_times;
     std::set<MemoryWriter> candidates;
+    // Only a consumer which has delivered every preceding memory effect may
+    // certify this. An absent publication is then an ordering lower bound.
+    bool source_prefix_closed = false;
+    std::set<MemoryWriter> unpublished_after_sample;
   };
   ReadGlobal read_;
   WriteGlobal write_;

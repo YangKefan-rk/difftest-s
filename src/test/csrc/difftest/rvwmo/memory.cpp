@@ -74,6 +74,8 @@ std::string Memory::commit_local(const MemoryStore &store) {
           !sample.mask[at - sample.address])
         continue;
       retain_candidate(sample, store.writer);
+      if (sample.source_prefix_closed)
+        sample.unpublished_after_sample.insert(store.writer);
       auto &latest = sample.latest_local_po[at - sample.address];
       if (!latest || *latest < store.po)
         latest = store.po;
@@ -106,6 +108,22 @@ std::string Memory::commit_global(uint64_t address, const std::vector<uint8_t> &
     auto found = stores_.find(writer);
     if (found == stores_.end() || !found->second.pending)
       return "global completion has no pending local store";
+  }
+  // A closed sampling prefix excludes every later-delivered overlapping write
+  // at or before the sample. Do not silently rewrite an already certified read.
+  for (const auto &entry : times) {
+    const auto &store = stores_.at(entry.first).store;
+    for (const auto &sample_entry : snapshots_) {
+      const auto &sample = sample_entry.second;
+      if (!sample.source_prefix_closed || entry.second > sample.time)
+        continue;
+      for (size_t byte = 0; byte < store.mask.size(); ++byte) {
+        const uint64_t at = store.address + byte;
+        if (store.mask[byte] && at >= sample.address && at - sample.address < sample.mask.size() &&
+            sample.mask[at - sample.address])
+          return byte_error("global write arrived behind a certified load prefix", at);
+      }
+    }
   }
   // Validate the whole transaction before changing either memory model.
   for (size_t i = 0; i < bytes.size(); ++i) {
@@ -205,7 +223,7 @@ std::string Memory::commit_global(uint64_t address, const std::vector<uint8_t> &
 
 std::string Memory::sample(uint32_t hart, uint64_t po, uint64_t time, uint64_t address,
                            const std::vector<uint8_t> &mask, const std::vector<std::optional<MemoryWriter>> &forwarded,
-                           MemorySnapshot &snapshot) {
+                           MemorySnapshot &snapshot, bool source_prefix_closed) {
   auto error = check_range(address, mask.size());
   if (!error.empty())
     return error;
@@ -224,6 +242,7 @@ std::string Memory::sample(uint32_t hart, uint64_t po, uint64_t time, uint64_t a
   record.po = po;
   record.address = address;
   record.time = time;
+  record.source_prefix_closed = source_prefix_closed;
   record.latest_local_po.resize(mask.size());
   record.mask = mask;
   record.global_bytes.resize(mask.size());
@@ -255,6 +274,8 @@ std::string Memory::sample(uint32_t hart, uint64_t po, uint64_t time, uint64_t a
           const auto &store = stores_.at(writer).store;
           if (store.po < po) {
             retain_candidate(record, writer);
+            if (source_prefix_closed && !stores_.at(writer).global_time)
+              record.unpublished_after_sample.insert(writer);
             if (!newest || store.po > newest->po)
               newest = &store;
           }
@@ -342,21 +363,29 @@ std::string Memory::resolve_modeled(MemorySnapshot &snapshot) const {
     if (record.global_bytes[i].writer && *latest[i] >= snapshot.time)
       return byte_error("global baseline does not precede load observation", snapshot.address + i);
   }
-  for (const auto &writer: record.candidates) {
+  std::vector<const StoreRecord *> newest_local(record.mask.size(), nullptr);
+  std::vector<bool> unresolved_local(record.mask.size(), false);
+  for (const auto &writer : record.candidates) {
     auto found = stores_.find(writer);
     if (found == stores_.end())
       return "modeled read awaits source store record";
     const auto &candidate = found->second;
-    if (!candidate.global_time)
-      return "modeled read awaits store global timestamp";
     const auto &store = candidate.store;
     if (store.writer.hart != snapshot.hart || store.po >= snapshot.po)
       return "invalid modeled local-store candidate";
+    if (!candidate.global_time && !record.unpublished_after_sample.count(writer))
+      return "modeled read awaits store global timestamp";
     for (size_t i = 0; i < record.mask.size(); ++i) {
-      uint64_t at = snapshot.address + i;
+      const uint64_t at = snapshot.address + i;
       if (!record.mask[i] || at < store.address || at - store.address >= store.mask.size() ||
           !store.mask[at - store.address])
         continue;
+      if (!newest_local[i] || store.po > newest_local[i]->store.po)
+        newest_local[i] = &candidate;
+      if (!candidate.global_time) {
+        unresolved_local[i] = true;
+        continue;
+      }
       if (!resolved[i].writer || *candidate.global_time > *latest[i]) {
         latest[i] = candidate.global_time;
         resolved[i].value = store.bytes[at - store.address];
@@ -366,10 +395,36 @@ std::string Memory::resolve_modeled(MemorySnapshot &snapshot) const {
       }
     }
   }
+  for (size_t i = 0; i < record.mask.size(); ++i) {
+    if (!record.mask[i] || !unresolved_local[i])
+      continue;
+    const auto &local = *newest_local[i];
+    // Every unresolved writer was absent from a closed prefix, so is later
+    // than its GlobalMem baseline. Same-byte store PPO orders local versions;
+    // the checker retains those publication obligations separately from L.
+    if (!local.global_time) {
+      resolved[i].value = local.store.bytes[snapshot.address + i - local.store.address];
+      resolved[i].writer = local.store.writer;
+      latest[i].reset();
+    }
+  }
   for (size_t i = 0; i < resolved.size(); ++i)
     resolved[i].writer_time = latest[i];
   snapshot.bytes = std::move(resolved);
   return {};
+}
+
+std::vector<MemoryWriter> Memory::unpublished_sources(const MemorySnapshot &snapshot) const {
+  std::vector<MemoryWriter> sources;
+  auto sample = snapshots_.find(snapshot.id);
+  if (sample == snapshots_.end())
+    return sources;
+  for (const auto &writer : sample->second.unpublished_after_sample) {
+    auto store = stores_.find(writer);
+    if (store != stores_.end() && !store->second.global_time)
+      sources.push_back(writer);
+  }
+  return sources;
 }
 
 std::string Memory::resolve_candidate(MemorySnapshot &snapshot) const {
