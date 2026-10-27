@@ -328,9 +328,20 @@ bool ObservationStream::payload_has_valid_shape(const RuntimeEvent &event) {
         p.byte_writers.size() != p.bytes.size())
       return false;
     std::set<OperationId> members;
-    for (const auto &member : p.members)
-      if (!member.id.uid || !members.insert(member.id).second)
+    const auto &first = p.members.front().id;
+    for (size_t index = 0; index < p.members.size(); ++index) {
+      const auto &member = p.members[index];
+      if (!member.id.uid || member.id.subaccess != 0 || member.id.hart != first.hart ||
+          member.id.epoch != first.epoch || !members.insert(member.id).second ||
+          (index && p.members[index - 1].id.uid >= member.id.uid))
         return false;
+    }
+    if ((p.members.size() > 1) != p.same_hart_group_linearization)
+      return false;
+    if (p.physical_write &&
+        (!valid_range(p.physical_write->address, p.physical_write->bytes, p.physical_write->byte_mask) ||
+         p.physical_write->bytes.size() > 8))
+      return false;
     for (size_t byte = 0; byte < p.byte_mask.size(); ++byte)
       if (p.byte_mask[byte] && !members.count(p.byte_writers[byte]))
         return false;
@@ -382,8 +393,8 @@ std::optional<ObservationStream::MemoryEffect> ObservationStream::memory_effect(
   }
   case RuntimeEventKind::StorePublish: {
     const auto &store = std::get<StorePublishEvent>(event.payload);
-    effect.address = store.address;
-    effect.byte_mask = store.byte_mask;
+    effect.address = store.physical_write ? store.physical_write->address : store.address;
+    effect.byte_mask = store.physical_write ? store.physical_write->byte_mask : store.byte_mask;
     effect.write = true;
     return effect;
   }
@@ -439,14 +450,17 @@ StreamResult ObservationStream::validate_transaction(const ObservationStream &st
 
     if (event.kind == RuntimeEventKind::StorePublish) {
       const auto &publish = std::get<StorePublishEvent>(event.payload);
+      std::set<OperationId> members;
+      uint64_t previous_uid = 0;
+      const uint32_t hart = publish.members.empty() ? 0 : publish.members.front().id.hart;
       for (const auto &member : publish.members) {
         const auto &position = member.publish_position;
         if (position.cycle != event.source.cycle || position.qualified_phase != event.source.qualified_phase ||
             position.producer_sequence != event.source.producer_sequence ||
-            position.order_qualified != event.source.order_qualified)
-          return incomplete("per-member store publish ordering is not supported by the single-point stream contract");
-        if (publish.members.size() > 1 && !position.order_qualified)
-          return incomplete("merged store members lack a qualified common publication point");
+            position.order_qualified != event.source.order_qualified || member.id.hart != hart ||
+            member.id.subaccess != 0 || member.id.uid <= previous_uid || !members.insert(member.id).second)
+          return invalid("store publication members do not share one ordered same-hart source edge");
+        previous_uid = member.id.uid;
       }
     }
   }

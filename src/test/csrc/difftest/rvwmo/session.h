@@ -99,6 +99,7 @@ private:
   struct PendingEvent {
     RuntimeEvent event;
     std::shared_ptr<MemoryGroup> memory_group;
+    bool isolated_store_group = false;
   };
   struct ReferenceRecord {
     std::vector<ReferenceStoreValue> stores;

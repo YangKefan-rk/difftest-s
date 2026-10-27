@@ -86,6 +86,19 @@ std::string Memory::commit_local(const MemoryStore &store) {
   return {};
 }
 
+std::string Memory::compare_global_bytes(uint64_t address, const std::vector<uint8_t> &actual,
+                                         const std::vector<uint8_t> &mask) const {
+  auto error = check_range(address, actual.size());
+  if (!error.empty())
+    return error;
+  if (mask.size() != actual.size())
+    return "physical preservation byte-mask size mismatch";
+  for (size_t byte = 0; byte < actual.size(); ++byte)
+    if (mask[byte] && actual[byte] != read_(address + byte))
+      return byte_error("physical store preservation differs from independent GlobalMem prefix", address + byte);
+  return {};
+}
+
 std::string Memory::commit_global(uint64_t address, const std::vector<uint8_t> &bytes, const std::vector<uint8_t> &mask,
                                   const std::vector<MemoryWriter> &writers, const std::vector<MemoryWriter> &completed,
                                   const std::vector<uint64_t> &completion_times) {

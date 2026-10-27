@@ -52,7 +52,8 @@ std::optional<ScalarEffect> scalar_effect(const RuntimeEvent &event) {
     return std::nullopt;
   const auto &publish = std::get<StorePublishEvent>(event.payload);
   const auto width = publish.byte_mask.size();
-  if (publish.members.size() != 1 || publish.members.front().id.subaccess != 0 ||
+  if (publish.physical_write || publish.same_hart_group_linearization || publish.members.size() != 1 ||
+      publish.members.front().id.subaccess != 0 ||
       (width != 1 && width != 2 && width != 4 && width != 8) || publish.bytes.size() != width ||
       publish.byte_writers.size() != width ||
       std::none_of(publish.byte_mask.begin(), publish.byte_mask.end(), [](uint8_t byte) { return byte == 1; }) ||
@@ -147,8 +148,17 @@ CheckResult ObservationSession::collect_closed_events() {
   auto order = classify_memory_groups(drained.events, groups);
   if (!order)
     return remember_failure(order);
-  for (size_t index = 0; index < drained.events.size(); ++index)
-    pending_events_.push_back({drained.events[index], std::move(groups[index])});
+  std::map<uint64_t, size_t> memory_events_per_cycle;
+  for (const auto &event : drained.events)
+    if (is_memory_event(event))
+      ++memory_events_per_cycle[event.source.cycle];
+  for (size_t index = 0; index < drained.events.size(); ++index) {
+    const auto &event = drained.events[index];
+    const bool isolated_store_group = event.kind == RuntimeEventKind::StorePublish &&
+        std::get<StorePublishEvent>(event.payload).same_hart_group_linearization &&
+        memory_events_per_cycle[event.source.cycle] == 1;
+    pending_events_.push_back({event, std::move(groups[index]), isolated_store_group});
+  }
   return {};
 }
 
@@ -242,7 +252,11 @@ CheckResult ObservationSession::consume_pending_events() {
       }
 
       if (memory_event) {
-        if (next_rank_ == std::numeric_limits<uint64_t>::max())
+        const auto rank_span = event.kind == RuntimeEventKind::StorePublish &&
+                                       std::get<StorePublishEvent>(event.payload).same_hart_group_linearization
+                                   ? std::get<StorePublishEvent>(event.payload).members.size()
+                                   : size_t{1};
+        if (rank_span > std::numeric_limits<uint64_t>::max() - next_rank_)
           return remember_failure(invalid("session memory rank space exhausted"));
         current_rank_event_ = std::make_pair(event.producer_id, event.source.producer_sequence);
         if (pending_event->memory_group) {
@@ -253,6 +267,12 @@ CheckResult ObservationSession::consume_pending_events() {
           current_rank_ = pending_event->memory_group->time;
         } else {
           current_rank_ = {next_rank_, true};
+          if (event.kind == RuntimeEventKind::StorePublish &&
+              std::get<StorePublishEvent>(event.payload).same_hart_group_linearization) {
+            if (!pending_event->isolated_store_group)
+              return remember_failure(incomplete("merged store publication has another memory effect in its source cycle"));
+            current_rank_.isolated_store_group = pending_event->isolated_store_group;
+          }
         }
       }
       CheckResult result;
@@ -279,8 +299,13 @@ CheckResult ObservationSession::consume_pending_events() {
       }
       if (!result)
         return remember_failure(result);
-      if (memory_event && (!pending_event->memory_group || --pending_event->memory_group->remaining == 0))
-        ++next_rank_;
+      if (memory_event && (!pending_event->memory_group || --pending_event->memory_group->remaining == 0)) {
+        const auto rank_span = event.kind == RuntimeEventKind::StorePublish &&
+                                       std::get<StorePublishEvent>(event.payload).same_hart_group_linearization
+                                   ? std::get<StorePublishEvent>(event.payload).members.size()
+                                   : size_t{1};
+        next_rank_ += rank_span;
+      }
       pending_event = pending_events_.erase(pending_event);
       progress = true;
     }

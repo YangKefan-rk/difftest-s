@@ -216,48 +216,156 @@ CheckResult CheckerEventConsumer::consume_store_publish(const RuntimeEvent &even
                                                         RankCertificate certificate) {
   if (publish.members.empty())
     return remember_failure(invalid("store publication has no logical store member"));
-  if (publish.members.size() != 1)
-    return remember_failure(unsupported("semantic consumer currently requires one logical store per publish event"));
-  const auto &member = publish.members.front();
-  if (!publish.transaction_id || !member.id.uid || publish.bytes.empty() ||
+  const bool grouped = publish.members.size() > 1;
+  if (grouped && !publish.same_hart_group_linearization)
+    return remember_failure(incomplete("multi-store publication lacks a same-hart group linearization certificate"));
+  if (!grouped && publish.same_hart_group_linearization)
+    return remember_failure(invalid("single-store publication carries a group linearization certificate"));
+  if (grouped && certificate != RankCertificate::None)
+    return remember_failure(incomplete("merged store group cannot share an unordered cross-producer event group"));
+  if (!publish.transaction_id || !publish.members.front().id.uid || publish.bytes.empty() ||
       publish.bytes.size() != publish.byte_mask.size() || publish.byte_writers.size() != publish.bytes.size() ||
       publish.bytes.size() - 1 > std::numeric_limits<uint64_t>::max() - publish.address ||
       std::none_of(publish.byte_mask.begin(), publish.byte_mask.end(), [](uint8_t byte) { return byte == 1; }) ||
       std::any_of(publish.byte_mask.begin(), publish.byte_mask.end(), [](uint8_t byte) { return byte > 1; }))
-    return remember_failure(invalid("invalid single-store publication identity, byte range or mask"));
-  if (member.id.subaccess != 0)
+    return remember_failure(invalid("invalid store publication transaction identity, byte range or mask"));
+
+  const auto &first_id = publish.members.front().id;
+  if (first_id.subaccess != 0)
     return remember_failure(unsupported("split or vector store publication is not covered by this consumer"));
-  const auto &member_position = member.publish_position;
-  if (member_position.cycle != event.source.cycle ||
-      member_position.qualified_phase != event.source.qualified_phase ||
-      member_position.producer_sequence != event.source.producer_sequence ||
-      member_position.order_qualified != event.source.order_qualified)
-    return remember_failure(invalid("single-store publish member has no matching envelope source position"));
-  for (size_t byte = 0; byte < publish.byte_mask.size(); ++byte)
-    if (publish.byte_mask[byte] && publish.byte_writers[byte] != member.id)
-      return remember_failure(invalid("single-store publication names another byte writer"));
-  auto store = stores_.find(member.id);
-  if (store == stores_.end())
-    return pending("store publication awaits its LocalStore record");
-  if (store->second.published || publish.address != store->second.operation.address ||
-      publish.bytes.size() != store->second.operation.byte_mask.size() ||
-      publish.byte_mask != store->second.operation.byte_mask || publish.byte_writers.size() != publish.bytes.size())
-    return remember_failure(invalid("StorePublish differs from its LocalStore record"));
+  if (publish.members.size() > max_live_instructions_)
+    return remember_failure(invalid("store publication member count exceeds the configured live-store bound"));
+  if (grouped && publish.bytes.size() > 8)
+    return remember_failure(unsupported("merged store publication exceeds the scalar transaction width"));
+
+  std::vector<StoreRecord *> group_stores;
+  group_stores.reserve(publish.members.size());
+  for (size_t index = 0; index < publish.members.size(); ++index) {
+    const auto &member = publish.members[index];
+    if (!member.id.uid || member.id.subaccess != 0 || member.id.hart != first_id.hart ||
+        member.id.epoch != first_id.epoch || (index && publish.members[index - 1].id.uid >= member.id.uid))
+      return remember_failure(invalid("store group members are not unique same-hart program-order stores"));
+    const auto &position = member.publish_position;
+    if (position.cycle != event.source.cycle || position.qualified_phase != event.source.qualified_phase ||
+        position.producer_sequence != event.source.producer_sequence ||
+        position.order_qualified != event.source.order_qualified)
+      return remember_failure(invalid("store group member does not name the observed transaction source edge"));
+    auto store = stores_.find(member.id);
+    if (store == stores_.end()) {
+      const auto retired = last_retired_.find(member.id.hart);
+      if (retired != last_retired_.end() && retired->second.first == member.id.epoch &&
+          member.id.uid <= retired->second.second)
+        return remember_failure(invalid("store publication repeats or names an unknown retired logical member"));
+      return pending("store group publication awaits every member LocalStore record");
+    }
+    if (store->second.published)
+      return remember_failure(invalid("store group publication repeats a completed logical member"));
+    if (!grouped && (publish.address != store->second.operation.address ||
+                     publish.byte_mask != store->second.operation.byte_mask))
+      return remember_failure(invalid("StorePublish differs from its LocalStore record"));
+    group_stores.push_back(&store->second);
+  }
+
+  std::vector<std::optional<OperationId>> latest_writer(publish.bytes.size());
+  for (size_t member_index = 0; member_index < publish.members.size(); ++member_index) {
+    const auto &member = publish.members[member_index];
+    const auto &store = group_stores[member_index]->store;
+    for (size_t byte = 0; byte < store.mask.size(); ++byte) {
+      if (!store.mask[byte])
+        continue;
+      const uint64_t address = store.address + byte;
+      if (address < publish.address || address - publish.address >= publish.bytes.size())
+        return remember_failure(invalid("store group transaction omits a logical member byte"));
+      const size_t offset = static_cast<size_t>(address - publish.address);
+      latest_writer[offset] = member.id;
+    }
+  }
+  for (size_t byte = 0; byte < publish.bytes.size(); ++byte) {
+    if (publish.byte_mask[byte] != static_cast<uint8_t>(latest_writer[byte].has_value()))
+      return remember_failure(invalid("store group transaction mask differs from the logical member union"));
+    if (!publish.byte_mask[byte])
+      continue;
+    if (publish.byte_writers[byte] != *latest_writer[byte])
+      return remember_failure(invalid("store group byte writer differs from the latest same-hart member"));
+    const auto member = std::find_if(publish.members.begin(), publish.members.end(), [&](const auto &candidate) {
+      return candidate.id == publish.byte_writers[byte];
+    });
+    const auto member_index = static_cast<size_t>(member - publish.members.begin());
+    const auto &store = group_stores[member_index]->store;
+    const auto local_offset = publish.address + byte - store.address;
+    if (local_offset >= store.bytes.size() || !store.mask[local_offset])
+      return remember_failure(invalid("store group byte writer does not cover its published lane"));
+    if (publish.bytes[byte] != store.bytes[local_offset])
+      return remember_failure({CheckStatus::Violation, 0,
+                               "store group published byte differs from its final logical member"});
+  }
+
   ObservationTime time;
   auto result = require_rank(event, time, certificate);
   if (!result)
     return result;
-  MemoryWriter writer;
-  result = checker_.memory_writer(member.id, writer);
-  if (!result)
-    return remember_failure(result);
-  result = checker_.observe_global(publish.address, publish.bytes, publish.byte_mask,
-                                   std::vector<MemoryWriter>(publish.byte_writers.size(), writer), {writer},
-                                   std::vector<ObservationTime>{time});
+  if (grouped && !time.isolated_store_group)
+    return remember_failure(incomplete("merged store publication shares its cycle with another memory effect"));
+  if (publish.physical_write) {
+    const auto &physical = *publish.physical_write;
+    if (physical.bytes.empty() || physical.bytes.size() > 8 ||
+        physical.bytes.size() != physical.byte_mask.size() ||
+        physical.bytes.size() - 1 > std::numeric_limits<uint64_t>::max() - physical.address ||
+        std::any_of(physical.byte_mask.begin(), physical.byte_mask.end(), [](uint8_t byte) { return byte > 1; }))
+      return remember_failure(invalid("store physical-write observation has an invalid byte extent or mask"));
+    auto preserved_mask = physical.byte_mask;
+    for (size_t byte = 0; byte < publish.byte_mask.size(); ++byte) {
+      if (!publish.byte_mask[byte])
+        continue;
+      const uint64_t address = publish.address + byte;
+      if (address < physical.address || address - physical.address >= physical.bytes.size())
+        return remember_failure(invalid("physical store observation omits a logical written byte"));
+      const size_t lane = address - physical.address;
+      if (!physical.byte_mask[lane] || physical.bytes[lane] != publish.bytes[byte])
+        return remember_failure(invalid("physical store observation differs from its logical written bytes"));
+      preserved_mask[lane] = 0;
+    }
+    const auto error = memory_.compare_global_bytes(physical.address, physical.bytes, preserved_mask);
+    if (!error.empty())
+      return remember_failure({CheckStatus::Violation, 0, error});
+  }
+  if (publish.members.size() - 1 > std::numeric_limits<uint64_t>::max() - time.rank)
+    return remember_failure(invalid("store group modeled rank interval overflows"));
+
+  std::vector<MemoryWriter> completed;
+  std::vector<ObservationTime> completion_times;
+  completed.reserve(publish.members.size());
+  completion_times.reserve(publish.members.size());
+  for (size_t index = 0; index < publish.members.size(); ++index) {
+    MemoryWriter writer;
+    result = checker_.memory_writer(publish.members[index].id, writer);
+    if (!result)
+      return remember_failure(result);
+    completed.push_back(writer);
+    auto member_time = time;
+    member_time.rank += index;
+    completion_times.push_back(member_time);
+  }
+  std::vector<MemoryWriter> byte_writers(publish.bytes.size());
+  for (size_t byte = 0; byte < publish.byte_mask.size(); ++byte) {
+    if (!publish.byte_mask[byte])
+      continue;
+    result = checker_.memory_writer(publish.byte_writers[byte], byte_writers[byte]);
+    if (!result)
+      return remember_failure(result);
+  }
+  result = checker_.observe_global(publish.address, publish.bytes, publish.byte_mask, byte_writers,
+                                   completed, completion_times);
   if (result.status != CheckStatus::Pass && result.status != CheckStatus::Pending)
     return remember_failure(result);
-  remember_rank(event, time, certificate, member.id, 0);
-  store->second.published = true;
+  if (grouped)
+    last_memory_rank_ = completion_times.back().rank;
+  else
+    remember_rank(event, completion_times.back(), certificate, first_id, 0);
+  if (grouped)
+    last_group_.reset();
+  for (auto *store : group_stores)
+    store->published = true;
   collect_store_metadata();
   return result;
 }

@@ -41,6 +41,9 @@ struct ObservationTime {
   // Independent effects commute on their enabled bytes; this certificate
   // preserves a partial order without inventing order inside the group.
   bool unordered_effect_group = false;
+  // The physical publication was the only memory effect in its source cycle.
+  // This permits the same-hart group expansion without inventing a cross-hart tie.
+  bool isolated_store_group = false;
 };
 
 enum class CheckStatus {
@@ -187,6 +190,12 @@ struct StorePublishMember {
   SourcePosition publish_position;
 };
 
+struct PhysicalStoreWrite {
+  uint64_t address = 0;
+  std::vector<uint8_t> bytes;
+  std::vector<uint8_t> byte_mask;
+};
+
 struct StorePublishEvent {
   uint64_t transaction_id = 0;
   uint64_t address = 0;
@@ -194,6 +203,13 @@ struct StorePublishEvent {
   std::vector<uint8_t> byte_mask;
   std::vector<OperationId> byte_writers;
   std::vector<StorePublishMember> members;
+  // Certifies that all logical members share this one observed physical
+  // publication and can be linearized in same-hart UID order. The consumer
+  // still validates membership, byte writers, independent REF audits and PPO.
+  bool same_hart_group_linearization = false;
+  // ECC read-modify-write may physically rewrite lanes outside the logical
+  // union. Those bytes must match the independent prefix and retain their writer.
+  std::optional<PhysicalStoreWrite> physical_write = std::nullopt;
 };
 
 struct AtomicLifecycleEvent {

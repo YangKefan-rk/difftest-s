@@ -59,6 +59,9 @@ public:
   std::string commit_local(const MemoryStore &store);
   // Translation/fetch view only; architectural data loads use timed snapshots.
   bool read_local(uint32_t hart, uint64_t before_po, uint64_t address, uint8_t &byte) const;
+  // Checks an observed preservation read without modifying bytes or writer tags.
+  std::string compare_global_bytes(uint64_t address, const std::vector<uint8_t> &actual,
+                                   const std::vector<uint8_t> &mask) const;
   // writers[i] names the logical store responsible for transaction byte i.
   // completed contains all merged logical stores, including overwritten stores.
   std::string commit_global(uint64_t address, const std::vector<uint8_t> &bytes, const std::vector<uint8_t> &mask,
