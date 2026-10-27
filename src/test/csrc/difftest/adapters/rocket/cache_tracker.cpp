@@ -139,6 +139,18 @@ CheckResult CacheTracker::accept_store(const CacheStoreValue &value) {
   return {};
 }
 
+CheckResult CacheTracker::store_member(uint64_t request_id, CacheStoreMember &member) const {
+  if (!failure_)
+    return failure_;
+  const auto found = requests_.find(request_id);
+  if (found == requests_.end())
+    return {CheckStatus::Invalid, 0, "Rocket store member has no matching cache request"};
+  if (!found->second.accepted_store)
+    return {CheckStatus::Pending, 0, "Rocket store member awaits accepted scalar store data"};
+  member = {request_id, found->second.core.attempt, *found->second.accepted_store};
+  return {};
+}
+
 CheckResult CacheTracker::local_store(uint64_t token, SourcePosition commit, StoreObservation &store) {
   if (!failure_)
     return failure_;
