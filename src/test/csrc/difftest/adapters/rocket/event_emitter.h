@@ -45,6 +45,17 @@ struct StoreObservation {
   rvwmo::SourcePosition source;
 };
 
+struct StorePublicationGroup {
+  uint64_t transaction = 0;
+  uint64_t address = 0;
+  std::vector<uint8_t> bytes;
+  std::vector<uint8_t> mask;
+  std::vector<uint64_t> member_tokens;
+  std::vector<std::optional<uint64_t>> byte_writer_tokens;
+  rvwmo::SourcePosition source;
+  std::optional<rvwmo::PhysicalStoreWrite> physical_write = std::nullopt;
+};
+
 // Private Rocket capture adapter, not a DPI ABI or an RVWMO verdict. Speculative
 // observations stay private until retirement and its final sample are known.
 // Native tokens must increase per session; physical slot indices are insufficient.
@@ -58,6 +69,7 @@ public:
   rvwmo::CheckResult cancel_load(uint64_t token, uint32_t attempt);
   rvwmo::CheckResult commit_store(const StoreObservation &store);
   rvwmo::CheckResult publish_store(const StoreObservation &store, uint64_t transaction);
+  rvwmo::CheckResult publish_store_group(const StorePublicationGroup &group);
   rvwmo::CheckResult retire(uint64_t token, rvwmo::SourcePosition source);
   rvwmo::CheckResult squash(uint64_t token);
   // Closes only this hart channel. The shared session closes the fabric channel.

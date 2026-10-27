@@ -3,6 +3,7 @@
 
 #include "cache_tracker.h"
 #include "retirement_capture.h"
+#include "store_groups.h"
 #include "../../rvwmo/session.h"
 
 namespace rocket_difftest {
@@ -45,6 +46,8 @@ public:
   CaptureResult cancel_request(uint64_t request_id);
   CaptureResult sample_load(const CacheLoadResult &load);
   CaptureResult accept_store(const CacheStoreValue &store);
+  rvwmo::CheckResult store_member(uint64_t request_id, CacheStoreMember &member) const;
+  CaptureResult publish_group(const StoreGroupObservation &group, uint64_t transaction);
   CaptureResult retire(const NativeRetireFact &fact);
   CaptureResult late_write(const NativeLateWrite &write);
   CaptureResult squash(uint64_t token);
@@ -74,6 +77,12 @@ private:
     bool sampled = false;
     bool store_accepted = false;
     std::optional<QualifiedStorePublication> publication;
+    std::optional<uint64_t> publication_group;
+  };
+  struct PendingStoreGroup {
+    StoreGroupObservation observation;
+    std::vector<uint64_t> request_ids;
+    uint64_t transaction = 0;
   };
 
   NativeConfiguration configuration_;
@@ -85,6 +94,7 @@ private:
   std::map<uint64_t, uint64_t> tokens_by_uid_;
   std::set<uint64_t> pending_retirements_;
   std::set<uint64_t> pending_publications_;
+  std::map<uint64_t, PendingStoreGroup> pending_publication_groups_;
   NativeOutput output_;
   uint64_t next_output_serial_ = 1;
   rvwmo::CheckResult failure_;

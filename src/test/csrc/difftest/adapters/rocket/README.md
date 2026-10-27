@@ -15,6 +15,12 @@ clock, a global ordering algorithm, or a final RVWMO verdict.
   retirement and its observations are available, so squash does not leave an
   allocation stranded in the semantic consumer.
 
+- `StoreGroupTracker` retains the original accepted members of the blocking
+  DCache pstore slots, including fully overwritten stores, and derives the final
+  byte writer from their masks and native order. It preserves one physical drain
+  source position and does not assign per-member global ranks. It is a private
+  collector; the shared decoder and consumer still reject merged publications.
+
 Unsupported speculative instructions remain opaque until confirmed retirement;
 a wrong-path FP/AMO allocation can be squashed without rejecting a valid scalar
 execution. Keeping such an identity is not support for its memory semantics.
@@ -231,3 +237,71 @@ any instruction, request, store publication, late value or output is live.
 The coordinator must additionally complete public-session checks, all-hart
 completion and fabric watermarks. A private successful call is not an RVWMO
 verdict.
+
+## Pending-store groups and ECC lanes
+
+The optional Rocket probe provides `storeAdvanceRequestId` for the source
+pstore1 request, `storeMergeTargetRequestId` for the existing pstore2 anchor,
+and `storeDrain.bits.physicalMask` for the actual ECC-expanded SRAM lanes.
+The original `store.mask` remains the logical byte union. These additional
+leaves require a newly generated shared native layout before decoder use.
+
+`CacheTracker::store_member()` and `NativeAdapter::store_member()` copy the
+accepted original request ID, attempt, token, physical address, normalized
+bytes, mask and source position without replacing them with final drain data.
+A decoder can pass that record to `StoreGroupTracker::accept()` and process
+actual `advance`, `merge` and `capture_drain` facts. In one source edge, capture
+the old-slot drain before installing an advancing new first-slot member. A
+merge targets an existing second slot and excludes drain/advance on that edge.
+The collector requires nondecreasing source cycles, including across physical
+slot reuse; equal cycles describe slot dataflow, not a new memory ordering.
+
+Every merged member remains retained even if no final byte names it. The
+collector checks final enabled logical bytes against the retained originals,
+while preserving the actual full word and separate physical mask. ECC
+preservation bytes do not gain a logical writer. Checking their values against
+an independent memory prefix remains a downstream obligation; the collector
+has no independent SRAM/global memory. Its internal consistency checks do not
+replace independent REF address/data/mask audits for **every** member.
+
+The physical slot is freed when its drain is captured. The captured members
+remain bounded, immutable output until `acknowledge_drain()` transfers lossless
+ownership downstream. An acknowledgement is not a publication certificate or
+a checker Pass. Default one-byte ECC granules do not permit a merge; larger
+granules must be supplied from the actual selected cache configuration.
+
+`NativeAdapter::publish_group()` accepts one captured physical transaction and
+retains every original member until its LocalStore and retirement facts arrive.
+Its `CaptureResult` transfers ownership once `consumed` is true, including a
+Pending result; the decoder may then acknowledge the private collector output.
+`poll()` waits for these asynchronous joins and `finalize()` requires every
+publication and output to be drained. Each logical request is released once the
+single group event has been emitted.
+
+The emitter maps original tokens to architectural OperationIds and constructs
+`StorePublishEvent.members` and `byte_writers`. Completely overwritten members
+remain present. The common consumer validates the logical union, final writer
+of every enabled byte, and every independent REF store audit. It publishes the
+final bytes into GlobalMem, removes every completed member from LocalMem, and
+checks each retired member's PPO obligations. Physical ECC preservation lanes
+are carried separately and checked against the independent GlobalMem prefix;
+they retain their existing writer identities.
+
+A merged publication contains one observed drain edge. Its
+`same_hart_group_linearization` flag requests a modeled expansion in strictly
+increasing same-hart UID order. ObservationSession grants the corresponding
+`isolated_store_group` rank certificate only when the complete source cycle
+contains this single memory effect. It reserves one consecutive logical rank
+per member before processing any later memory effect. These ranks express a
+model witness; they are not separate hardware timestamps. Any other memory
+effect in that cycle leaves the merged transaction Incomplete. All required
+producer watermarks must close the cycle before this decision is made.
+
+The native decoder reads `eccBytes` from the selected DCache configuration and
+uses `storeAdvanceMaintenance` to distinguish ECC correction from logical store
+advance. The current scalar protocol requires an independent maintenance-byte
+audit for actual ECC correction drains and reports Incomplete until one is
+available. The `QuadRocketMergeDifftestSConfig` integration profile selects four
+Big Rocket cores with parity ECC and a two-byte granule. Its native source list
+includes `store_groups.cpp`; rebuilding the generated layouts and all client
+and checker C++ objects is required when enabling these observations.

@@ -347,6 +347,103 @@ CheckResult EventEmitter::publish_store(const StoreObservation &store, uint64_t 
   return {};
 }
 
+CheckResult EventEmitter::publish_store_group(const StorePublicationGroup &group) {
+  if (!failure_)
+    return failure_;
+  const bool grouped = group.member_tokens.size() > 1;
+  if (!group.transaction || group.member_tokens.empty() || group.bytes.empty() ||
+      group.bytes.size() != group.mask.size() || group.byte_writer_tokens.size() != group.bytes.size() ||
+      group.bytes.size() - 1 > std::numeric_limits<uint64_t>::max() - group.address ||
+      std::none_of(group.mask.begin(), group.mask.end(), [](uint8_t byte) { return byte == 1; }) ||
+      std::any_of(group.mask.begin(), group.mask.end(), [](uint8_t byte) { return byte > 1; }))
+    return reject(CheckStatus::Invalid, "Rocket merged publication has invalid transaction or source evidence");
+  if (!configuration_.publication_producer)
+    return reject(CheckStatus::Unsupported, "Rocket publication has no registered memory-fabric producer");
+  if (group.source.qualified_phase == SourcePosition::cycle_closed_phase || !group.source.producer_sequence)
+    return reject(CheckStatus::Invalid, "Rocket merged publication uses an invalid physical drain source");
+
+  std::vector<Instruction *> members;
+  members.reserve(group.member_tokens.size());
+  std::set<uint64_t> unique_tokens;
+  uint32_t member_hart = 0;
+  uint64_t member_epoch = 0;
+  uint64_t previous_uid = 0;
+  for (size_t index = 0; index < group.member_tokens.size(); ++index) {
+    const uint64_t token = group.member_tokens[index];
+    auto found = instructions_.find(token);
+    if (!unique_tokens.insert(token).second || found == instructions_.end() ||
+        found->second.kind != MemoryKind::Store)
+      return reject(CheckStatus::Invalid, "Rocket merged publication has a missing or duplicate logical store");
+    auto &instruction = found->second;
+    if (!instruction.store || !instruction.retired)
+      return {CheckStatus::Pending, 0, "Rocket merged publication awaits every member LocalStore and retirement"};
+    if (index == 0) {
+      member_hart = instruction.id.hart;
+      member_epoch = instruction.id.epoch;
+    } else if (instruction.id.hart != member_hart || instruction.id.epoch != member_epoch ||
+               instruction.id.uid <= previous_uid) {
+      return reject(CheckStatus::Invalid, "Rocket merged store members are not in one hart's program order");
+    }
+    previous_uid = instruction.id.uid;
+    const auto order = compare_source_position(configuration_.producer, instruction.allocation.source,
+                                               configuration_.publication_producer, group.source);
+    if (order == SourceOrder::After || order == SourceOrder::Equal)
+      return reject(CheckStatus::Invalid, "Rocket merged publication predates a logical store allocation");
+    if (order == SourceOrder::Unordered)
+      return reject(CheckStatus::Incomplete, "Rocket allocation and merged publication lack common phase evidence");
+    members.push_back(&instruction);
+  }
+
+  std::vector<std::optional<uint64_t>> latest_writer(group.bytes.size());
+  for (size_t member_index = 0; member_index < members.size(); ++member_index) {
+    const auto &store = *members[member_index]->store;
+    for (size_t byte = 0; byte < store.mask.size(); ++byte) {
+      if (!store.mask[byte])
+        continue;
+      const uint64_t address = store.address + byte;
+      if (address < group.address || address - group.address >= group.bytes.size())
+        return reject(CheckStatus::Invalid, "Rocket merged transaction omits a member byte");
+      latest_writer[address - group.address] = group.member_tokens[member_index];
+    }
+  }
+
+  rvwmo::StorePublishEvent publication;
+  publication.transaction_id = group.transaction;
+  publication.address = group.address;
+  publication.bytes = group.bytes;
+  publication.byte_mask = group.mask;
+  publication.same_hart_group_linearization = grouped;
+  publication.physical_write = group.physical_write;
+  for (size_t index = 0; index < members.size(); ++index)
+    publication.members.push_back({members[index]->id, group.source});
+  publication.byte_writers.reserve(group.bytes.size());
+  for (size_t byte = 0; byte < group.bytes.size(); ++byte) {
+    if (group.mask[byte] != static_cast<uint8_t>(latest_writer[byte].has_value()) ||
+        group.byte_writer_tokens[byte] != latest_writer[byte])
+      return reject(CheckStatus::Invalid, "Rocket merged transaction mask or byte-writer identity is inconsistent");
+    if (!group.mask[byte]) {
+      publication.byte_writers.push_back({});
+      continue;
+    }
+    const auto member = std::find(group.member_tokens.begin(), group.member_tokens.end(), *latest_writer[byte]);
+    const auto member_index = static_cast<size_t>(member - group.member_tokens.begin());
+    const auto &store = *members[member_index]->store;
+    const auto offset = group.address + byte - store.address;
+    if (offset >= store.bytes.size() || !store.mask[offset])
+      return reject(CheckStatus::Invalid, "Rocket merged byte writer does not cover its final lane");
+    if (group.bytes[byte] != store.bytes[offset])
+      return reject(CheckStatus::Violation, "Rocket merged SRAM bytes differ from retained logical stores");
+    publication.byte_writers.push_back(members[member_index]->id);
+  }
+
+  if (batch_.events.size() >= configuration_.capacity)
+    return {CheckStatus::Pending, 0, "Rocket output batch capacity reached"};
+  append(RuntimeEventKind::StorePublish, std::move(publication), group.source);
+  for (const auto token : group.member_tokens)
+    instructions_.erase(token);
+  return {};
+}
+
 CheckResult EventEmitter::squash(uint64_t token) {
   if (!failure_)
     return failure_;
