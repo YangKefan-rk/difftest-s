@@ -66,6 +66,9 @@ transaction identity and the fabric source supplied by the common integration.
 Store retirement, native slot release, publication and independent REF audit
 are separate obligations.
 
+The common [incremental checking contract](../../rvwmo/README.md) describes
+early load completion, deferred store order checks and finalization requirements.
+
 `publish_merged_stores` accepts a complete, same-hart coalesced cache effect
 with every logical member's original STQ generation and the final writer of
 each enabled byte. Keep fully overwritten stores in the member list. The
