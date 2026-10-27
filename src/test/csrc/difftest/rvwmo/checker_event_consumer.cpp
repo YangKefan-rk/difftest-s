@@ -148,7 +148,7 @@ CheckResult CheckerEventConsumer::consume_local_store(const LocalStoreEvent &eve
 }
 
 CheckResult CheckerEventConsumer::consume_load_sample(const RuntimeEvent &event, const LoadSampleEvent &sample,
-                                                      RankCertificate certificate) {
+                                                      RankCertificate certificate, bool source_prefix_closed) {
   auto operation = sample.operation;
   const auto parent = instruction_id(operation.id);
   if (!allocations_.count(parent))
@@ -172,7 +172,7 @@ CheckResult CheckerEventConsumer::consume_load_sample(const RuntimeEvent &event,
   operation.source_kind = ReadSourceKind::ModeledWitness;
   operation.read_sources.clear();
   // DUT forwarding tags are diagnostic only in the modeled-witness profile.
-  result = checker_.observe_load(operation, operation.id.uid, {});
+  result = checker_.observe_load(operation, operation.id.uid, {}, source_prefix_closed);
   if (result.status != CheckStatus::Pass && result.status != CheckStatus::Pending)
     return remember_failure(result);
   remember_rank(event, time, certificate, operation.id, operation.attempt);
@@ -180,7 +180,7 @@ CheckResult CheckerEventConsumer::consume_load_sample(const RuntimeEvent &event,
   return result;
 }
 
-CheckResult CheckerEventConsumer::consume_read_group_member(const RuntimeEvent &event) {
+CheckResult CheckerEventConsumer::consume_read_group_member(const RuntimeEvent &event, bool source_prefix_closed) {
   if (!failure_)
     return failure_;
   const auto *sample = std::get_if<LoadSampleEvent>(&event.payload);
@@ -188,10 +188,11 @@ CheckResult CheckerEventConsumer::consume_read_group_member(const RuntimeEvent &
       !sample->operation.load || sample->operation.store || sample->operation.atomic || sample->operation.lr ||
       sample->operation.sc || sample->operation.acquire || sample->operation.release || sample->operation.rcsc)
     return remember_failure(invalid("certified read group contains a non-scalar load effect"));
-  return consume_load_sample(event, *sample, RankCertificate::ReadOnly);
+  return consume_load_sample(event, *sample, RankCertificate::ReadOnly, source_prefix_closed);
 }
 
-CheckResult CheckerEventConsumer::consume_independent_group_member(const RuntimeEvent &event) {
+CheckResult CheckerEventConsumer::consume_independent_group_member(const RuntimeEvent &event,
+                                                                   bool source_prefix_closed) {
   if (!failure_)
     return failure_;
   if (!event.producer_id)
@@ -202,7 +203,7 @@ CheckResult CheckerEventConsumer::consume_independent_group_member(const Runtime
         sample->operation.lr || sample->operation.sc || sample->operation.acquire || sample->operation.release ||
         sample->operation.rcsc || sample->operation.has_paired_lr)
       return remember_failure(invalid("independent memory group contains a non-ordinary load"));
-    return consume_load_sample(event, *sample, RankCertificate::IndependentEffects);
+    return consume_load_sample(event, *sample, RankCertificate::IndependentEffects, source_prefix_closed);
   }
   if (event.kind == RuntimeEventKind::StorePublish) {
     const auto *publish = std::get_if<StorePublishEvent>(&event.payload);
@@ -216,8 +217,11 @@ CheckResult CheckerEventConsumer::consume_store_publish(const RuntimeEvent &even
                                                         RankCertificate certificate) {
   if (publish.members.empty())
     return remember_failure(invalid("store publication has no logical store member"));
-  if (publish.members.size() != 1)
-    return remember_failure(unsupported("semantic consumer currently requires one logical store per publish event"));
+  if (publish.members.size() != 1) {
+    if (certificate != RankCertificate::None)
+      return remember_failure(incomplete("coalesced publication cannot share an unordered memory-group rank"));
+    return consume_coalesced_store_publish(event, publish);
+  }
   const auto &member = publish.members.front();
   if (!publish.transaction_id || !member.id.uid || publish.bytes.empty() ||
       publish.bytes.size() != publish.byte_mask.size() || publish.byte_writers.size() != publish.bytes.size() ||
@@ -258,6 +262,99 @@ CheckResult CheckerEventConsumer::consume_store_publish(const RuntimeEvent &even
     return remember_failure(result);
   remember_rank(event, time, certificate, member.id, 0);
   store->second.published = true;
+  collect_store_metadata();
+  return result;
+}
+
+CheckResult CheckerEventConsumer::consume_coalesced_store_publish(const RuntimeEvent &event,
+                                                                  const StorePublishEvent &publish) {
+  if (!publish.coalesced_program_order)
+    return remember_failure(unsupported("merged publication lacks a complete coalesced program-order certificate"));
+  if (!event.source.order_qualified)
+    return remember_failure(incomplete("coalesced publication lacks a qualified common source point"));
+  if (!publish.transaction_id || publish.bytes.empty() || publish.bytes.size() != publish.byte_mask.size() ||
+      publish.byte_writers.size() != publish.bytes.size() ||
+      publish.bytes.size() - 1 > std::numeric_limits<uint64_t>::max() - publish.address ||
+      std::none_of(publish.byte_mask.begin(), publish.byte_mask.end(), [](uint8_t byte) { return byte == 1; }) ||
+      std::any_of(publish.byte_mask.begin(), publish.byte_mask.end(), [](uint8_t byte) { return byte > 1; }))
+    return remember_failure(invalid("invalid coalesced publication transaction, byte range or mask"));
+
+  std::map<OperationId, StoreRecord *> members;
+  const auto &first = publish.members.front().id;
+  for (const auto &member : publish.members) {
+    if (!member.id.uid || member.id.hart != first.hart || member.id.epoch != first.epoch)
+      return remember_failure(unsupported("coalesced publication members must belong to one hart and epoch"));
+    if (member.id.subaccess != 0)
+      return remember_failure(unsupported("split or vector coalesced publication is outside scalar coverage"));
+    const auto &position = member.publish_position;
+    if (position.cycle != event.source.cycle || position.qualified_phase != event.source.qualified_phase ||
+        position.producer_sequence != event.source.producer_sequence ||
+        position.order_qualified != event.source.order_qualified)
+      return remember_failure(incomplete("coalesced publication member differs from the common source point"));
+    auto found = stores_.find(member.id);
+    if (found == stores_.end())
+      return pending("coalesced publication awaits every LocalStore member");
+    if (found->second.published || !members.emplace(member.id, &found->second).second)
+      return remember_failure(invalid("coalesced publication repeats an already published or duplicate member"));
+  }
+
+  // The producer certifies one complete physical effect. Program-order
+  // linearization is a model witness for its logical stores, not vector order
+  // or a fabricated order between independent harts or publication sources.
+  std::vector<std::optional<OperationId>> final_writers(publish.bytes.size());
+  for (const auto &member : members) {
+    const auto &store = member.second->store;
+    if (store.address < publish.address || store.address - publish.address >= publish.bytes.size() ||
+        store.mask.size() > publish.bytes.size() - (store.address - publish.address))
+      return remember_failure(invalid("coalesced publication does not contain a member's byte range"));
+    const size_t offset = store.address - publish.address;
+    for (size_t byte = 0; byte < store.mask.size(); ++byte) {
+      if (store.mask[byte] > 1)
+        return remember_failure(invalid("coalesced LocalStore contains a nonbinary byte mask"));
+      if (store.mask[byte])
+        final_writers[offset + byte] = member.first;
+    }
+  }
+  for (size_t byte = 0; byte < publish.byte_mask.size(); ++byte) {
+    if (bool(publish.byte_mask[byte]) != final_writers[byte].has_value())
+      return remember_failure(invalid("coalesced publication mask differs from its logical member union"));
+    if (!publish.byte_mask[byte])
+      continue;
+    if (publish.byte_writers[byte] != *final_writers[byte])
+      return remember_failure(invalid("coalesced byte writer is not the latest enabled program-order member"));
+    const auto &store = members.at(*final_writers[byte])->store;
+    if (publish.bytes[byte] != store.bytes[publish.address + byte - store.address])
+      return remember_failure(invalid("coalesced publication byte differs from its final LocalStore writer"));
+  }
+
+  ObservationTime first_time;
+  auto result = require_rank(event, first_time);
+  if (!result)
+    return result;
+  if (members.size() - 1 > std::numeric_limits<uint64_t>::max() - first_time.rank)
+    return remember_failure(invalid("coalesced publication logical rank space exhausted"));
+  std::map<OperationId, MemoryWriter> writer_ids;
+  std::vector<MemoryWriter> completed;
+  std::vector<ObservationTime> times;
+  for (const auto &member : members) {
+    MemoryWriter writer;
+    result = checker_.memory_writer(member.first, writer);
+    if (!result)
+      return remember_failure(result);
+    writer_ids.emplace(member.first, writer);
+    completed.push_back(writer);
+    times.push_back({first_time.rank + times.size(), true});
+  }
+  std::vector<MemoryWriter> byte_writers(publish.bytes.size());
+  for (size_t byte = 0; byte < publish.byte_mask.size(); ++byte)
+    if (publish.byte_mask[byte])
+      byte_writers[byte] = writer_ids.at(publish.byte_writers[byte]);
+  result = checker_.observe_global(publish.address, publish.bytes, publish.byte_mask, byte_writers, completed, times);
+  if (result.status != CheckStatus::Pass && result.status != CheckStatus::Pending)
+    return remember_failure(result);
+  remember_rank(event, times.back(), RankCertificate::None, members.rbegin()->first, 0);
+  for (const auto &member : members)
+    member.second->published = true;
   collect_store_metadata();
   return result;
 }
@@ -459,7 +556,7 @@ void CheckerEventConsumer::collect_store_metadata() {
   }
 }
 
-CheckResult CheckerEventConsumer::consume_closed(const RuntimeEvent &event) {
+CheckResult CheckerEventConsumer::consume_closed(const RuntimeEvent &event, bool source_prefix_closed) {
   if (!failure_)
     return failure_;
   if (!event.producer_id)
@@ -476,7 +573,8 @@ CheckResult CheckerEventConsumer::consume_closed(const RuntimeEvent &event) {
   case RuntimeEventKind::LocalStore:
     return consume_local_store(std::get<LocalStoreEvent>(event.payload));
   case RuntimeEventKind::LoadSample:
-    return consume_load_sample(event, std::get<LoadSampleEvent>(event.payload));
+    return consume_load_sample(event, std::get<LoadSampleEvent>(event.payload), RankCertificate::None,
+                               source_prefix_closed);
   case RuntimeEventKind::StorePublish:
     return consume_store_publish(event, std::get<StorePublishEvent>(event.payload));
   case RuntimeEventKind::InstructionRetire:

@@ -194,6 +194,11 @@ struct StorePublishEvent {
   std::vector<uint8_t> byte_mask;
   std::vector<OperationId> byte_writers;
   std::vector<StorePublishMember> members;
+  // Producer certificate: these same-hart stores first become externally
+  // visible as one indivisible, complete coalesced publication. The checker
+  // may linearize its members in program order at that point. This is a model
+  // witness, not independently observed hardware timestamps for each member.
+  bool coalesced_program_order = false;
 };
 
 struct AtomicLifecycleEvent {

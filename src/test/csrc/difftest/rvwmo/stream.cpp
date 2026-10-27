@@ -439,13 +439,21 @@ StreamResult ObservationStream::validate_transaction(const ObservationStream &st
 
     if (event.kind == RuntimeEventKind::StorePublish) {
       const auto &publish = std::get<StorePublishEvent>(event.payload);
+      const bool coalesced = publish.members.size() > 1;
+      if (coalesced && !publish.coalesced_program_order)
+        return unsupported("merged publication lacks a complete coalesced program-order certificate");
+      const auto &first = publish.members.front().id;
       for (const auto &member : publish.members) {
+        if (coalesced && (member.id.hart != first.hart || member.id.epoch != first.epoch))
+          return unsupported("coalesced publication members must belong to one hart and epoch");
+        if (coalesced && member.id.subaccess != 0)
+          return unsupported("split or vector coalesced publication is outside scalar coverage");
         const auto &position = member.publish_position;
         if (position.cycle != event.source.cycle || position.qualified_phase != event.source.qualified_phase ||
             position.producer_sequence != event.source.producer_sequence ||
             position.order_qualified != event.source.order_qualified)
           return incomplete("per-member store publish ordering is not supported by the single-point stream contract");
-        if (publish.members.size() > 1 && !position.order_qualified)
+        if (coalesced && !position.order_qualified)
           return incomplete("merged store members lack a qualified common publication point");
       }
     }
