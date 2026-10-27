@@ -377,6 +377,53 @@ public:
     record("CANCEL", id.hart, id.epoch, id.uid, number, time, reason);
   }
 
+  static bool forwards_byte(const Attempt &execution, const NativeMemoryFact &sample, size_t lane) {
+    if (!execution.store || execution.store->address != sample.address ||
+        !(execution.store->mask & (1u << lane)))
+      return false;
+    // Bypass registers observe the pre-edge queue. The same edge may drain
+    // this entry, so equality remains a valid physical forwarding source.
+    return execution.store->source_time <= sample.forwarding_time &&
+           (!execution.cancelled || execution.cancelled_at > sample.forwarding_time) &&
+           (!execution.drained || execution.drained_at >= sample.forwarding_time);
+  }
+
+  void validate_forwarded_byte(const NativeMemoryFact &sample, size_t lane,
+                              const rvwmo::OperationId &writer, const Attempt &execution) const {
+    const unsigned shift = 8 * lane;
+    require(static_cast<uint8_t>(execution.store->aligned_data >> shift) ==
+                static_cast<uint8_t>(sample.aligned_data >> shift),
+            "forwarded byte differs from its observed store-buffer writer data");
+    // This fixed WBUF retains individual stores in FIFO order. Its bypass
+    // selects current input, then el0, then el1: the youngest active older
+    // same-hart store covering each byte. This audits a physical source tag;
+    // it neither supplies REF bytes nor establishes a cross-hart memory rank.
+    for (auto newer = instructions.upper_bound(writer);
+         newer != instructions.end() && newer->first < sample.id; ++newer)
+      for (const auto &attempt_entry : newer->second.attempts)
+        require(!forwards_byte(attempt_entry.second, sample, lane),
+                "forwarded byte skips a younger active store-buffer writer");
+  }
+
+  void validate_forwarded_sample(const NativeMemoryFact &sample) {
+    // Only a closed raw source interval can prove that no later callback adds
+    // an older physical store input. Recheck the final sample before conversion.
+    for (size_t lane = 0; lane < sample.forwarded_writers.size(); ++lane) {
+      const auto &writer_id = sample.forwarded_writers[lane];
+      if (!writer_id)
+        continue;
+      const auto &writer = instruction(*writer_id);
+      size_t eligible = 0;
+      for (const auto &writer_attempt : writer.attempts)
+        if (forwards_byte(writer_attempt.second, sample, lane)) {
+          ++eligible;
+          validate_forwarded_byte(sample, lane, *writer_id, writer_attempt.second);
+        }
+      if (eligible != 1)
+        gap("forwarded byte lacks a unique writer attempt in the closed source interval");
+    }
+  }
+
   void memory(NativeMemoryFact fact) {
     hart(fact.id.hart);
     require(!completed_cycle, "memory observation delivered after the terminal source prefix");
@@ -441,11 +488,7 @@ public:
                   !((attempt_state.store->mask >> lane) & 1))
                 continue;
               observed_writer_byte = true;
-              // The SV bypass registers sample pre-edge queue contents; a
-              // writer can forward on the same edge that drains its entry.
-              if (attempt_state.store->source_time <= fact.forwarding_time &&
-                  (!attempt_state.cancelled || attempt_state.cancelled_at > fact.forwarding_time) &&
-                  (!attempt_state.drained || attempt_state.drained_at >= fact.forwarding_time))
+              if (forwards_byte(attempt_state, fact, lane))
                 eligible_attempts.push_back(writer_attempt.first);
             }
             require(observed_writer_byte, "forwarded writer does not own the captured address/byte lane");
@@ -1112,6 +1155,11 @@ private:
       if (previous == stop_at.end() || time < previous->second)
         stop_at[hart_id] = time;
     };
+    if (live.retirement) {
+      const auto &selected = live.attempts.at(live.retirement->attempt);
+      if (selected.sample)
+        validate_forwarded_sample(*selected.sample);
+    }
     const auto &channel = channels(id.hart);
     const auto allocation = live.allocation;
     if (!allocation.length) {
