@@ -91,6 +91,26 @@ struct StorePublication {
   EventSource source;
 };
 
+struct StorePublicationMember {
+  OperationId id;
+  SlotGeneration stq;
+};
+
+// A complete group first becomes externally visible at one indivisible cache
+// effect. The producer must establish this fact; existing BOOM probes still
+// emit one StorePublication per scalar data-array write.
+struct MergedStorePublication {
+  uint64_t transaction_id = 0;
+  uint64_t address = 0;
+  std::vector<uint8_t> bytes;
+  std::vector<uint8_t> byte_mask;
+  std::vector<OperationId> byte_writers;
+  std::vector<StorePublicationMember> members;
+  StorePublicationEvidence evidence = StorePublicationEvidence::Unavailable;
+  EventSource source;
+  bool coalesced_program_order = false;
+};
+
 enum class IntegerDestinationType : uint8_t { Integer = 0, Floating = 1, None = 2, Zero = 3 };
 enum class RetirementResultCoverage : uint8_t {
   Complete,
@@ -162,6 +182,7 @@ public:
   // travelling through the cache/MSHR. This does not emit StorePublish.
   CheckResult release_store_slot(const OperationId &id, const SlotGeneration &stq);
   CheckResult publish_store(const StorePublication &record);
+  CheckResult publish_merged_stores(const MergedStorePublication &record);
   CheckResult retire(const Retirement &record);
   CheckResult audit_reference_store(CheckerEventConsumer &consumer, const ReferenceStoreAudit &record);
   // Checks an independent REF store without requiring access to a session's
@@ -224,6 +245,8 @@ private:
   CheckResult owned_slot(const std::vector<SlotOwner> &slots, const SlotGeneration &slot,
                          const OperationId &id) const;
   CheckResult find_load(const LoadAttempt &record, Instruction *&instruction);
+  CheckResult validate_merged_bytes(const MergedStorePublication &record,
+                                    const std::map<OperationId, const Instruction *> &members) const;
   CheckResult append(const EventSource &source, RuntimeEventKind kind, RuntimeEventPayload payload);
   void claim_slot(std::vector<SlotOwner> &slots, const SlotGeneration &slot, const OperationId &id);
   void release_slot(std::vector<SlotOwner> &slots, const SlotGeneration &slot);

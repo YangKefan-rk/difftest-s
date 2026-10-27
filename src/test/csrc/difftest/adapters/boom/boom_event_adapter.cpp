@@ -185,6 +185,18 @@ bool fence_instruction(uint32_t instruction) {
          (opcode == 0x73 && (instruction & 0xfe007fff) == 0x12000073);
 }
 
+CheckResult validate_publication_evidence(StorePublicationEvidence evidence) {
+  switch (evidence) {
+  case StorePublicationEvidence::Unavailable:
+    return incomplete("BOOM store lacks cache/coherence evidence for global publication");
+  case StorePublicationEvidence::ExclusiveCacheDataWrite:
+  case StorePublicationEvidence::CoherentRefillDataWrite:
+    return {};
+  default:
+    return invalid("BOOM store publication has an unknown evidence kind");
+  }
+}
+
 bool same_position(const SourcePosition &lhs, const SourcePosition &rhs) {
   return lhs.cycle == rhs.cycle && lhs.qualified_phase == rhs.qualified_phase &&
          lhs.producer_sequence == rhs.producer_sequence && lhs.order_qualified == rhs.order_qualified;
@@ -546,15 +558,9 @@ CheckResult BoomEventAdapter::publish_store(const StorePublication &record) {
     if (!result)
       return result;
   }
-  switch (record.evidence) {
-  case StorePublicationEvidence::Unavailable:
-    return incomplete("BOOM store lacks cache/coherence evidence for global publication");
-  case StorePublicationEvidence::ExclusiveCacheDataWrite:
-  case StorePublicationEvidence::CoherentRefillDataWrite:
-    break;
-  default:
-    return invalid("BOOM store publication has an unknown evidence kind");
-  }
+  result = validate_publication_evidence(record.evidence);
+  if (!result)
+    return result;
   const auto &store = *found->second.store;
   if (!record.transaction_id || record.address != store.address || record.byte_mask != store.byte_mask ||
       !valid_bytes(record.address, record.bytes, record.byte_mask) || record.byte_writers.size() != record.bytes.size())
@@ -571,6 +577,96 @@ CheckResult BoomEventAdapter::publish_store(const StorePublication &record) {
     return result;
   found->second.published = true;
   collect(record.id);
+  return {};
+}
+
+CheckResult BoomEventAdapter::validate_merged_bytes(
+    const MergedStorePublication &record, const std::map<OperationId, const Instruction *> &members) const {
+  constexpr size_t cache_line_bytes = 64;
+  if (!record.transaction_id || record.bytes.empty() || record.bytes.size() != record.byte_mask.size() ||
+      record.byte_writers.size() != record.bytes.size() ||
+      record.bytes.size() - 1 > std::numeric_limits<uint64_t>::max() - record.address ||
+      std::any_of(record.byte_mask.begin(), record.byte_mask.end(), [](uint8_t bit) { return bit > 1; }))
+    return invalid("BOOM merged publication has an invalid transaction, range, mask or writer count");
+  if (record.bytes.size() > cache_line_bytes || record.address / cache_line_bytes !=
+      (record.address + record.bytes.size() - 1) / cache_line_bytes)
+    return unsupported("BOOM merged publication exceeds one native 64-byte cache line");
+
+  std::vector<const Instruction *> latest(record.bytes.size(), nullptr);
+  for (const auto &member : members) {
+    const auto &instruction = *member.second;
+    const auto &store = *instruction.store;
+    for (size_t byte = 0; byte < store.byte_mask.size(); ++byte) {
+      if (!store.byte_mask[byte])
+        continue;
+      const auto address = store.address + byte;
+      if (address < record.address || address - record.address >= record.bytes.size())
+        return invalid("BOOM merged publication omits a logical store byte");
+      const size_t offset = address - record.address;
+      if (!latest[offset] || latest[offset]->allocation.id.uid < member.first.uid)
+        latest[offset] = &instruction;
+    }
+  }
+  for (size_t byte = 0; byte < record.bytes.size(); ++byte) {
+    if (bool(record.byte_mask[byte]) != (latest[byte] != nullptr))
+      return invalid("BOOM merged publication mask differs from the union of its logical stores");
+    if (!latest[byte])
+      continue;
+    const auto &writer = *latest[byte];
+    const auto &store = *writer.store;
+    if (record.byte_writers[byte] != writer.allocation.id)
+      return invalid("BOOM merged publication byte writer is not the latest program-order member");
+    if (record.bytes[byte] != writer.store_bytes[record.address + byte - store.address])
+      return invalid("BOOM merged publication bytes differ from the committed final writer");
+  }
+  return {};
+}
+
+CheckResult BoomEventAdapter::publish_merged_stores(const MergedStorePublication &record) {
+  if (record.members.size() < 2 || record.members.size() > limits_.live_instructions)
+    return invalid("BOOM merged publication requires a bounded group of at least two logical stores");
+  auto result = validate_publication_evidence(record.evidence);
+  if (!result)
+    return result;
+  result = validate_event_source(RuntimeEventKind::StorePublish, record.source);
+  if (!result)
+    return result;
+  if (!record.coalesced_program_order || !record.source.position.order_qualified)
+    return incomplete("BOOM merged publication lacks a complete indivisible publication certificate");
+
+  std::map<OperationId, const Instruction *> members;
+  for (const auto &member : record.members) {
+    result = validate_id(member.id);
+    if (!result)
+      return result;
+    const auto found = instructions_.find(member.id);
+    if (found == instructions_.end() || !found->second.store || found->second.published ||
+        !found->second.allocation.stq || !(*found->second.allocation.stq == member.stq))
+      return invalid("BOOM merged member has no unpublished LocalStore with the matching STQ generation");
+    if (!found->second.stq_released) {
+      result = owned_slot(stq_, member.stq, member.id);
+      if (!result)
+        return result;
+    }
+    if (!members.emplace(member.id, &found->second).second)
+      return invalid("BOOM merged publication repeats a logical store member");
+  }
+  result = validate_merged_bytes(record, members);
+  if (!result)
+    return result;
+
+  StorePublishEvent publication{record.transaction_id, record.address, record.bytes, record.byte_mask,
+                                record.byte_writers, {}};
+  publication.coalesced_program_order = true;
+  for (const auto &member : members)
+    publication.members.push_back({member.first, record.source.position});
+  result = append(record.source, RuntimeEventKind::StorePublish, std::move(publication));
+  if (!result)
+    return result;
+  for (const auto &member : members)
+    instructions_.at(member.first).published = true;
+  for (const auto &member : members)
+    collect(member.first);
   return {};
 }
 

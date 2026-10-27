@@ -52,6 +52,9 @@ struct NativeFrame {
   bool trap = false;
   bool queues_empty = false;
   bool cache_idle = false;
+  // Optional typed ingress for a producer that proves a complete coalesced
+  // cache effect. Current BOOM Scala/native decoders leave this empty.
+  std::vector<MergedStorePublication> merged_publications;
 };
 struct NativeCollectorConfiguration {
   uint32_t hart = 0;
