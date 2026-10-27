@@ -147,10 +147,15 @@ private:
     if (closed_through < sample->source_time)
       return failure(rvwmo::CheckStatus::Pending, "load order awaits complete raw sample-interval closure");
 
-    certificate = {retired.id, retired.attempt, actual_time, sample->source_time,
-                   actual_time, sample->mask, true, false};
-    if (sample->forwarded_mask || !state.fenced_store_publish || actual_time > state.fenced_store_publish)
+    LoadOrderCertificate candidate{retired.id, retired.attempt, actual_time, sample->source_time,
+                                   actual_time, sample->mask, true, false};
+    if (!state.fenced_store_publish || actual_time > state.fenced_store_publish) {
+      certificate = candidate;
       return {};
+    }
+    if (sample->forwarded_mask)
+      return failure(rvwmo::CheckStatus::Incomplete,
+                     "fenced forwarded load has no certified model-order point after prior stores");
     if (state.fenced_store_publish == std::numeric_limits<uint64_t>::max())
       return failure(rvwmo::CheckStatus::Incomplete, "fenced store leaves no representable load-order witness");
     uint64_t selected = state.fenced_store_publish + 1;
@@ -172,8 +177,9 @@ private:
       if (overlaps(*sample, store))
         return failure(rvwmo::CheckStatus::Incomplete, "load-order interval contains a byte writer transition");
     }
-    certificate.selected = selected;
-    certificate.modeled_witness = true;
+    candidate.selected = selected;
+    candidate.modeled_witness = true;
+    certificate = candidate;
     return {};
   }
 };

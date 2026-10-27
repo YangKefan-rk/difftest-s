@@ -142,8 +142,12 @@ load that crosses an older W-to-R FENCE can receive a model-order witness only
 when its complete raw sampling interval is closed and none of its enabled bytes
 has any hart's store-input or store-drain transition in that interval. Writer
 identity transitions matter even when the data values are equal. Mixed
-forwarding, missing evidence, overlapping writes, or an interval with no legal
-point remain Incomplete/Unsupported.
+forwarding, and fully forwarded loads whose forwarding tick crosses the prior
+store-publication boundary remain Incomplete/Unsupported because they do not
+have a certified model-order point. Missing evidence, overlapping writes, or
+an interval with no legal point also remains Incomplete/Unsupported. This
+certificate covers the observed W-to-R scalar SRAM window; it does not claim
+complete handling for every FENCE predecessor/successor combination.
 
 The raw `NativeMemoryFact` keeps its actual array/forwarding and callback times.
 A derived `LOAD_ORDER_WINDOW` record separately identifies the original interval
