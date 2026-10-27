@@ -1,4 +1,5 @@
 #include "native_adapter.h"
+#include <algorithm>
 #include <limits>
 #include <utility>
 
@@ -88,7 +89,7 @@ CaptureResult NativeAdapter::bind_request(const CoreRequest &core, const CacheRe
   auto result = cache_.bind(core, cache);
   if (!result)
     return {remember(std::move(result)), false};
-  requests_.emplace(cache.request_id, Request{core, false, false, std::nullopt});
+  requests_.emplace(cache.request_id, Request{core, false, false, std::nullopt, std::nullopt});
   instruction->second.request = cache.request_id;
   return finish_input({});
 }
@@ -101,6 +102,7 @@ CaptureResult NativeAdapter::cancel_request(uint64_t request_id) {
     return {remember(invalid("Rocket native cancellation has no live request")), false};
   auto &instruction = instructions_.at(request->second.core.token);
   if (instruction.retirement || request->second.store_accepted || request->second.publication ||
+      request->second.publication_group ||
       instruction.next_attempt == std::numeric_limits<uint32_t>::max())
     return {remember(invalid("Rocket native cancellation retracts a committed or exhausted attempt")), false};
   if (request->second.core.request.command == 0) {
@@ -148,6 +150,36 @@ CaptureResult NativeAdapter::accept_store(const CacheStoreValue &store) {
     return finish_input(std::move(result));
   request->second.store_accepted = true;
   return finish_input(std::move(result));
+}
+
+CheckResult NativeAdapter::store_member(uint64_t request_id, CacheStoreMember &member) const {
+  if (!failure_)
+    return failure_;
+  return cache_.store_member(request_id, member);
+}
+
+CaptureResult NativeAdapter::publish_group(const StoreGroupObservation &group, uint64_t transaction) {
+  if (!failure_)
+    return {failure_, false};
+  if (!transaction || group.members.empty() ||
+      group.members.size() > configuration_.cache.capacity || pending_publication_groups_.count(transaction))
+    return {remember(invalid("Rocket merged publication has invalid transaction or group evidence")), false};
+
+  PendingStoreGroup pending_group;
+  pending_group.observation = group;
+  pending_group.transaction = transaction;
+  for (const auto &member : group.members) {
+    auto request = requests_.find(member.request_id);
+    if (request == requests_.end() || !request->second.store_accepted || request->second.publication ||
+        request->second.publication_group || request->second.core.token != member.store.token ||
+        request->second.core.attempt != member.attempt)
+      return {remember(invalid("Rocket merged publication member has no matching accepted cache request")), false};
+    pending_group.request_ids.push_back(member.request_id);
+  }
+  for (const auto request_id : pending_group.request_ids)
+    requests_.at(request_id).publication_group = transaction;
+  pending_publication_groups_.emplace(transaction, std::move(pending_group));
+  return finish_input({});
 }
 
 CaptureResult NativeAdapter::retire(const NativeRetireFact &fact) {
@@ -216,6 +248,8 @@ CaptureResult NativeAdapter::publish(const QualifiedStorePublication &publicatio
   auto request = requests_.find(publication.actual.request_id);
   if (request == requests_.end() || request->second.publication || !publication.transaction)
     return {remember(invalid("Rocket native publication is unknown, duplicated or lacks a transaction")), false};
+  if (request->second.publication_group)
+    return {remember(invalid("Rocket store already belongs to a merged publication")), false};
   if (request->second.core.request.command != 1)
     return {remember({CheckStatus::Unsupported, 0, "Rocket native publication is not an ordinary store"}), false};
   request->second.publication = publication;
@@ -259,6 +293,75 @@ CheckResult NativeAdapter::flush_retirements() {
 }
 
 CheckResult NativeAdapter::flush_publications() {
+  for (auto next = pending_publication_groups_.begin(); next != pending_publication_groups_.end();) {
+    auto &group = next->second;
+    StorePublicationGroup publication;
+    publication.transaction = group.transaction;
+    size_t first_lane = group.observation.actual_bytes.size();
+    size_t last_lane = 0;
+    for (size_t lane = 0; lane < group.observation.actual_bytes.size(); ++lane)
+      if (group.observation.logical_mask & (1u << lane)) {
+        first_lane = std::min(first_lane, lane);
+        last_lane = lane;
+      }
+    if (first_lane >= group.observation.actual_bytes.size())
+      return remember(invalid("Rocket store group has no logical written byte"));
+    const size_t interval = last_lane - first_lane + 1;
+    publication.address = group.observation.word_address + first_lane;
+    publication.bytes.assign(group.observation.actual_bytes.begin() + first_lane,
+                             group.observation.actual_bytes.begin() + last_lane + 1);
+    publication.mask.resize(interval);
+    publication.byte_writer_tokens.resize(interval);
+    publication.source = group.observation.source;
+    if (group.observation.physical_mask & ~group.observation.logical_mask) {
+      PhysicalStoreWrite physical;
+      physical.address = group.observation.word_address;
+      physical.bytes.assign(group.observation.actual_bytes.begin(), group.observation.actual_bytes.end());
+      for (size_t lane = 0; lane < physical.bytes.size(); ++lane)
+        physical.byte_mask.push_back((group.observation.physical_mask >> lane) & 1);
+      publication.physical_write = std::move(physical);
+    }
+    for (size_t byte = 0; byte < interval; ++byte) {
+      const size_t lane = first_lane + byte;
+      publication.mask[byte] = (group.observation.logical_mask >> lane) & 1;
+      if (!publication.mask[byte])
+        continue;
+      if (!group.observation.byte_writer_requests[lane])
+        return remember(invalid("Rocket merged publication omits a final byte-writer identity"));
+      auto request = requests_.find(*group.observation.byte_writer_requests[lane]);
+      if (request == requests_.end() || request->second.publication_group != group.transaction)
+        return remember(invalid("Rocket merged publication writer is not a retained group member"));
+      publication.byte_writer_tokens[byte] = request->second.core.token;
+    }
+    for (const auto request_id : group.request_ids) {
+      auto request = requests_.find(request_id);
+      if (request == requests_.end() || request->second.publication_group != group.transaction)
+        return remember(invalid("Rocket merged publication lost a logical request before output"));
+      publication.member_tokens.push_back(request->second.core.token);
+    }
+    auto result = emitter_.publish_store_group(publication);
+    if (result.status == CheckStatus::Pending) {
+      ++next;
+      continue;
+    }
+    if (!result)
+      return remember(std::move(result));
+
+    for (const auto request_id : group.request_ids) {
+      auto request = requests_.find(request_id);
+      const auto token = request->second.core.token;
+      result = cache_.release(request_id);
+      if (!result)
+        return remember(std::move(result));
+      auto &instruction = instructions_.at(token);
+      instruction.publication_done = true;
+      instruction.request.reset();
+      requests_.erase(request);
+      collect_instruction(token);
+    }
+    next = pending_publication_groups_.erase(next);
+  }
+
   for (auto next = pending_publications_.begin(); next != pending_publications_.end();) {
     const auto request_id = *next;
     auto &request = requests_.at(request_id);
@@ -346,7 +449,7 @@ CheckResult NativeAdapter::poll() {
   collect_output();
   if (!failure_)
     return failure_;
-  if (!pending_retirements_.empty() || !pending_publications_.empty())
+  if (!pending_retirements_.empty() || !pending_publications_.empty() || !pending_publication_groups_.empty())
     return pending("Rocket native joins await a final sample, store, retirement or output capacity");
   return {};
 }
@@ -377,7 +480,7 @@ CheckResult NativeAdapter::finalize() const {
   if (!failure_)
     return failure_;
   if (output_.serial || !instructions_.empty() || !requests_.empty() || !pending_retirements_.empty() ||
-      !pending_publications_.empty())
+      !pending_publications_.empty() || !pending_publication_groups_.empty())
     return pending("Rocket native adapter has live facts, joins or undelivered output");
   for (const auto &result : {emitter_.finalize(), cache_.finalize(), capture_.finalize()})
     if (!result)
