@@ -200,13 +200,17 @@ certificate covers the observed W-to-R scalar SRAM window; it does not claim
 complete handling for every FENCE predecessor/successor combination.
 
 The same interval rule also handles a same-hart WBUF acceptance tied with a
-physical load sample. Current-input forwarding may include the accepted store
-at the interval's first tick only when each overlapping byte has that exact
-observed writer. All other overlapping writer transitions are rejected,
-including same-value writes. The chosen point is strictly later, lies inside
-the closed sampling interval and is still subject to the public PPO checks.
-It is not a fabricated global store/load phase for simultaneous cross-hart
-accesses. Physical drain is a completion obligation, not another logical write.
+physical load sample. A disjoint SRAM read can be placed after that store only
+when its complete closed interval shows no writer transition on any enabled
+byte; this commutes with the store and asserts a possible model order, not a
+new physical sample time. Current-input forwarding may include an overlapping
+store only when all enabled bytes identify that exact writer. Any other
+writer transition, including a same-value write, leaves the result Incomplete.
+The chosen point lies strictly after acceptance, before architectural retirement
+and within the closed sampling interval; it remains subject to public PPO and
+independent REF value checks. This does not fabricate a cross-hart hardware
+arbitration phase. Physical drain is a completion obligation, not another
+logical write.
 
 The raw `NativeMemoryFact` keeps its actual array/forwarding and callback times.
 A derived `LOAD_ORDER_WINDOW` record separately identifies the original interval

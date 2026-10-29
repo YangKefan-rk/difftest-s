@@ -71,10 +71,8 @@ public:
       return result;
 
     const bool base_fence = retired.instruction_bytes == 4 && (expanded & 0xf000707f) == 0x000f;
-    if (base_fence && (expanded & (1u << 24)) && (expanded & (1u << 21))) {
+    if (base_fence && (expanded & (1u << 24)) && (expanded & (1u << 21)))
       next.fenced_store_publish = std::max(next.fenced_store_publish, next.latest_store_publish);
-      next.fenced_uid = retired.id.uid;
-    }
     next.last_uid = retired.id.uid;
     harts_[retired.id.hart] = next;
     certificate = candidate;
@@ -87,7 +85,6 @@ private:
     uint64_t last_uid = 0;
     uint64_t latest_store_publish = 0;
     uint64_t fenced_store_publish = 0;
-    uint64_t fenced_uid = 0;
   };
   std::map<uint32_t, HartState> harts_;
 
@@ -173,15 +170,14 @@ private:
       if (sample->mask & (1u << lane))
         exact_forwarded_input = sample->forwarded_writers[lane] &&
                                 *sample->forwarded_writers[lane] == current_input_writer->id;
-    // A W->R Fence supplies the necessary Store->Load order only for stores
-    // before that Fence. For a disjoint SRAM read, the closed interval below
-    // must also prove its bytes remain stable at the chosen model-order point.
-    const bool fenced_disjoint_input = older_input && !overlapping_input && !sample->forwarded_mask &&
-        current_input_writer->id.uid < state.fenced_uid &&
-        state.fenced_store_publish >= actual_time;
-    if (input_tie && !exact_forwarded_input && !fenced_disjoint_input)
+    // A disjoint SRAM load can commute with a same-tick older store. A
+    // model-order point after that store is valid only if the complete closed
+    // interval below contains no write to any byte the load reads. This is an
+    // existential order witness, never a new physical sample timestamp.
+    const bool disjoint_stable_input = older_input && !overlapping_input && !sample->forwarded_mask;
+    if (input_tie && !exact_forwarded_input && !disjoint_stable_input)
       return failure(rvwmo::CheckStatus::Incomplete,
-                     "same-hart load/store source tie lacks a fenced stable interval or exact forwarded writer");
+                     "same-hart load/store source tie lacks stable disjoint bytes or exact forwarded writer");
     if ((!state.fenced_store_publish || actual_time > state.fenced_store_publish) && !input_tie) {
       certificate = candidate;
       return {};
@@ -192,15 +188,12 @@ private:
     if (std::max(actual_time, state.fenced_store_publish) == std::numeric_limits<uint64_t>::max())
       return failure(rvwmo::CheckStatus::Incomplete, "fenced store leaves no representable load-order witness");
     uint64_t selected = std::max(actual_time, state.fenced_store_publish) + 1;
-    // A derived sample/retirement tie on a merged producer lacks strict source
-    // evidence. Leave room for the public consumer instead of inventing a phase.
-    if (selected == retired.source_time) {
-      if (selected == std::numeric_limits<uint64_t>::max())
-        return failure(rvwmo::CheckStatus::Incomplete, "load-order witness cannot avoid its retirement source tie");
-      ++selected;
-    }
+    // The derived point must precede architectural retirement. Equality has
+    // no proven intra-tick rank; moving it later would invent a post-retire load.
+    if (selected >= retired.source_time)
+      return failure(rvwmo::CheckStatus::Incomplete, "load-order witness is not strictly before retirement");
     if (selected > sample->source_time)
-      return failure(rvwmo::CheckStatus::Incomplete, "fenced load has no closed stable-writer interval after prior stores");
+      return failure(rvwmo::CheckStatus::Incomplete, "load has no closed stable-writer interval after tied store");
     for (const auto &store : retained_memory) {
       if (store.kind != 1 || store.source_time < actual_time ||
           store.source_time > sample->source_time)
