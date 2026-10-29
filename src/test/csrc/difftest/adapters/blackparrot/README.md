@@ -59,14 +59,28 @@ attempts remain provisional. These physical-source tags never supply REF
 expected values or a cross-hart memory rank; inconsistent tags are Invalid,
 while missing or ambiguous source evidence remains incomplete.
 
-Store publication requires the matching physical SRAM drain, logical final
-UID/attempt, exact byte data/mask and the coherence monitor's five proof bits:
-ordinary scalar access, known matching tag, observed M/E ownership, the actual
-SRAM write, and continuous exclusion of conflicting coherence actions while
-buffered. A naked buffer drain, permission ACK or cache request is insufficient.
-Publication keeps its physical tick even when it precedes LocalStore retirement.
-The public session waits for the later LocalStore and independent REF audit;
-it does not retime publication or trust DUT bytes as expected data.
+For ordinary cached scalar stores, the logical publication point is qualified
+WBUF acceptance. The admission monitor checks the concrete UID/attempt,
+address, enabled bytes, one-hot bank/target location, known matching tag and
+previously observed M/E ownership. This is a per-store acceptance event, not
+the earlier cache-line permission grant and not a claim that SRAM was written.
+
+Hit stores register their provisional writer record and publish at acceptance;
+their LocalMem byte overlay therefore has zero logical residency. If a store
+retires first, its accepted miss request supplies address/data/mask for LocalMem
+until fill replay reaches WBUF. Retirement always independently audits the
+store against REF, including stores published before retirement. A private
+kind-4 memory fact captures the accepted miss payload; kind 1 remains WBUF
+acceptance, kind 2 physical drain and kind 3 a load sample.
+
+Physical completion is still mandatory: every admitted store must drain once,
+with identical bytes/mask and independently checked SRAM geometry. The monitor
+continuously excludes ownership loss and coherence reads of buffered stores.
+Those checks remain active after logical publication. The bridge conservatively
+retains raw facts and holds source closure until retirement, physical drain and
+both proof records are available; this delivery delay does not change the
+original admission source position. Missing admission/drain or later source
+failure cannot leave a final Pass.
 
 ## Reference and completion contract
 
@@ -176,7 +190,7 @@ identities or substitutes for the final stopped/drained-source protocol.
 `load_order.h` retains constant-size order summaries per hart. An ordinary SRAM
 load that crosses an older W-to-R FENCE can receive a model-order witness only
 when its complete raw sampling interval is closed and none of its enabled bytes
-has any hart's store-input or store-drain transition in that interval. Writer
+has any hart's logical store-input transition in that interval. Writer
 identity transitions matter even when the data values are equal. Mixed
 forwarding, and fully forwarded loads whose forwarding tick crosses the prior
 store-publication boundary remain Incomplete/Unsupported because they do not
@@ -184,6 +198,15 @@ have a certified model-order point. Missing evidence, overlapping writes, or
 an interval with no legal point also remains Incomplete/Unsupported. This
 certificate covers the observed W-to-R scalar SRAM window; it does not claim
 complete handling for every FENCE predecessor/successor combination.
+
+The same interval rule also handles a same-hart WBUF acceptance tied with a
+physical load sample. Current-input forwarding may include the accepted store
+at the interval's first tick only when each overlapping byte has that exact
+observed writer. All other overlapping writer transitions are rejected,
+including same-value writes. The chosen point is strictly later, lies inside
+the closed sampling interval and is still subject to the public PPO checks.
+It is not a fabricated global store/load phase for simultaneous cross-hart
+accesses. Physical drain is a completion obligation, not another logical write.
 
 The raw `NativeMemoryFact` keeps its actual array/forwarding and callback times.
 A derived `LOAD_ORDER_WINDOW` record separately identifies the original interval

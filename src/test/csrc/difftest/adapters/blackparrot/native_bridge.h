@@ -17,6 +17,7 @@ struct NativeMemoryFact {
   rvwmo::OperationId id;
   uint32_t attempt = 0;
   uint64_t source_time = 0;
+  // 1: WBUF acceptance, 2: physical drain, 3: load, 4: accepted store-miss payload.
   uint32_t kind = 0;
   uint64_t address = 0;
   uint64_t aligned_data = 0;
@@ -82,6 +83,8 @@ struct NativeCoherenceFact {
   uint32_t proof_flags = 0;
   uint32_t bank_select = 0;
   uint32_t physical_sram_index = 0;
+  // Admission names the target location; drain proves the actual SRAM write.
+  bool admission = false;
 };
 
 // Evidence is emitted only by the native terminal-WFI protocol after issue is
@@ -192,6 +195,10 @@ int bp_difftest_s_coherent_drain(uint32_t hart, uint64_t epoch, uint64_t uid, ui
                                  uint64_t source_time, uint64_t address, uint32_t cache_set,
                                  uint32_t cache_way, uint32_t state, uint64_t grant_time, uint32_t proof_flags,
                                  uint32_t bank_select, uint32_t physical_sram_index);
+int bp_difftest_s_coherent_accept(uint32_t hart, uint64_t epoch, uint64_t uid, uint32_t attempt,
+                                  uint64_t source_time, uint64_t address, uint32_t cache_set,
+                                  uint32_t cache_way, uint32_t state, uint64_t grant_time, uint32_t proof_flags,
+                                  uint32_t bank_select, uint32_t target_sram_index);
 int bp_difftest_s_terminal_state(uint32_t hart, uint64_t source_time, uint64_t terminal_uid,
                                 uint32_t stopped, uint32_t pending_writebacks);
 int bp_difftest_s_can_end();

@@ -36,6 +36,7 @@ struct Attempt {
   uint32_t memory_flags = 0;
   bool observed_store_drain = false;
   bool drained = false;
+  std::optional<NativeMemoryFact> accepted_store;
   std::optional<NativeMemoryFact> store;
   std::optional<NativeMemoryFact> sample;
   std::array<std::optional<rvwmo::OperationId>, 8> forwarding_candidates;
@@ -155,6 +156,7 @@ public:
   std::map<rvwmo::OperationId, Instruction> instructions;
   std::map<DrainKey, size_t> physical_drain_counts;
   std::map<DrainKey, size_t> coherent_drain_indices;
+  std::map<DrainKey, size_t> coherent_admission_indices;
   std::map<std::tuple<rvwmo::OperationId, uint32_t, uint32_t>, size_t> forwarding_fact_indices;
 
   void reject_transport(const char *message) {
@@ -364,6 +366,7 @@ public:
     require(reason == 1 || reason == 2, "unknown native cancellation reason");
     require(!online_closed || time > *online_closed, "cancellation arrived inside a closed online prefix");
     require(!live.retirement, "cancellation names an architecturally retired instruction");
+    require(!execution.accepted_store && !execution.store, "accepted ordinary store cannot be cancelled");
     if (reason == 1)
       require(!execution.cancelled, "duplicate execution-attempt cancellation");
     else
@@ -429,7 +432,7 @@ public:
     require(!completed_cycle, "memory observation delivered after the terminal source prefix");
     auto &source = hart(fact.id.hart);
     source.latest_memory_time = std::max(source.latest_memory_time, fact.source_time);
-    require(fact.kind >= 1 && fact.kind <= 3, "unknown native memory observation kind");
+    require(fact.kind >= 1 && fact.kind <= 4, "unknown native memory observation kind");
     require(fact.mask && !(fact.mask & ~0xffu) && !(fact.address & 7), "invalid aligned memory byte mask/address");
     require(!(fact.flags & ~kKnownMemoryFlags), "unknown native memory flags");
     require(!(fact.forwarded_mask & ~fact.mask), "forwarded byte mask exceeds enabled memory bytes");
@@ -444,8 +447,23 @@ public:
       require(!execution.cancelled, "memory observation belongs to a cancelled execution attempt");
       execution.memory_flags |= fact.flags;
       execution.observed_store_drain |= fact.kind == 2;
-      if (fact.kind == 1) {
+      if (fact.kind == 4) {
+        require(is_store(live.expanded_instruction) && !(fact.flags & ~uint32_t{8}),
+                "accepted miss payload is not an ordinary cached store");
+        require(!execution.accepted_store && !execution.store,
+                "duplicate or late accepted store-miss payload");
+        execution.accepted_store = fact;
+      } else if (fact.kind == 1) {
         require(!execution.store, "duplicate store-buffer input for one execution attempt");
+        if (execution.accepted_store) {
+          const auto &accepted = *execution.accepted_store;
+          require(accepted.source_time < fact.source_time && accepted.address == fact.address &&
+                      accepted.mask == fact.mask, "replayed store differs from its accepted miss payload");
+          for (size_t lane = 0; lane < 8; ++lane)
+            require(!(fact.mask & (1u << lane)) ||
+                        uint8_t(accepted.aligned_data >> (8 * lane)) == uint8_t(fact.aligned_data >> (8 * lane)),
+                    "replayed store bytes differ from its accepted miss payload");
+        }
         execution.store = fact;
       } else if (fact.kind == 2) {
         require(execution.store.has_value(), "physical store drain has no prior store-buffer input");
@@ -575,22 +593,22 @@ public:
            fact.cause, fact.interrupt, fact.tval, fact.target_pc, fact.privilege, fact.target_privilege);
   }
 
-  void coherent_drain(const NativeCoherenceFact &fact) {
+  void coherent_store(const NativeCoherenceFact &fact) {
     hart(fact.id.hart);
     require(!completed_cycle, "coherence observation delivered after the terminal source prefix");
     auto &source = hart(fact.id.hart);
     source.latest_memory_time = std::max(source.latest_memory_time, fact.source_time);
     require(!(fact.address & 7) && !(fact.proof_flags & ~0x1fu) && (fact.source_time & 1) &&
                 fact.cache_set < cache_geometry::kSetCount && fact.cache_way < cache_geometry::kWayCount,
-            "coherent drain record has an invalid source position, address or proof shape");
+            "coherent store record has an invalid source position, address or proof shape");
     if (fact.proof_flags == 0x1f) {
       require(fact.id.epoch && fact.id.uid && fact.attempt &&
                   (fact.coherence_state == 2 || fact.coherence_state == 6) && fact.grant_time &&
                   fact.grant_time < fact.source_time,
-              "coherent drain proof lacks the fixed four-hart ownership/write evidence");
+              "coherent store proof lacks the fixed four-hart ownership evidence");
       require(cache_geometry::is_one_hot_bank(fact.bank_select) &&
                   fact.physical_sram_index < cache_geometry::kPhysicalEntryCount,
-              "coherent drain proof lacks a one-hot physical SRAM location");
+              "coherent store proof lacks a one-hot SRAM location");
       const uint32_t physical_set = cache_geometry::set_for_physical_index(fact.physical_sram_index);
       const uint32_t expected_set = cache_geometry::set_for_address(fact.address);
       const uint32_t expected_way = cache_geometry::way_for_location(fact.bank_select,
@@ -605,15 +623,16 @@ public:
     require(hart_count == 4, "coherent publication proof requires the audited four-hart profile");
     if (online_adapter)
       instruction(fact.id).last_fact_time = std::max(instruction(fact.id).last_fact_time, fact.source_time);
-    if (fact.proof_flags == 0x1f)
+    if (fact.proof_flags == 0x1f && !fact.admission)
       ++source.coherent_stores;
     const auto key = drain_key(fact.id, fact.attempt, fact.source_time, fact.address);
-    require(!coherent_drain_indices.count(key), "duplicate coherent drain proof");
+    auto &indices = fact.admission ? coherent_admission_indices : coherent_drain_indices;
+    require(!indices.count(key), "duplicate coherent store proof");
     // The two source monitors run in separate SV processes. Match their facts
     // after delivery, without assuming which DPI callback arrives first.
     capture.coherence_facts.push_back(fact);
-    coherent_drain_indices.emplace(key, capture.coherence_facts.size() - 1);
-    record("COHERENT_DRAIN", fact.id.hart, fact.id.epoch, fact.id.uid, fact.attempt,
+    indices.emplace(key, capture.coherence_facts.size() - 1);
+    record(fact.admission ? "COHERENT_ACCEPT" : "COHERENT_DRAIN", fact.id.hart, fact.id.epoch, fact.id.uid, fact.attempt,
            fact.source_time, fact.address, fact.cache_set, fact.cache_way,
            fact.coherence_state, fact.grant_time, fact.proof_flags, fact.bank_select,
            fact.physical_sram_index);
@@ -860,7 +879,8 @@ private:
       return false;
     for (const auto &entry : live.attempts) {
       const auto &execution = entry.second;
-      if (execution.store && !execution.drained)
+      if (execution.store && (!execution.drained || !coherent_admission_indices.count(
+          drain_key(id, entry.first, execution.store->source_time, execution.store->address))))
         return false;
       if (!execution.drained)
         continue;
@@ -871,9 +891,17 @@ private:
     for (const auto &proof : capture.coherence_facts) {
       if (proof.id != id)
         continue;
-      const auto drain = physical_drain_counts.find(drain_key(id, proof.attempt, proof.source_time, proof.address));
-      if (drain == physical_drain_counts.end() || drain->second != 1)
-        return false;
+      if (proof.admission) {
+        const auto execution = live.attempts.find(proof.attempt);
+        if (execution == live.attempts.end() || !execution->second.store ||
+            execution->second.store->source_time != proof.source_time ||
+            execution->second.store->address != proof.address)
+          return false;
+      } else {
+        const auto drain = physical_drain_counts.find(drain_key(id, proof.attempt, proof.source_time, proof.address));
+        if (drain == physical_drain_counts.end() || drain->second != 1)
+          return false;
+      }
     }
     return true;
   }
@@ -917,10 +945,10 @@ private:
         const NativeMemoryFact *memory = execution.sample ? &*execution.sample
                                               : execution.store ? &*execution.store : nullptr;
         const NativeCoherenceFact *proof = nullptr;
-        if (execution.drained) {
-          const auto found = coherent_drain_indices.find(
-              drain_key(entry.first, live.retirement->attempt, execution.drained_at, execution.store->address));
-          if (found != coherent_drain_indices.end())
+        if (execution.store) {
+          const auto found = coherent_admission_indices.find(
+              drain_key(entry.first, live.retirement->attempt, execution.store->source_time, execution.store->address));
+          if (found != coherent_admission_indices.end())
             proof = &capture.coherence_facts[found->second];
         }
         LoadOrderCertificate certificate;
@@ -1048,9 +1076,11 @@ private:
       else
         ++drain;
     coherent_drain_indices.clear();
+    coherent_admission_indices.clear();
     for (size_t index = 0; index < capture.coherence_facts.size(); ++index) {
       const auto &fact = capture.coherence_facts[index];
-      coherent_drain_indices.emplace(drain_key(fact.id, fact.attempt, fact.source_time, fact.address), index);
+      auto &indices = fact.admission ? coherent_admission_indices : coherent_drain_indices;
+      indices.emplace(drain_key(fact.id, fact.attempt, fact.source_time, fact.address), index);
     }
     forwarding_fact_indices.clear();
     for (size_t index = 0; index < capture.forwarding_facts.size(); ++index) {
@@ -1174,13 +1204,13 @@ private:
       if (execution.store && !execution.drained)
         gap("store-buffer input has no matching physical drain candidate");
       if (execution.drained) {
-        const auto key = drain_key(id, attempt_entry.first, execution.drained_at, execution.store->address);
-        const auto proof_index = coherent_drain_indices.find(key);
-        if (proof_index == coherent_drain_indices.end()) {
-          gap("physical SRAM store drain is an unqualified publication candidate, not StorePublish");
+        const auto key = drain_key(id, attempt_entry.first, execution.store->source_time, execution.store->address);
+        const auto proof_index = coherent_admission_indices.find(key);
+        if (proof_index == coherent_admission_indices.end()) {
+          gap("store-buffer acceptance lacks qualified ownership/publication evidence");
         } else if (capture.coherence_facts[proof_index->second].proof_flags != 0x1f ||
                    (execution.memory_flags & ~uint32_t{1u << 3})) {
-          gap("coherent drain belongs to an unsupported memory lifecycle");
+          gap("coherent admission belongs to an unsupported memory lifecycle");
         } else if (!live.retirement || live.retirement->attempt != attempt_entry.first || execution.cancelled) {
           gap("coherent physical store drain has no final committed instruction");
         } else {
@@ -1194,7 +1224,7 @@ private:
           publish.bytes = span_bytes(store.aligned_data, span);
           publish.byte_mask.assign(span.size, 1);
           publish.byte_writers.assign(span.size, id);
-          // Transaction IDs identify actual per-instruction drains and do not
+          // Transaction IDs identify per-instruction acceptance and do not
           // establish an order among simultaneous cache producers.
 
           planned.push_back({id.hart, capture.coherence_facts[proof_index->second].source_time,
@@ -1264,10 +1294,21 @@ private:
         return;
       }
       const auto &store = *execution.store;
-      const auto span = scalar_span(store.mask);
-      const rvwmo::LocalStoreEvent local{id, store.address + span.first, span_bytes(store.aligned_data, span),
+      const bool accepted_before_retirement = store.source_time < fact.source_time;
+      if (!accepted_before_retirement && !execution.accepted_store) {
+        stop(id.hart, fact.source_time, "retired unpublished store lacks its accepted miss payload");
+        return;
+      }
+      const auto &local_data = accepted_before_retirement ? store : *execution.accepted_store;
+      if (local_data.source_time > fact.source_time) {
+        stop(id.hart, fact.source_time, "retired store predates its accepted payload");
+        return;
+      }
+      const auto span = scalar_span(local_data.mask);
+      const rvwmo::LocalStoreEvent local{id, local_data.address + span.first, span_bytes(local_data.aligned_data, span),
                                         std::vector<uint8_t>(span.size, 1)};
-      planned.push_back({id.hart, fact.source_time, channel.memory, false,
+      // Hit stores have zero local-overlay residency but retain their REF audit record.
+      planned.push_back({id.hart, std::min(fact.source_time, store.source_time), channel.memory, false,
                          [local](Adapter &target, const Origin &origin) { return target.local_store(origin, local); }});
       rvwmo::MemoryOperation operation;
       operation.id = id;
@@ -1288,8 +1329,16 @@ private:
     std::map<uint32_t, uint64_t> stop_at;
     for (const auto &proof : capture.coherence_facts) {
       const auto key = drain_key(proof.id, proof.attempt, proof.source_time, proof.address);
-      if (physical_drain_counts[key] != 1)
+      if (proof.admission) {
+        const auto live = instructions.find(proof.id);
+        if (live == instructions.end() || !live->second.attempts.count(proof.attempt) ||
+            !live->second.attempts.at(proof.attempt).store ||
+            live->second.attempts.at(proof.attempt).store->source_time != proof.source_time ||
+            live->second.attempts.at(proof.attempt).store->address != proof.address)
+          gap("coherence admission proof has no unique matching store input");
+      } else if (physical_drain_counts[key] != 1) {
         gap("coherence location proof has no unique exact physical store drain fact");
+      }
     }
     for (const auto &drain : physical_drain_counts)
       if (drain.second != 1 || !coherent_drain_indices.count(drain.first))
@@ -1526,8 +1575,18 @@ extern "C" int bp_difftest_s_coherent_drain(uint32_t hart, uint64_t epoch, uint6
                                               uint32_t proof_flags, uint32_t bank_select,
                                               uint32_t physical_sram_index) {
   return blackparrot::invoke("coherent_drain", [&](auto &bridge) {
-    bridge.coherent_drain({{hart, epoch, uid, 0}, attempt, time, address, cache_set, cache_way,
+    bridge.coherent_store({{hart, epoch, uid, 0}, attempt, time, address, cache_set, cache_way,
                            state, grant_time, proof_flags, bank_select, physical_sram_index});
+  });
+}
+extern "C" int bp_difftest_s_coherent_accept(uint32_t hart, uint64_t epoch, uint64_t uid, uint32_t attempt,
+                                               uint64_t time, uint64_t address, uint32_t cache_set,
+                                               uint32_t cache_way, uint32_t state, uint64_t grant_time,
+                                               uint32_t proof_flags, uint32_t bank_select,
+                                               uint32_t target_sram_index) {
+  return blackparrot::invoke("coherent_accept", [&](auto &bridge) {
+    bridge.coherent_store({{hart, epoch, uid, 0}, attempt, time, address, cache_set, cache_way,
+                           state, grant_time, proof_flags, bank_select, target_sram_index, true});
   });
 }
 extern "C" int bp_difftest_s_terminal_state(uint32_t hart, uint64_t time, uint64_t uid,

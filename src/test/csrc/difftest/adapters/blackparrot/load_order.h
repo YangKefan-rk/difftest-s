@@ -27,7 +27,7 @@ struct LoadOrderCertificate {
 // Called exactly once for each final architectural retirement, in each hart's
 // UID order. Cancelled/replayed attempts never advance this state. The caller
 // proves source_closed_through closes the *raw* prefix and retains every hart's
-// store input/drain in each sample interval, including already retired stores.
+// store input in each sample interval, including already retired stores.
 // This class retains constant-size order summaries per hart, not trace history.
 class LoadOrderValidator {
 public:
@@ -111,9 +111,9 @@ private:
       return failure(rvwmo::CheckStatus::Invalid, "store order evidence differs from the final retired identity or address");
     if (!ordinary_span(*memory))
       return failure(rvwmo::CheckStatus::Unsupported, "store order requires an ordinary aligned scalar byte span");
-    if (publication->proof_flags != 0x1f)
+    if (!publication->admission || publication->proof_flags != 0x1f)
       return failure(rvwmo::CheckStatus::Incomplete, "store order lacks a qualified coherence publication proof");
-    if (!memory->source_time || publication->source_time < memory->source_time ||
+    if (!memory->source_time || publication->source_time != memory->source_time ||
         !publication->grant_time || publication->grant_time >= publication->source_time)
       return failure(rvwmo::CheckStatus::Invalid, "store order input, grant and publication times are inconsistent");
     if (closed_through < publication->source_time)
@@ -149,16 +149,22 @@ private:
 
     LoadOrderCertificate candidate{retired.id, retired.attempt, actual_time, sample->source_time,
                                    actual_time, sample->mask, true, false};
-    if (!state.fenced_store_publish || actual_time > state.fenced_store_publish) {
+    // A WBUF acceptance can share the load's physical read/forward edge.
+    // Derive an interval witness instead of inventing a cross-hart clock phase.
+    const bool input_tie = std::any_of(retained_memory.begin(), retained_memory.end(),
+        [&](const NativeMemoryFact &store) {
+          return store.kind == 1 && store.id.hart == retired.id.hart && store.source_time == actual_time;
+        });
+    if ((!state.fenced_store_publish || actual_time > state.fenced_store_publish) && !input_tie) {
       certificate = candidate;
       return {};
     }
-    if (sample->forwarded_mask)
+    if (sample->forwarded_mask && actual_time < state.fenced_store_publish)
       return failure(rvwmo::CheckStatus::Incomplete,
                      "fenced forwarded load has no certified model-order point after prior stores");
-    if (state.fenced_store_publish == std::numeric_limits<uint64_t>::max())
+    if (std::max(actual_time, state.fenced_store_publish) == std::numeric_limits<uint64_t>::max())
       return failure(rvwmo::CheckStatus::Incomplete, "fenced store leaves no representable load-order witness");
-    uint64_t selected = state.fenced_store_publish + 1;
+    uint64_t selected = std::max(actual_time, state.fenced_store_publish) + 1;
     // A derived sample/retirement tie on a merged producer lacks strict source
     // evidence. Leave room for the public consumer instead of inventing a phase.
     if (selected == retired.source_time) {
@@ -169,12 +175,24 @@ private:
     if (selected > sample->source_time)
       return failure(rvwmo::CheckStatus::Incomplete, "fenced load has no closed stable-writer interval after prior stores");
     for (const auto &store : retained_memory) {
-      if ((store.kind != 1 && store.kind != 2) || store.source_time < actual_time ||
+      if (store.kind != 1 || store.source_time < actual_time ||
           store.source_time > sample->source_time)
         continue;
       if (!ordinary_span(store))
         return failure(rvwmo::CheckStatus::Incomplete, "load-order interval contains unqualified store-byte evidence");
-      if (overlaps(*sample, store))
+      if (!overlaps(*sample, store))
+        continue;
+      // Current-input bypass observes these exact store bytes on this edge.
+      // No other writer, even one writing the same value, may enter the window.
+      bool input_source = store.source_time == actual_time && store.id.hart == retired.id.hart &&
+                          store.id.epoch == retired.id.epoch && store.id.uid < retired.id.uid;
+      for (size_t lane = 0; lane < 8 && input_source; ++lane) {
+        if (!(sample->mask & store.mask & (1u << lane)))
+          continue;
+        input_source = (sample->forwarded_mask & (1u << lane)) && sample->forwarded_writers[lane] &&
+                       *sample->forwarded_writers[lane] == store.id;
+      }
+      if (!input_source)
         return failure(rvwmo::CheckStatus::Incomplete, "load-order interval contains a byte writer transition");
     }
     candidate.selected = selected;
