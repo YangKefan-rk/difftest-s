@@ -71,8 +71,10 @@ public:
       return result;
 
     const bool base_fence = retired.instruction_bytes == 4 && (expanded & 0xf000707f) == 0x000f;
-    if (base_fence && (expanded & (1u << 24)) && (expanded & (1u << 21)))
+    if (base_fence && (expanded & (1u << 24)) && (expanded & (1u << 21))) {
       next.fenced_store_publish = std::max(next.fenced_store_publish, next.latest_store_publish);
+      next.fenced_uid = retired.id.uid;
+    }
     next.last_uid = retired.id.uid;
     harts_[retired.id.hart] = next;
     certificate = candidate;
@@ -85,6 +87,7 @@ private:
     uint64_t last_uid = 0;
     uint64_t latest_store_publish = 0;
     uint64_t fenced_store_publish = 0;
+    uint64_t fenced_uid = 0;
   };
   std::map<uint32_t, HartState> harts_;
 
@@ -151,10 +154,34 @@ private:
                                    actual_time, sample->mask, true, false};
     // A WBUF acceptance can share the load's physical read/forward edge.
     // Derive an interval witness instead of inventing a cross-hart clock phase.
-    const bool input_tie = std::any_of(retained_memory.begin(), retained_memory.end(),
-        [&](const NativeMemoryFact &store) {
-          return store.kind == 1 && store.id.hart == retired.id.hart && store.source_time == actual_time;
-        });
+    const NativeMemoryFact *current_input_writer = nullptr;
+    for (const auto &store : retained_memory) {
+      if (store.kind != 1 || store.id.hart != retired.id.hart || store.source_time != actual_time)
+        continue;
+      if (current_input_writer)
+        return failure(rvwmo::CheckStatus::Incomplete,
+                       "load sample tick has multiple same-hart store-input candidates");
+      current_input_writer = &store;
+    }
+    const bool input_tie = current_input_writer != nullptr;
+    const bool older_input = input_tie && current_input_writer->id.epoch == retired.id.epoch &&
+                             current_input_writer->id.uid < retired.id.uid;
+    const bool overlapping_input = older_input && overlaps(*sample, *current_input_writer);
+    bool exact_forwarded_input = overlapping_input && sample->forwarded_mask == sample->mask &&
+                                 (current_input_writer->mask & sample->mask) == sample->mask;
+    for (size_t lane = 0; lane < 8 && exact_forwarded_input; ++lane)
+      if (sample->mask & (1u << lane))
+        exact_forwarded_input = sample->forwarded_writers[lane] &&
+                                *sample->forwarded_writers[lane] == current_input_writer->id;
+    // A W->R Fence supplies the necessary Store->Load order only for stores
+    // before that Fence. For a disjoint SRAM read, the closed interval below
+    // must also prove its bytes remain stable at the chosen model-order point.
+    const bool fenced_disjoint_input = older_input && !overlapping_input && !sample->forwarded_mask &&
+        current_input_writer->id.uid < state.fenced_uid &&
+        state.fenced_store_publish >= actual_time;
+    if (input_tie && !exact_forwarded_input && !fenced_disjoint_input)
+      return failure(rvwmo::CheckStatus::Incomplete,
+                     "same-hart load/store source tie lacks a fenced stable interval or exact forwarded writer");
     if ((!state.fenced_store_publish || actual_time > state.fenced_store_publish) && !input_tie) {
       certificate = candidate;
       return {};
@@ -184,14 +211,7 @@ private:
         continue;
       // Current-input bypass observes these exact store bytes on this edge.
       // No other writer, even one writing the same value, may enter the window.
-      bool input_source = store.source_time == actual_time && store.id.hart == retired.id.hart &&
-                          store.id.epoch == retired.id.epoch && store.id.uid < retired.id.uid;
-      for (size_t lane = 0; lane < 8 && input_source; ++lane) {
-        if (!(sample->mask & store.mask & (1u << lane)))
-          continue;
-        input_source = (sample->forwarded_mask & (1u << lane)) && sample->forwarded_writers[lane] &&
-                       *sample->forwarded_writers[lane] == store.id;
-      }
+      const bool input_source = exact_forwarded_input && store.id == current_input_writer->id;
       if (!input_source)
         return failure(rvwmo::CheckStatus::Incomplete, "load-order interval contains a byte writer transition");
     }
