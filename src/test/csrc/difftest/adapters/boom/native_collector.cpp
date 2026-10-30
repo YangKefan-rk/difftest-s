@@ -20,6 +20,9 @@ NativeCollector::NativeCollector(NativeCollectorConfiguration configuration)
     : configuration_(configuration), adapter_(configuration.hart, configuration.epoch, configuration.limits) {
   if (!hart_producer_id(configuration.hart) || !configuration.staged_events)
     throw std::invalid_argument("BOOM collector requires a valid hart and nonzero staging limit");
+  if ((configuration.checked_ram_size == 0 && configuration.checked_ram_base != 0) ||
+      configuration.checked_ram_size > std::numeric_limits<uint64_t>::max() - configuration.checked_ram_base)
+    throw std::invalid_argument("BOOM collector requires a representable checked RAM interval");
 }
 
 OperationId NativeCollector::id(const ProbeIdentity &identity) const {
@@ -70,6 +73,16 @@ CaptureResult NativeCollector::capture(const NativeFrame &frame) {
   return {remember_failure(result), static_cast<bool>(result)};
 }
 
+CheckResult NativeCollector::require_checked_ram(uint64_t address, size_t bytes) const {
+  if (!configuration_.checked_ram_size)
+    return {}; // Existing scalar-only fixtures; the host must opt in to RAM bounds.
+  const uint64_t end = configuration_.checked_ram_base + configuration_.checked_ram_size;
+  if (address < configuration_.checked_ram_base || address >= end || bytes > end - address)
+    return {CheckStatus::Unsupported, 0,
+            "BOOM MMIO access lacks independent REF/device and publication evidence"};
+  return {};
+}
+
 CheckResult NativeCollector::capture_frame(const NativeFrame &frame) {
   auto result = capture_allocations(frame);
   if (!result || !(result = capture_attempts(frame)))
@@ -77,6 +90,9 @@ CheckResult NativeCollector::capture_frame(const NativeFrame &frame) {
   for (const auto &store : frame.local_stores) {
     StoreCommit local;
     auto result = convert_store(configuration_.hart, store, capture_source(frame.cycle), local);
+    if (!result)
+      return result;
+    result = require_checked_ram(local.address, local.bytes.size());
     if (!result || !(result = adapter_.commit_store(local)))
       return result;
   }
@@ -89,12 +105,20 @@ CheckResult NativeCollector::capture_frame(const NativeFrame &frame) {
     StorePublication converted;
     auto result = convert_single_store_publication(configuration_.hart, publication.probe, publication.source,
         publication.transaction_id, publication.evidence, publication.single_writer_complete, converted);
+    if (!result)
+      return result;
+    result = require_checked_ram(converted.address, converted.bytes.size());
     if (!result || !(result = adapter_.publish_store(converted)))
       return result;
   }
   for (const auto &publication : frame.merged_publications) {
     if (publication.source.position.cycle > frame.cycle)
       return invalid("BOOM merged publication claims a future source cycle");
+    if (!publication.bytes.empty()) {
+      auto range = require_checked_ram(publication.address, publication.bytes.size());
+      if (!range)
+        return range;
+    }
     auto result = adapter_.publish_merged_stores(publication);
     if (!result)
       return result;
@@ -227,7 +251,15 @@ CheckResult NativeCollector::capture_retirements(const NativeFrame &frame) {
       auto result = merge_retirement(configuration_.hart, core, allocation->second, load,
                                      configuration_.limits.ldq_slots, configuration_.limits.stq_slots,
                                      capture_source(frame.cycle), retirement);
-      if (!result || !(result = adapter_.retire(retirement)))
+      if (!result)
+        return result;
+      if (retirement.load_address && retirement.load_log2_size && *retirement.load_log2_size <= 3) {
+        result = require_checked_ram(*retirement.load_address, size_t{1} << *retirement.load_log2_size);
+        if (!result)
+          return result;
+      }
+      result = adapter_.retire(retirement);
+      if (!result)
         return result;
     }
     allocations_.erase(allocation);
