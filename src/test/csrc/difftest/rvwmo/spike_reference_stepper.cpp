@@ -1,4 +1,5 @@
 #include "spike_reference_stepper.h"
+#include "dependency.h"
 
 #include <algorithm>
 #include <cstring>
@@ -224,6 +225,13 @@ ReferenceStepResult SpikeReferenceStepper::step(const InstructionRetireEvent &re
     }
   }
 
+  FloatingPointInstruction floating;
+  const auto decoded_fp = decode_floating_point_instruction(retirement.instruction.instruction, floating);
+  if (!decoded_fp) {
+    result.check = decoded_fp;
+    return result;
+  }
+
   difftest_ref_state_v1 before{};
   before.abi_version = DIFFTEST_REF_STATE_ABI_VERSION_1;
   before.struct_size = sizeof(before);
@@ -321,6 +329,16 @@ ReferenceStepResult SpikeReferenceStepper::step(const InstructionRetireEvent &re
   if (state.wrote_integer && after.gpr[state.destination] != state.value) {
     return fail_after_step(invalid("Spike retirement observer differs from its post-step integer register state"));
   }
+  if (floating.recognized) {
+    if (state.wrote_integer != floating.writes_integer ||
+        (state.wrote_integer && state.destination != floating.destination))
+      return fail_after_step(invalid("Spike floating-point instruction write class differs from its decoded effects"));
+    if (floating.writes_floating_point)
+      result.floating_point_write = ReferenceFloatingPointWrite{floating.destination, after.fpr[floating.destination]};
+  }
+  if (after.fcsr > UINT64_C(0xff))
+    return fail_after_step(invalid("Spike exposed FCSR bits outside its architectural width"));
+  result.fcsr = static_cast<uint8_t>(after.fcsr);
   if (difftest_ref_pending_store_traces_v1(state.handle, &pending_stores) != DIFFTEST_REF_API_OK) {
     return fail_after_step(incomplete("Spike could not report post-step reference store traces"));
   }
