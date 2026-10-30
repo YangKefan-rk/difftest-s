@@ -482,21 +482,44 @@ CheckResult CheckerEventConsumer::consume_retire(const InstructionRetireEvent &e
   if (allocation->second.length == 2) {
     const unsigned quadrant = instruction.instruction & 3;
     const unsigned funct3 = (instruction.instruction >> 13) & 7;
-    if ((quadrant == 0 || quadrant == 2) && (funct3 == 1 || funct3 == 5))
-      return remember_failure(unsupported("floating compressed memory instruction needs a wider REF adapter"));
+    const bool fp_load = (quadrant == 0 || quadrant == 2) && funct3 == 1;
+    const bool fp_store = (quadrant == 0 || quadrant == 2) && funct3 == 5;
     const bool compressed_load = (quadrant == 0 || quadrant == 2) && (funct3 == 2 || funct3 == 3);
     const bool compressed_store = (quadrant == 0 || quadrant == 2) && (funct3 == 6 || funct3 == 7);
-    if ((compressed_load && (!has_load || has_store)) || (compressed_store && (!has_store || has_load)))
-      return remember_failure(incomplete("compressed scalar load/store lacks its matching memory event"));
-    if (!compressed_load && !compressed_store && !instruction.memory.empty())
+    if ((fp_load || compressed_load) && (!has_load || has_store || instruction.memory.size() != 1))
+      return remember_failure(incomplete("compressed load lacks one matching memory effect"));
+    if ((fp_store || compressed_store) && (!has_store || has_load || instruction.memory.size() != 1))
+      return remember_failure(incomplete("compressed store lacks one matching memory effect"));
+    if ((fp_load || fp_store) && instruction.memory.front().byte_mask.size() != 8)
+      return remember_failure(invalid("RV64 compressed FP memory effect is not eight bytes"));
+    if ((fp_load || fp_store) && std::any_of(instruction.memory.front().byte_mask.begin(),
+          instruction.memory.front().byte_mask.end(), [](uint8_t byte) { return byte != 1; }))
+      return remember_failure(unsupported("compressed FP scalar memory effect has a sparse byte mask"));
+    if (!fp_load && !fp_store && !compressed_load && !compressed_store && !instruction.memory.empty())
       return remember_failure(invalid("compressed non-memory opcode carries a memory effect"));
   } else {
     const uint32_t opcode = instruction.instruction & 0x7f;
-    if (opcode == 0x07 || opcode == 0x27 || opcode == 0x2f)
-      return remember_failure(unsupported("floating/vector or atomic memory opcode needs a richer consumer"));
+    if (opcode == 0x2f)
+      return remember_failure(unsupported("atomic memory opcode needs its lifecycle checker"));
+    const bool fp_load = opcode == 0x07;
+    const bool fp_store = opcode == 0x27;
+    if (fp_load || fp_store) {
+      const unsigned width_encoding = (instruction.instruction >> 12) & 7;
+      if (width_encoding != 2 && width_encoding != 3)
+        return remember_failure(unsupported("vector or unsupported FP memory width lacks a scalar model"));
+      if (instruction.memory.size() != 1 || (fp_load && (!has_load || has_store)) ||
+          (fp_store && (!has_store || has_load)))
+        return remember_failure(incomplete("FP load/store retirement lacks one matching memory effect"));
+      const auto expected_width = size_t{1} << width_encoding;
+      if (instruction.memory.front().byte_mask.size() != expected_width)
+        return remember_failure(invalid("FP load/store memory width differs from instruction encoding"));
+      if (std::any_of(instruction.memory.front().byte_mask.begin(),
+            instruction.memory.front().byte_mask.end(), [](uint8_t byte) { return byte != 1; }))
+        return remember_failure(unsupported("FP scalar memory effect has a sparse byte mask"));
+    }
     if ((opcode == 0x03 && (!has_load || has_store)) || (opcode == 0x23 && (!has_store || has_load)))
       return remember_failure(incomplete("scalar load/store retirement lacks its matching memory event"));
-    if (opcode != 0x03 && opcode != 0x23 && !instruction.memory.empty())
+    if (opcode != 0x03 && opcode != 0x23 && !fp_load && !fp_store && !instruction.memory.empty())
       return remember_failure(invalid("non-load/store opcode carries a memory effect"));
     if (opcode == 0x0f && ((instruction.instruction >> 12) & 7) == 2)
       return remember_failure(unsupported("cache-block operation is not modeled by this consumer"));
