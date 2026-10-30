@@ -1,4 +1,5 @@
 #include "boom_event_adapter.h"
+#include "readonly_hartid.h"
 #include "../../rvwmo/checker_event_consumer.h"
 #include "../../rvwmo/stream.h"
 #include "../../rvwmo/producer_ids.h"
@@ -168,7 +169,8 @@ RetirementResultCoverage retirement_coverage(uint32_t instruction, IntegerDestin
   if (floating_instruction)
     return RetirementResultCoverage::FloatingFlagsNeedComparator;
   if (csr_instruction(instruction))
-    return RetirementResultCoverage::CsrStateNeedsComparator;
+    return is_observable_readonly_hartid(instruction) ? RetirementResultCoverage::Complete
+                                                   : RetirementResultCoverage::CsrStateNeedsComparator;
   // A retired WFI has no scalar register or CSR write. Trap/interrupt handling
   // and proof of native completion remain separate lifecycle obligations.
   if (instruction == 0x10500073)
