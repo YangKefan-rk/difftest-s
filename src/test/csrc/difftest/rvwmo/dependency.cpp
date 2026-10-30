@@ -464,7 +464,10 @@ CheckResult decode_dependencies(uint32_t inst, DependencyMetadata &m) {
         break;
       if (((inst >> 12) & 7) != 0)
         return {CheckStatus::Unsupported, 0, "non-data fence requires adapter metadata"};
-      if ((inst >> 28) != 0)
+      // FENCE.TSO's R/W predecessor/successor masks do not require W->R.
+      if (inst == 0x8330000f)
+        m.fence_tso = true;
+      else if ((inst >> 28) != 0)
         return {CheckStatus::Unsupported, 0, "non-base fence requires adapter metadata"};
       m.fence = true;
       m.fence_predecessor = (inst >> 24) & 15;

@@ -358,8 +358,12 @@ CheckResult PpoChecker::retire_instruction(const RetiredInstruction &instruction
       predecessors.include(hart.reads);
     if (metadata.fence_predecessor & 1)
       predecessors.include(hart.writes);
-    if (metadata.fence_successor & 2)
-      hart.fence_read.include(predecessors);
+    if (metadata.fence_successor & 2) {
+      if (metadata.fence_tso)
+        hart.fence_read.include(hart.reads);
+      else
+        hart.fence_read.include(predecessors);
+    }
     if (metadata.fence_successor & 1)
       hart.fence_write.include(predecessors);
   }
