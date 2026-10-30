@@ -143,6 +143,22 @@ CaptureResult NativeAdapter::sample_load(const CacheLoadResult &load) {
   return finish_input(std::move(result));
 }
 
+CaptureResult NativeAdapter::atomic(const rvwmo::AtomicLifecycleEvent &record,
+                                        const rvwmo::SourcePosition &source) {
+  if (!failure_)
+    return {failure_, false};
+  auto token = tokens_by_uid_.find(record.id.uid);
+  if (token == tokens_by_uid_.end())
+    return {remember(invalid("Rocket atomic lifecycle has no live instruction")), false};
+  auto instruction = instructions_.find(token->second);
+  if (instruction == instructions_.end() || instruction->second.semantic_retire_done)
+    return {remember(invalid("Rocket atomic lifecycle has no live instruction")), false};
+  auto result = emitter_.atomic(token->second, record, source);
+  if (!result)
+    return finish_input(std::move(result));
+  return finish_input({});
+}
+
 CaptureResult NativeAdapter::accept_store(const CacheStoreValue &store) {
   if (!failure_)
     return {failure_, false};

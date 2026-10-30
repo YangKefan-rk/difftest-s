@@ -69,7 +69,8 @@ EventEmitter::MemoryKind EventEmitter::memory_kind(uint32_t instruction, uint8_t
                      ? MemoryKind::Load : MemoryKind::Unsupported;
   case 0x27: return ((instruction >> 12) & 7) == 2 || ((instruction >> 12) & 7) == 3
                      ? MemoryKind::Store : MemoryKind::Unsupported;
-  case 0x2f: return MemoryKind::Unsupported;
+  case 0x2f: return ((instruction >> 12) & 7) == 2 || ((instruction >> 12) & 7) == 3
+                     ? MemoryKind::Atomic : MemoryKind::Unsupported;
   case 0x0f: return ((instruction >> 12) & 7) == 2 ? MemoryKind::Unsupported : MemoryKind::None;
   case 0x73: {
     const auto funct3 = (instruction >> 12) & 7;
@@ -96,6 +97,8 @@ size_t EventEmitter::memory_width(uint32_t instruction, uint8_t length) {
   const auto function = (instruction >> 12) & 7;
   if (opcode == 0x03 || opcode == 0x23 || opcode == 0x07 || opcode == 0x27)
     return size_t{1} << (function & 3);
+  if (opcode == 0x2f && (function == 2 || function == 3))
+    return size_t{1} << function;
   return 0;
 }
 
@@ -193,6 +196,80 @@ CheckResult EventEmitter::sample_load(const LoadObservation &load) {
   return {};
 }
 
+CheckResult EventEmitter::atomic(uint64_t token, const AtomicLifecycleEvent &record,
+                                    const SourcePosition &source) {
+  auto result = validate_source(source);
+  if (!result)
+    return result;
+  auto found = instructions_.find(token);
+  if (found == instructions_.end() || found->second.retired)
+    return reject(CheckStatus::Invalid, "Rocket atomic lifecycle has no live instruction");
+  auto &instruction = found->second;
+  if (instruction.kind != MemoryKind::Atomic)
+    return reject(CheckStatus::Invalid, "Rocket atomic lifecycle for a non-atomic instruction");
+  if (record.id != instruction.id || record.id.subaccess != 0)
+    return reject(CheckStatus::Invalid, "Rocket atomic lifecycle identity differs from its instruction");
+  const auto allocation_order = compare_source_position(configuration_.producer, instruction.allocation.source,
+                                                        configuration_.producer, source);
+  if (allocation_order == SourceOrder::After || allocation_order == SourceOrder::Equal)
+    return reject(CheckStatus::Invalid, "Rocket atomic lifecycle does not follow its allocation");
+  if (allocation_order == SourceOrder::Unordered)
+    return reject(CheckStatus::Incomplete, "Rocket allocation and atomic lifecycle are unordered in one cycle");
+  auto &atomic = instruction.atomic;
+  switch (record.phase) {
+  case AtomicObservationPhase::Begin:
+    if (atomic.begun)
+      return reject(CheckStatus::Invalid, "Rocket duplicate atomic Begin");
+    atomic = {};
+    atomic.begun = true;
+    atomic.attempt = record.attempt;
+    atomic.lr = record.fuop == 2 || record.fuop == 3;
+    atomic.sc = record.fuop == 6 || record.fuop == 7;
+    atomic.rmw = !atomic.lr && !atomic.sc;
+    break;
+  case AtomicObservationPhase::Request:
+    if (!atomic.begun)
+      return reject(CheckStatus::Invalid, "Rocket atomic Request lacks Begin");
+    atomic.address = record.address;
+    atomic.mask = record.mask;
+    atomic.attempt = record.attempt;
+    atomic.request = true;
+    atomic.read = false;
+    atomic.write = false;
+    atomic.has_old = false;
+    break;
+  case AtomicObservationPhase::ReadEffect:
+    if (!atomic.request)
+      return reject(CheckStatus::Invalid, "Rocket atomic ReadEffect lacks Request");
+    atomic.read = true;
+    atomic.has_old = true;
+    atomic.old_data = record.data;
+    break;
+  case AtomicObservationPhase::WriteEffect:
+    if (!atomic.request)
+      return reject(CheckStatus::Invalid, "Rocket atomic WriteEffect lacks Request");
+    atomic.write = true;
+    break;
+  case AtomicObservationPhase::Response:
+    atomic.response = true;
+    atomic.success = record.success;
+    break;
+  case AtomicObservationPhase::Replay:
+    atomic.request = false;
+    atomic.read = false;
+    atomic.write = false;
+    atomic.has_old = false;
+    break;
+  case AtomicObservationPhase::Finish:
+    break;
+  case AtomicObservationPhase::Cancel:
+    atomic = {};
+    break;
+  }
+  append(RuntimeEventKind::AtomicLifecycle, record, source);
+  return {};
+}
+
 CheckResult EventEmitter::cancel_load(uint64_t token, uint32_t attempt) {
   if (!failure_)
     return failure_;
@@ -281,6 +358,47 @@ CheckResult EventEmitter::retire(uint64_t token, SourcePosition source) {
   retired.pc = allocation.pc;
   retired.instruction = allocation.instruction;
   InstructionRetireEvent retirement{retired, {}};
+  if (instruction.kind == MemoryKind::Atomic) {
+    const auto &atomic = instruction.atomic;
+    if (!atomic.begun || !atomic.request || !atomic.response)
+      return reject(CheckStatus::Incomplete, "Rocket atomic retirement lacks a complete lifecycle");
+    if (!atomic.lr && !atomic.sc && (!atomic.read || !atomic.write))
+      return reject(CheckStatus::Incomplete, "Rocket AMO retirement lacks its read/write effects");
+    if (atomic.lr && !atomic.read)
+      return reject(CheckStatus::Incomplete, "Rocket LR retirement lacks its read effect");
+    if (atomic.sc && atomic.success && !atomic.write)
+      return reject(CheckStatus::Incomplete, "Rocket successful SC retirement lacks its write effect");
+    if (atomic.sc && !atomic.success && atomic.write)
+      return reject(CheckStatus::Invalid, "Rocket failed SC retirement carries a write effect");
+    MemoryOperation operation;
+    operation.id = instruction.id;
+    operation.attempt = atomic.attempt;
+    operation.address = atomic.address;
+    operation.byte_mask.assign(8, 0);
+    for (unsigned byte = 0; byte < 8; ++byte)
+      operation.byte_mask[byte] = (atomic.mask >> byte) & 1;
+    if (atomic.lr) {
+      operation.load = true;
+      operation.lr = true;
+    } else if (atomic.sc) {
+      operation.sc = true;
+      operation.store = atomic.success;
+    } else {
+      operation.atomic = true;
+      operation.load = true;
+      operation.store = true;
+    }
+    if (operation.load) {
+      if (!atomic.has_old)
+        return reject(CheckStatus::Incomplete, "Rocket atomic retirement lacks its lifecycle read effect");
+      std::vector<uint8_t> actual(8);
+      for (unsigned byte = 0; byte < 8; ++byte)
+        actual[byte] = static_cast<uint8_t>(atomic.old_data >> (8 * byte));
+      retirement.loads.push_back({instruction.id, atomic.attempt, actual});
+    }
+    retirement.instruction.failed_sc = atomic.sc && !atomic.success;
+    retirement.instruction.memory.push_back(operation);
+  }
   if (instruction.load) {
     const auto &load = *instruction.load;
     MemoryOperation operation;
