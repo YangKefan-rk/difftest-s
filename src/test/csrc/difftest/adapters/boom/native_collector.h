@@ -62,6 +62,10 @@ struct NativeCollectorConfiguration {
   uint64_t initial_cycle = 0;
   AdapterLimits limits;
   size_t staged_events = 65536;
+  // Zero size preserves existing scalar-only fixtures; production entrants
+  // must supply the bounds of their independently initialized GlobalMem.
+  uint64_t checked_ram_base = 0;
+  uint64_t checked_ram_size = 0;
 };
 struct CollectedObservations {
   EventBatch batch;
@@ -108,6 +112,7 @@ private:
   CheckResult capture_terminations(const NativeFrame &frame);
   CheckResult collect_adapter_output();
   CheckResult validate_attempt(const NativeAttempt &attempt) const;
+  CheckResult require_checked_ram(uint64_t address, size_t bytes) const;
   OperationId id(const ProbeIdentity &identity) const;
   CheckResult remember_failure(CheckResult result);
 };
