@@ -160,6 +160,13 @@ object Gateway {
     config.check()
   }
 
+  def requireSourcePrefixTransport(): Unit = {
+    require(
+      !config.needEndpoint && !config.isNonBlock && !config.isFPGA && !config.isGSIM,
+      "source-prefix certification requires direct synchronous DPI transport",
+    )
+  }
+
   def apply[T <: DifftestBundle](gen: T, delay: Int): T = {
     val bundle = WireInit(0.U.asTypeOf(gen))
     if (!config.traceLoad) {

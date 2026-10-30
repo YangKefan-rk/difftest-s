@@ -27,6 +27,7 @@
 #include <vector>
 #if NUM_CORES > 1
 #include "rvwmo/runtime.h"
+#include "rvwmo/source_boundary.h"
 #endif
 #if defined(CONFIG_DIFFTEST_SQUASH) && !defined(CONFIG_PLATFORM_FPGA)
 #include "svdpi.h"
@@ -184,6 +185,11 @@ int difftest_init() {
   // A fuzzing process may initialize several independent DUT runs.
   multicore_session = std::make_unique<rvwmo::Runtime>(NUM_CORES);
   native_exit_codes.assign(NUM_CORES, STATE_RUNNING);
+#ifdef CONFIG_DIFFTEST_SOURCEPREFIXEVENT
+  rvwmo::source_boundary().reset(NUM_CORES, CONFIG_DIFF_SOURCE_PREFIX_WIDTH);
+#else
+  rvwmo::source_boundary().reset(NUM_CORES, 0);
+#endif
 #endif
 #ifdef CONFIG_DIFFTEST_PERFCNT
   difftest_perfcnt_init();

@@ -38,6 +38,13 @@ trait DifftestWithIndex {
   val index = UInt(8.W)
 }
 
+// Transport identity is assigned after the producer finishes driving its bundle.
+trait DifftestSourceEvent { this: DifftestBundle =>
+  val sourceId = UInt(16.W)
+  val sourceSequence = UInt(64.W)
+  def producerKind: Int
+}
+
 trait DifftestWithStamp {
   val stamp = UInt(16.W)
 }
@@ -241,7 +248,12 @@ class DiffArchEvent extends ArchEvent with DifftestBundle {
   override val desiredCppName: String = "event"
 }
 
-class DiffInstrCommit(nPhyRegs: Int = 32) extends InstrCommit(nPhyRegs) with DifftestBundle with DifftestWithIndex {
+class DiffInstrCommit(nPhyRegs: Int = 32)
+  extends InstrCommit(nPhyRegs)
+  with DifftestBundle
+  with DifftestWithIndex
+  with DifftestSourceEvent {
+  override def producerKind: Int = 1
   override val desiredCppName: String = "commit"
 
   private val maxNumFused = 255
@@ -377,7 +389,12 @@ class DiffFpCSRState extends FpCSRState with DifftestBundle {
   override val supportsDelta: Boolean = true
 }
 
-class DiffSbufferEvent extends SbufferEvent with DifftestBundle with DifftestWithIndex {
+class DiffSbufferEvent
+  extends SbufferEvent
+  with DifftestBundle
+  with DifftestWithIndex
+  with DifftestSourceEvent {
+  override def producerKind: Int = 7
   override val desiredCppName: String = "sbuffer"
   override val squashGroup: Seq[String] = Seq("GOLDENMEM")
 }
@@ -387,7 +404,12 @@ class DiffUncacheMMStoreEvent extends UncacheMMStoreEvent with DifftestBundle wi
   override val squashGroup: Seq[String] = Seq("GOLDENMEM")
 }
 
-class DiffStoreEvent extends StoreEvent with DifftestBundle with DifftestWithIndex {
+class DiffStoreEvent
+  extends StoreEvent
+  with DifftestBundle
+  with DifftestWithIndex
+  with DifftestSourceEvent {
+  override def producerKind: Int = 5
   override val desiredCppName: String = "store"
 }
 
@@ -399,12 +421,32 @@ class DiffMemoryTimeEvent extends MemoryTimeEvent with DifftestBundle {
   override val desiredCppName: String = "memory_time"
 }
 
-class DiffStoreIdentityEvent extends StoreIdentityEvent with DifftestBundle with DifftestWithIndex {
+class DiffSourceResetEvent extends SourceResetEvent with DifftestBundle {
+  override val desiredCppName: String = "source_reset"
+  override val squashGroup: Seq[String] = Seq()
+}
+
+class DiffSourcePrefixEvent extends SourcePrefixEvent with DifftestBundle with DifftestWithIndex {
+  override val desiredCppName: String = "source_prefix"
+  override val squashGroup: Seq[String] = Seq()
+}
+
+class DiffStoreIdentityEvent
+  extends StoreIdentityEvent
+  with DifftestBundle
+  with DifftestWithIndex
+  with DifftestSourceEvent {
+  override def producerKind: Int = 3
   override val desiredCppName: String = "store_identity"
   override val squashGroup: Seq[String] = Seq()
 }
 
-class DiffStoreLocalEvent extends StoreLocalEvent with DifftestBundle with DifftestWithIndex {
+class DiffStoreLocalEvent
+  extends StoreLocalEvent
+  with DifftestBundle
+  with DifftestWithIndex
+  with DifftestSourceEvent {
+  override def producerKind: Int = 4
   override val desiredCppName: String = "store_local"
   override val squashGroup: Seq[String] = Seq()
 }
@@ -425,7 +467,12 @@ class DiffLoadEventQueue extends DiffLoadEvent with DifftestWithStamp with DiffT
   override val squashQueue: Boolean = true
 }
 
-class DiffLoadSnapshotEvent extends LoadSnapshotEvent with DifftestBundle with DifftestWithIndex {
+class DiffLoadSnapshotEvent
+  extends LoadSnapshotEvent
+  with DifftestBundle
+  with DifftestWithIndex
+  with DifftestSourceEvent {
+  override def producerKind: Int = 6
   override val desiredCppName: String = "load_snapshot"
   override val squashGroup: Seq[String] = Seq()
 }
@@ -435,7 +482,12 @@ class DiffAtomicEvent extends AtomicEvent with DifftestBundle {
   override val squashGroup: Seq[String] = Seq("GOLDENMEM")
 }
 
-class DiffAtomicMemoryEvent extends AtomicMemoryEvent with DifftestBundle with DifftestWithIndex {
+class DiffAtomicMemoryEvent
+  extends AtomicMemoryEvent
+  with DifftestBundle
+  with DifftestWithIndex
+  with DifftestSourceEvent {
+  override def producerKind: Int = 8
   override val desiredCppName: String = "atomic_memory"
   override val squashGroup: Seq[String] = Seq()
 }
@@ -454,7 +506,12 @@ class DiffL1TLBEvent extends L1TLBEvent with DifftestBundle with DifftestWithInd
   override def supportsSquashBase: Bool = true.B
 }
 
-class DiffTlbEvent extends TlbEvent with DifftestBundle with DifftestWithIndex {
+class DiffTlbEvent
+  extends TlbEvent
+  with DifftestBundle
+  with DifftestWithIndex
+  with DifftestSourceEvent {
+  override def producerKind: Int = 2
   override val desiredCppName: String = "tlb"
   override val squashGroup: Seq[String] = Seq()
 }
@@ -565,16 +622,99 @@ object DifftestModule {
     delay: Int = 0,
   ): T = {
     val difftest: T = Wire(gen)
-    if (enabled) {
-      Gateway(gen, delay) := difftest
-    }
     if (dontCare) {
       difftest := DontCare
       difftest.bits.getValidOption.foreach(_ := false.B)
     }
+    difftest match {
+      case observed: DifftestSourceEvent =>
+        observed.sourceId := 0.U
+        observed.sourceSequence := 0.U
+      case _ =>
+    }
+    if (enabled) {
+      Gateway(gen, delay) := forwardSourceEvent(difftest, delay)
+    }
     dontTouch(difftest)
     interfaces.append((gen, delay))
     difftest
+  }
+
+  private def forwardSourceEvent[T <: DifftestBundle](producer: T, delay: Int): T = {
+    val forwarded = Wire(chiselTypeOf(producer))
+    forwarded := producer
+    forwarded match {
+      case observed: DifftestSourceEvent =>
+        // Callers can bulk-connect the returned producer wire later. Reserved
+        // metadata belongs to this final copy, beyond those caller assignments.
+        observed.sourceId := 0.U
+        observed.sourceSequence := 0.U
+        ObservationClock.sourceContract.foreach { contract =>
+          Gateway.requireSourcePrefixTransport()
+          val sourceId = contract.allocateSourceId()
+          val stableHartId = contract.hartId()
+          val produced = RegInit(0.U(64.W))
+          when(producer.bits.getValid) {
+            assert(producer.coreid === stableHartId, "source event hart ID differs from its integration scope")
+            assert(!produced.andR, "source event sequence exhausted")
+            produced := produced + 1.U
+          }
+          // DelayReg deliberately passes coreid through without delaying it.
+          // Keep that routing stable even when an invalid native lane is DontCare.
+          forwarded.coreid := stableHartId
+          observed.sourceId := sourceId.U
+          observed.sourceSequence := produced + 1.U
+          emitSourcePrefix(producer, observed.producerKind, sourceId, produced, delay, contract)
+        }
+      case _ =>
+    }
+    forwarded
+  }
+
+  private def emitSourcePrefix(
+    producer: DifftestBundle,
+    kind: Int,
+    sourceId: Int,
+    produced: UInt,
+    delay: Int,
+    contract: ObservationClock.SourceContract,
+  ): Unit = {
+    val sampleDelayEdges = if (kind == 6) 2 else 0
+    require(sampleDelayEdges <= contract.maxSampleDelayEdges, "producer exceeds the integration's source-delay contract")
+    val cycle = ObservationClock()
+    var oldestCycle = cycle
+    var historyValid = true.B
+    for (_ <- 0 until sampleDelayEdges) {
+      oldestCycle = RegNext(oldestCycle, 0.U(64.W))
+      historyValid = RegNext(historyValid, false.B)
+    }
+    val ready = historyValid && oldestCycle =/= 0.U
+    val sequence = RegInit(0.U(64.W))
+    when(ready) {
+      assert(!sequence.andR, "source prefix sequence exhausted")
+      sequence := sequence + 1.U
+    }
+    producer.elements.get("timestamp").foreach { timestamp =>
+      when(producer.bits.getValid && ready) {
+        assert(timestamp.asUInt >= oldestCycle, "event exceeded its declared source delay")
+        assert(timestamp.asUInt <= cycle, "event timestamp is ahead of its source clock")
+      }
+    }
+    val prefix = apply(new DiffSourcePrefixEvent, delay = delay)
+    prefix.coreid := contract.hartId()
+    prefix.index := sourceId.U
+    prefix.valid := ready
+    prefix.producerKind := kind.U
+    // The ordinal is stable even when the caller's native index is DontCare.
+    prefix.producerLane := sourceId.U
+    prefix.contract := 1.U
+    prefix.delayEdges := sampleDelayEdges.U
+    prefix.sourceCycle := cycle
+    prefix.closedThrough := oldestCycle - 1.U
+    // This counter excludes the current edge. Every event covered by the
+    // strictly older prefix was emitted before it, including delayed samples.
+    prefix.producedCount := produced
+    prefix.sequence := sequence + 1.U
   }
 
   def get_current_interfaces(): Seq[(DifftestBundle, Int)] = interfaces.toSeq

@@ -209,7 +209,24 @@ class DPIC[T <: DifftestBundle](gen: T, config: GatewayConfig) extends DPICBase(
              |  ${Query.writeInvoke(gen)}
              |#endif // CONFIG_DIFFTEST_QUERY
              |""".stripMargin)
-    packetDecl ++ validAssign ++ body ++ query
+    sourceBoundaryCallback ++ packetDecl ++ validAssign ++ body ++ query
+  }
+
+  private def sourceBoundaryCallback: Seq[String] = gen match {
+    case _: DiffSourceResetEvent =>
+      Seq("difftest_rvwmo_source_reset(io_coreid, io_asserted, io_sourceCycle, io_sequence);")
+    case _: DiffSourcePrefixEvent =>
+      Seq(
+        "difftest_rvwmo_source_prefix(io_coreid, io_index, io_producerKind, io_producerLane, " +
+          "io_contract, io_delayEdges, io_sourceCycle, io_closedThrough, io_producedCount, io_sequence);"
+      )
+    case observed: DifftestSourceEvent =>
+      val timestamp = if (gen.elements.contains("timestamp")) "io_timestamp" else "UINT64_MAX"
+      Seq(
+        s"difftest_rvwmo_source_event(io_coreid, io_sourceId, ${observed.producerKind}, " +
+          s"static_cast<uint8_t>(io_sourceId), io_sourceSequence, $timestamp);"
+      )
+    case _ => Seq.empty
   }
 
   createCppExtModule(desiredName, cppExtModule, Some("\"difftest-dpic.h\""))
@@ -392,6 +409,7 @@ object DPIC {
     interfaceCpp += ""
     interfaceCpp += "#include <cstdint>"
     interfaceCpp += "#include \"diffstate.h\""
+    interfaceCpp += "#include \"rvwmo/source_boundary.h\""
     interfaceCpp += "#if defined(CONFIG_DIFFTEST_BATCH) && !defined(CONFIG_PLATFORM_FPGA)"
     interfaceCpp += "#include \"svdpi.h\""
     interfaceCpp += "#endif // CONFIG_DIFFTEST_BATCH && !CONFIG_PLATFORM_FPGA"

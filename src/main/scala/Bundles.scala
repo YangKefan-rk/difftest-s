@@ -269,6 +269,25 @@ class MemoryTimeEvent extends DifftestBaseBundle {
   val timestamp = UInt(64.W)
 }
 
+// Sampled in an always-on integration domain, including inactive harts.
+class SourceResetEvent extends DifftestBaseBundle {
+  val asserted = Bool()
+  val sourceCycle = UInt(64.W)
+  val sequence = UInt(64.W)
+}
+
+// A producer-clock fence. producedCount excludes the edge emitting this fence.
+class SourcePrefixEvent extends DifftestBaseBundle with HasValid {
+  val producerKind = UInt(8.W)
+  val producerLane = UInt(8.W)
+  val contract = UInt(8.W)
+  val delayEdges = UInt(8.W)
+  val sourceCycle = UInt(64.W)
+  val closedThrough = UInt(64.W)
+  val producedCount = UInt(64.W)
+  val sequence = UInt(64.W)
+}
+
 class StoreIdentityEvent extends DifftestBaseBundle with HasValid {
   val timestamp = UInt(64.W)
   val storeUid = UInt(64.W)
