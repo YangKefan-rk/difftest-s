@@ -142,6 +142,24 @@ CheckResult HostSession::validate_batch(const EventBatch &batch) const {
       return invalid("event arrived after its source was declared drained");
     if (event.kind == RuntimeEventKind::StorePublish && event.producer_id < kMemoryFabricProducerBase)
       return invalid("store publication is not on a registered fabric source channel");
+    // This session models initialized RAM only. Device writes require a
+    // separate observed MMIO protocol; feeding them to LocalMem/GlobalMem or
+    // stepping Spike without its device is not a valid read-value check.
+    if (event.kind == RuntimeEventKind::LocalStore) {
+      const auto &store = std::get<LocalStoreEvent>(event.payload);
+      if (!store.bytes.empty() && !memory_.contains(store.address, store.bytes.size()))
+        return {CheckStatus::Unsupported, 0, "local store targets MMIO or uninitialized reference RAM"};
+    }
+    if (event.kind == RuntimeEventKind::InstructionRetire) {
+      for (const auto &access : std::get<InstructionRetireEvent>(event.payload).instruction.memory)
+        if (!access.byte_mask.empty() && !memory_.contains(access.address, access.byte_mask.size()))
+          return {CheckStatus::Unsupported, 0, "retired memory access targets MMIO or uninitialized reference RAM"};
+    }
+    if (event.kind == RuntimeEventKind::StorePublish) {
+      const auto &store = std::get<StorePublishEvent>(event.payload);
+      if (!store.bytes.empty() && !memory_.contains(store.address, store.bytes.size()))
+        return {CheckStatus::Unsupported, 0, "publication targets MMIO or uninitialized reference RAM"};
+    }
     for (const uint32_t hart : event_harts(event)) {
       if (!registered_hart(hart))
         return invalid("host event names a hart outside the fixed reference roster");
