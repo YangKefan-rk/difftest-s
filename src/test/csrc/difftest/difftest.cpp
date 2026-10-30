@@ -228,7 +228,8 @@ int difftest_state() {
     const auto result = multicore_runtime().finish();
     if (result.status == rvwmo::CheckStatus::Pending) return -1;
     if (runtime_error(result, "all-hart finalization")) return STATE_ABORT;
-    Info("RVWMO scalar PPO/read-value checks passed for all participating harts\n");
+    if (multicore_runtime().print_final_statistics())
+      Info("RVWMO scalar PPO/read-value checks passed for all participating harts\n");
     return STATE_GOODTRAP;
   }
 #endif
@@ -657,7 +658,14 @@ inline int Difftest::check_all() {
     return 1;
   }
 
-  if ((!access_fault_skipped && proxy->compare(dut)) || pc_mismatch || load_mismatch
+  const bool arch_compared = !access_fault_skipped;
+  const bool arch_mismatch = arch_compared && proxy->compare(dut);
+#if NUM_CORES > 1
+  if (arch_compared && !arch_mismatch && num_commit &&
+      runtime_error(multicore_runtime().note_arch_compare(id, num_commit), "independent architecture comparison"))
+    return 1;
+#endif
+  if (arch_mismatch || pc_mismatch || load_mismatch
 #ifdef CONFIG_DIFFTEST_NONREGINTERRUPTPENDINGEVENT
       || interrupt_mismatch || csr_snapshot_mismatch
 #endif
@@ -978,6 +986,9 @@ int Difftest::do_instr_commit(int i) {
     } else
 #endif
     proxy->ref_exec(1);
+#if NUM_CORES > 1
+    if (runtime_error(multicore_runtime().note_reference_step(id), "independent REF execution")) return 1;
+#endif
 #if NUM_CORES > 1 && defined(CONFIG_DIFFTEST_TLBEVENT) && !defined(CONFIG_DIFFTEST_SQUASH)
     if (tlb_mismatch) {
       result = 1;

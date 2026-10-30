@@ -2,6 +2,7 @@
 #include "dependency.h"
 #include "globalmem.h"
 #include <algorithm>
+#include <cstdio>
 #include <limits>
 #include <sstream>
 #include <utility>
@@ -120,6 +121,7 @@ CheckResult Runtime::unsupported(const std::string &reason) {
 }
 void Runtime::timestamp(uint64_t cycle) {
   latest_cycle_ = std::max(latest_cycle_, cycle);
+  last_effect_cycle_ = std::max(last_effect_cycle_, cycle);
   touched_cycles_.insert(cycle);
   last_event_tick_ = capture_tick_;
 }
@@ -495,7 +497,10 @@ CheckResult Runtime::advance(uint64_t watermark) {
 
 CheckResult Runtime::capture(const std::vector<DiffTestState *> &states) {
   ++capture_tick_;
+  finalized_ = false;
   touched_cycles_.clear();
+  for (auto &hart : harts_)
+    hart.frame_ref_steps = 0;
   if (!failure_)
     return failure_;
   if (!covered())
@@ -941,6 +946,32 @@ void Runtime::observe_reference_instruction(void *context, uint64_t pc, uint32_t
     hart.active->reference_instructions.emplace_back(pc, instruction);
 }
 
+CheckResult Runtime::note_reference_step(unsigned hart) {
+  auto &h = harts_.at(hart);
+  if (!h.active)
+    return failure_ = invalid("REF execution has no active retirement packet");
+  if (h.ref_instructions == std::numeric_limits<uint64_t>::max() ||
+      h.frame_ref_steps == std::numeric_limits<uint64_t>::max())
+    return failure_ = invalid("REF instruction counter exhausted");
+  ++h.ref_instructions;
+  ++h.frame_ref_steps;
+  return {};
+}
+
+CheckResult Runtime::note_arch_compare(unsigned hart, uint64_t retired_instructions) {
+  auto &h = harts_.at(hart);
+  // skip_one synchronizes REF from DUT and cannot earn an independent compare.
+  if (!h.frame_ref_steps)
+    return {};
+  if (h.frame_ref_steps > retired_instructions)
+    return failure_ = invalid("REF steps exceed the architecture-compare retirement group");
+  if (h.frame_ref_steps > std::numeric_limits<uint64_t>::max() - h.arch_compares)
+    return failure_ = invalid("independent architecture-compare counter exhausted");
+  h.arch_compares += h.frame_ref_steps;
+  h.frame_ref_steps = 0;
+  return {};
+}
+
 CheckResult Runtime::after_commit(unsigned hart, RefProxy &reference) {
   auto &h = harts_.at(hart);
   if (!h.active)
@@ -1147,7 +1178,53 @@ CheckResult Runtime::finish() {
     return result;
   if (!events_.empty())
     return pending("INCOMPLETE_RUN: captured memory events await source-cycle closure");
-  return checker_.finalize();
+  auto final_check = checker_.finalize();
+  if (final_check)
+    finalized_ = true;
+  return final_check;
+}
+
+bool Runtime::print_final_statistics() {
+  if (!finalized_ || !failure_ || !covered() || statistics_emitted_)
+    return false;
+  statistics_emitted_ = true;
+  const auto &memory_statistics = checker_.memory_statistics();
+  for (unsigned hart = 0; hart < harts_.size(); ++hart) {
+    const auto found = memory_statistics.find(hart);
+    const CheckMemoryStatistics memory_stats = found == memory_statistics.end() ? CheckMemoryStatistics{} : found->second;
+    const auto &execution = harts_[hart];
+    // PPO counters need a source accessor from Checker::drain. Counting retire
+    // requests would overstate actual calls when ordinary segments compress.
+    std::printf("RVWMO_HART_STATS_V1 hart=%u arch_compares=%llu ref_instructions=%llu "
+                "ppo_retirements=%llu ppo_operations=%llu load_compares=%llu "
+                "verified_stores=%llu store_audits=%llu cross_hart_reads=%llu\n",
+                hart, static_cast<unsigned long long>(execution.arch_compares),
+                static_cast<unsigned long long>(execution.ref_instructions),
+                0ull, 0ull,
+                static_cast<unsigned long long>(memory_stats.verified_load_operations),
+                static_cast<unsigned long long>(memory_stats.verified_store_operations),
+                static_cast<unsigned long long>(memory_stats.store_audits),
+                static_cast<unsigned long long>(memory_stats.cross_hart_reads));
+  }
+  size_t pending_atomics = 0;
+  for (const auto &hart : harts_) {
+    pending_atomics += hart.atomic_inflight != nullptr;
+    for (const auto &entry : hart.atomics)
+      pending_atomics += !entry.second->verified;
+  }
+  // The internal fixed-delay replay watermark is not a producer-certified
+  // closure. Report the missing certificate explicitly; never claim strict Pass.
+  std::printf("RVWMO_SESSION_STATS_V1 watermarked=%u closed_through=%llu last_effect_cycle=%llu "
+              "pending_events=%llu pending_retirements=%llu pending_loads=%llu "
+              "pending_stores=%llu pending_atomics=%llu all_harts_done=%u\n",
+              0u, 0ull,
+              static_cast<unsigned long long>(last_effect_cycle_), static_cast<unsigned long long>(events_.size()),
+              static_cast<unsigned long long>(checker_.pending_retirements()),
+              static_cast<unsigned long long>(checker_.pending_loads()),
+              static_cast<unsigned long long>(memory_.pending_stores()),
+              static_cast<unsigned long long>(pending_atomics), static_cast<unsigned>(all_done()));
+  std::fflush(stdout);
+  return true;
 }
 
 } // namespace rvwmo

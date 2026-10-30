@@ -21,6 +21,9 @@ public:
   CheckResult capture(const std::vector<DiffTestState *> &states);
   CheckResult before_commit(unsigned hart, unsigned port, DiffTestState &state, RefProxy &reference);
   CheckResult after_commit(unsigned hart, RefProxy &reference);
+  CheckResult note_reference_step(unsigned hart);
+  CheckResult note_arch_compare(unsigned hart, uint64_t retired_instructions);
+  bool print_final_statistics();
   CheckResult verify_store(unsigned hart, uint64_t store_uid, uint64_t address, uint64_t data, uint8_t mask);
   CheckResult note_done(unsigned hart, int code);
   CheckResult finish();
@@ -108,6 +111,9 @@ private:
   };
   struct Hart {
     uint64_t next_uid = 1;
+    uint64_t ref_instructions = 0;
+    uint64_t frame_ref_steps = 0;
+    uint64_t arch_compares = 0;
     uint64_t last_retired_uid = 0;
     uint64_t last_store_uid = 0;
     std::map<uint16_t, OperationId> allocations;
@@ -142,11 +148,14 @@ private:
   uint64_t next_rank_ = 1;
   uint64_t ranks_consumed_ = 1;
   uint64_t latest_cycle_ = 0;
+  uint64_t last_effect_cycle_ = 0;
   uint64_t capture_tick_ = 0;
   uint64_t last_event_tick_ = 0;
   uint64_t all_done_tick_ = 0;
   CheckResult coverage_;
   CheckResult failure_;
+  bool finalized_ = false;
+  bool statistics_emitted_ = false;
   std::string ordering_pending_;
   CheckResult unsupported(const std::string &reason);
   CheckResult advance(uint64_t watermark);
