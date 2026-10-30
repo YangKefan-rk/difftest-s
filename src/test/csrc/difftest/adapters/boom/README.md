@@ -122,6 +122,16 @@ completion. Hart park, an empty STQ or a successful host conversion is not that
 verdict. Scalar integer RAM is the current generic path; unsupported architectural
 state, atomics/LRSC, split access, FP/vector, trap and MMIO must not be dropped.
 
+## Immutable per-hart CSR read
+
+Only `CSRRS rd,mhartid,x0` with `rd != x0` is in the scalar GPR path.
+It cannot write the CSR; the actual destination bits are compared with
+Spike's independently executed integer result for the same hart. No other
+CSR operation is treated as verified: CSR writes and all other CSR reads
+require a separate architectural CSR-state comparator. This exception does
+not make HartBreaker programs fully supported (FP, AMO, CLINT and termination
+still require their own coverage and lifecycle checks).
+
 ## WFI retirement
 
 An actually retired `WFI` (`0x10500073`) has no scalar register or CSR write;
