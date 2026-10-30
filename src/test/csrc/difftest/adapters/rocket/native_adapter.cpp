@@ -14,13 +14,14 @@ CheckResult invalid(const char *message) { return {CheckStatus::Invalid, 0, mess
 
 bool scalar_width_matches(const InstructionObservation &instruction, uint8_t size) {
   const auto raw = instruction.instruction;
-  if (instruction.length == 4 && ((raw & 0x7f) == 0x03 || (raw & 0x7f) == 0x23))
+  if (instruction.length == 4 && ((raw & 0x7f) == 0x03 || (raw & 0x7f) == 0x23 ||
+      (raw & 0x7f) == 0x07 || (raw & 0x7f) == 0x27))
     return size == ((raw >> 12) & 3);
   if (instruction.length == 2 && ((raw & 3) == 0 || (raw & 3) == 2)) {
     const auto function = (raw >> 13) & 7;
     if (function == 2 || function == 6)
       return size == 2;
-    if (function == 3 || function == 7)
+    if (function == 1 || function == 3 || function == 5 || function == 7)
       return size == 3;
   }
   return true; // Opaque speculative extensions are rejected at retirement.
@@ -107,6 +108,9 @@ CaptureResult NativeAdapter::cancel_request(uint64_t request_id) {
     return {remember(invalid("Rocket native cancellation retracts a committed or exhausted attempt")), false};
   if (request->second.core.request.command == 0) {
     auto result = emitter_.cancel_load(request->second.core.token, request->second.core.attempt);
+    if (!result)
+      return finish_input(std::move(result));
+    result = capture_.cancel_load_attempt(request->second.core.token);
     if (!result)
       return finish_input(std::move(result));
   }
@@ -213,6 +217,16 @@ CaptureResult NativeAdapter::late_write(const NativeLateWrite &write) {
   if (!instruction->second.retirement)
     return finish_input(pending("Rocket native late writeback awaits its original retirement fact"));
   return finish_input(capture_.late_write(write));
+}
+
+CaptureResult NativeAdapter::floating_write(const NativeFpWrite &write) {
+  if (!failure_)
+    return {failure_, false};
+  const auto instruction = instructions_.find(write.token);
+  if (!write.identity_known || instruction == instructions_.end() || instruction->second.snapshot_done)
+    return {remember({CheckStatus::Incomplete, 0,
+        "Rocket native floating-point writeback lacks a live instruction identity"}), false};
+  return finish_input(capture_.floating_write(write));
 }
 
 CaptureResult NativeAdapter::squash(uint64_t token) {
@@ -420,9 +434,13 @@ void NativeAdapter::collect_output() {
   output_.serial = next_output_serial_++;
   output_.batch = std::move(batch);
   for (const auto &snapshot : captured) {
+    auto destination = ArchitecturalDestination::None;
+    if (snapshot.floating_write)
+      destination = ArchitecturalDestination::FloatingPoint;
+    else if (snapshot.integer_write)
+      destination = ArchitecturalDestination::Integer;
     output_.retirements.push_back({snapshot.id, snapshot.pc, snapshot.instruction,
-      snapshot.integer_write ? ArchitecturalDestination::Integer : ArchitecturalDestination::None,
-      snapshot.destination, snapshot.value});
+      destination, snapshot.destination, snapshot.value, snapshot.fcsr});
     const auto token = tokens_by_uid_.find(snapshot.id.uid);
     if (token == tokens_by_uid_.end()) {
       remember(invalid("Rocket native snapshot has no logical-to-native identity mapping"));

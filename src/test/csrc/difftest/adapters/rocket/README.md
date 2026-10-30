@@ -49,6 +49,23 @@ Collect observations on the modules' actual clock edges. A clock-gated module's
 held valid signal is not a new event on every ungated host clock. The shared
 profile must establish a common synchronous source-time domain.
 
+## Optional floating-point architecture scope
+
+The Rocket private collector joins exact committed FP destinations with the
+FPU's two actual final register-file write ports, retaining token identity across
+late writes. IEEE-754 canonical 64-bit FPR data (including writable f0) and an
+eligible FCSR snapshot are passed as DUT **actuals** to the generic session;
+Spike provides the independent REF expected results. A missing identity,
+unsupported FP encoding or unfinished FP write remains `Incomplete` or
+`Unsupported`, never a fabricated integer compare. The terminal additionally
+requires no pending FPU writes. The four-hart arch-only workload checks FP
+arithmetic, conversions, f0, flags and integer shared-memory effects.
+
+This arch-only cohort deliberately expresses memory bit transfers through
+ordinary integer loads/stores plus FMV instructions. Native FLW/FLD/FSW/FSD,
+AMO/LRSC, FP memory PPO, and HartBreaker's native exit still require separate
+memory-event and reference support and do not inherit this Pass.
+
 ## Producer and source-time ownership
 
 The embedding session registers `rvwmo::hart_producer_id(hart)` and the selected

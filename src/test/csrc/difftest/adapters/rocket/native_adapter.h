@@ -50,6 +50,7 @@ public:
   CaptureResult publish_group(const StoreGroupObservation &group, uint64_t transaction);
   CaptureResult retire(const NativeRetireFact &fact);
   CaptureResult late_write(const NativeLateWrite &write);
+  CaptureResult floating_write(const NativeFpWrite &write);
   CaptureResult squash(uint64_t token);
   // The caller proves publication; a raw SRAM drain alone is insufficient.
   CaptureResult publish(const QualifiedStorePublication &publication);
