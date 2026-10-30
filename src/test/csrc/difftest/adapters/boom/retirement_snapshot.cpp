@@ -1,4 +1,5 @@
 #include "retirement_snapshot.h"
+#include "readonly_hartid.h"
 #include <set>
 #include <utility>
 
@@ -50,6 +51,13 @@ CheckResult convert_retirement_snapshot(const CapturedRetirement &captured, Arch
   result = validate_coverage(captured.coverage);
   if (!result)
     return result;
+  if ((captured.instruction & 0x7f) == 0x73 && ((captured.instruction >> 12) & 7) != 0) {
+    if (!is_observable_readonly_hartid(captured.instruction))
+      return unsupported("BOOM CSR instruction requires architectural CSR-state comparison");
+    if (captured.destination_type != IntegerDestinationType::Integer || !captured.destination_register ||
+        *captured.destination_register != ((captured.instruction >> 7) & 31))
+      return invalid("BOOM read-only mhartid retirement omits its decoded integer destination");
+  }
   if (captured.destination_type == IntegerDestinationType::Floating)
     return unsupported("BOOM floating destination is outside the scalar integer session");
 
