@@ -1,6 +1,7 @@
 #include "runtime.h"
 #include "dependency.h"
 #include "globalmem.h"
+#include "source_boundary.h"
 #include <algorithm>
 #include <cstdio>
 #include <limits>
@@ -505,6 +506,11 @@ CheckResult Runtime::capture(const std::vector<DiffTestState *> &states) {
     return failure_;
   if (!covered())
     return coverage_;
+#ifdef CONFIG_DIFFTEST_SOURCEPREFIXEVENT
+  const auto source = source_boundary().snapshot();
+  if (!source.status)
+    return failure_ = source.status;
+#endif
 #if NUM_CORES > 1 && defined(CONFIG_DIFFTEST_STOREIDENTITYEVENT) && defined(CONFIG_DIFFTEST_STORELOCALEVENT) &&        \
     defined(CONFIG_DIFFTEST_LOADSNAPSHOTEVENT) && defined(CONFIG_DIFFTEST_SBUFFEREVENT) &&                             \
     defined(CONFIG_DIFFTEST_STOREEVENT) && defined(CONFIG_DIFFTEST_TLBEVENT) &&                                        \
@@ -728,10 +734,16 @@ CheckResult Runtime::capture(const std::vector<DiffTestState *> &states) {
     return coverage_;
   if (latest_cycle_ == 0)
     return {};
-  // Memory probes are captured at their source edge, including global writes.
-  // Load samples carry their SRAM/forwarding source time from s1 but arrive
-  // after s3. Keep three source cycles open before replaying any global writes.
+#ifdef CONFIG_DIFFTEST_SOURCEPREFIXEVENT
+  // The slowest actual producer prefix determines closure, including gated
+  // clocks and delivery counts. No host callback order supplies a memory rank.
+  if (!source.closed_through)
+    return {};
+  auto result = advance(*source.closed_through);
+#else
+  // Older event producers cannot earn a certified final source boundary.
   auto result = advance(latest_cycle_ > 3 ? latest_cycle_ - 3 : 0);
+#endif
   return result.status == CheckStatus::Pending ? CheckResult{} : result;
 #else
   (void)states;
@@ -1145,9 +1157,16 @@ CheckResult Runtime::finish() {
     return pending("INCOMPLETE_RUN: not every participating hart has terminated");
   if (!covered())
     return coverage_;
-  // Allow all fixed-delay probe packets to arrive after the last relevant event.
+#ifdef CONFIG_DIFFTEST_SOURCEPREFIXEVENT
+  const auto source = source_boundary().snapshot();
+  if (!source.status)
+    return failure_ = source.status;
+  if (!source.catalog_complete || !source.closed_through || *source.closed_through < last_effect_cycle_ || source.pending_prefixes)
+    return pending("INCOMPLETE_RUN: required source prefixes or event deliveries have not closed");
+#else
   if (capture_tick_ <= std::max(all_done_tick_, last_event_tick_) + 4)
     return pending("INCOMPLETE_RUN: observation transport has not drained");
+#endif
   for (const auto &h : harts_) {
     if (h.atomic_inflight)
       return pending("INCOMPLETE_RUN: atomic lifecycle has not finished");
@@ -1173,7 +1192,11 @@ CheckResult Runtime::finish() {
     }
   // Hart retirement does not end memory execution: cache misses may still
   // complete later. Never close future source cycles while stores are pending.
+#ifdef CONFIG_DIFFTEST_SOURCEPREFIXEVENT
+  auto result = advance(*source.closed_through);
+#else
   auto result = advance(latest_cycle_ > 3 ? latest_cycle_ - 3 : 0);
+#endif
   if (!result)
     return result;
   if (!events_.empty())
@@ -1214,13 +1237,15 @@ bool Runtime::print_final_statistics() {
     for (const auto &entry : hart.atomics)
       pending_atomics += !entry.second->verified;
   }
-  // The internal fixed-delay replay watermark is not a producer-certified
-  // closure. Report the missing certificate explicitly; never claim strict Pass.
+  const auto source = source_boundary().snapshot();
+  const bool closed = source.status && source.catalog_complete && source.closed_through && !source.pending_prefixes &&
+                      *source.closed_through >= last_effect_cycle_;
   std::printf("RVWMO_SESSION_STATS_V1 watermarked=%u closed_through=%llu last_effect_cycle=%llu "
               "pending_events=%llu pending_retirements=%llu pending_loads=%llu "
               "pending_stores=%llu pending_atomics=%llu all_harts_done=%u\n",
-              0u, 0ull,
-              static_cast<unsigned long long>(last_effect_cycle_), static_cast<unsigned long long>(events_.size()),
+              static_cast<unsigned>(closed), static_cast<unsigned long long>(source.closed_through.value_or(0)),
+              static_cast<unsigned long long>(last_effect_cycle_),
+              static_cast<unsigned long long>(events_.size() + source.pending_prefixes),
               static_cast<unsigned long long>(checker_.pending_retirements()),
               static_cast<unsigned long long>(checker_.pending_loads()),
               static_cast<unsigned long long>(memory_.pending_stores()),
