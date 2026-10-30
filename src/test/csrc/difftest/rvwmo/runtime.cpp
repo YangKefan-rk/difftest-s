@@ -1189,18 +1189,20 @@ bool Runtime::print_final_statistics() {
     return false;
   statistics_emitted_ = true;
   const auto &memory_statistics = checker_.memory_statistics();
+  const auto &ppo_statistics = checker_.ppo_statistics();
   for (unsigned hart = 0; hart < harts_.size(); ++hart) {
-    const auto found = memory_statistics.find(hart);
-    const CheckMemoryStatistics memory_stats = found == memory_statistics.end() ? CheckMemoryStatistics{} : found->second;
+    const auto memory = memory_statistics.find(hart);
+    const CheckMemoryStatistics memory_stats = memory == memory_statistics.end() ? CheckMemoryStatistics{} : memory->second;
+    const auto ppo = ppo_statistics.find(hart);
+    const CheckPpoStatistics ppo_stats = ppo == ppo_statistics.end() ? CheckPpoStatistics{} : ppo->second;
     const auto &execution = harts_[hart];
-    // PPO counters need a source accessor from Checker::drain. Counting retire
-    // requests would overstate actual calls when ordinary segments compress.
     std::printf("RVWMO_HART_STATS_V1 hart=%u arch_compares=%llu ref_instructions=%llu "
                 "ppo_retirements=%llu ppo_operations=%llu load_compares=%llu "
                 "verified_stores=%llu store_audits=%llu cross_hart_reads=%llu\n",
                 hart, static_cast<unsigned long long>(execution.arch_compares),
                 static_cast<unsigned long long>(execution.ref_instructions),
-                0ull, 0ull,
+                static_cast<unsigned long long>(ppo_stats.accepted_retirement_batches),
+                static_cast<unsigned long long>(ppo_stats.accepted_memory_operations),
                 static_cast<unsigned long long>(memory_stats.verified_load_operations),
                 static_cast<unsigned long long>(memory_stats.verified_store_operations),
                 static_cast<unsigned long long>(memory_stats.store_audits),

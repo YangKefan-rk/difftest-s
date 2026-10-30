@@ -28,6 +28,13 @@ struct CheckMemoryStatistics {
   uint64_t store_audits = 0;
 };
 
+// Counts actual successful PPO retire calls after retirement-queue compression.
+// Deferred store publication completes the original operation, not a new one.
+struct CheckPpoStatistics {
+  uint64_t accepted_retirement_batches = 0;
+  uint64_t accepted_memory_operations = 0;
+};
+
 // Event transport and REF execution remain outside this class. Provisional
 // store bytes may advance candidate memory state, but cannot earn a final pass
 // until independently computed REF stores have verified every provisional write.
@@ -80,6 +87,7 @@ public:
   }
   static OperationId initialization_writer(uint64_t byte_address);
   const std::map<uint32_t, CheckMemoryStatistics> &memory_statistics() const { return memory_statistics_; }
+  const std::map<uint32_t, CheckPpoStatistics> &ppo_statistics() const { return ppo_statistics_; }
 
 private:
   struct LoadSample {
@@ -94,6 +102,7 @@ private:
   Memory &memory_;
   size_t max_statistics_harts_;
   std::map<uint32_t, CheckMemoryStatistics> memory_statistics_;
+  std::map<uint32_t, CheckPpoStatistics> ppo_statistics_;
   PpoChecker ppo_;
   LrScChecker lrsc_;
   std::map<OperationId, StoreConditionalEvidence> sc_evidence_;
@@ -117,6 +126,7 @@ private:
   CheckResult prepare(Retirement &retirement);
   CheckResult require_verified_sources(const MemorySnapshot &snapshot) const;
   CheckResult ensure_statistics_hart(uint32_t hart);
+  CheckResult ensure_ppo_statistics_hart(uint32_t hart);
   CheckResult verified_memory_delta(const RetiredInstruction &instruction, CheckMemoryStatistics &delta) const;
   CheckResult remember_failure(CheckResult result);
 };

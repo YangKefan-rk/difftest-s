@@ -65,6 +65,15 @@ CheckResult Checker::ensure_statistics_hart(uint32_t hart) {
   return {};
 }
 
+CheckResult Checker::ensure_ppo_statistics_hart(uint32_t hart) {
+  if (!ppo_statistics_.count(hart)) {
+    if (ppo_statistics_.size() >= max_statistics_harts_)
+      return invalid("checker PPO-statistics hart bound exceeded");
+    ppo_statistics_.emplace(hart, CheckPpoStatistics{});
+  }
+  return {};
+}
+
 CheckResult Checker::verified_memory_delta(const RetiredInstruction &instruction,
                                             CheckMemoryStatistics &delta) const {
   for (const auto &operation : instruction.memory) {
@@ -527,6 +536,14 @@ CheckResult Checker::drain(uint32_t hart) {
       if (!statistics_fit(memory_statistics_.at(hart), delta))
         return remember_failure(invalid("checker verified-memory counter exhausted"));
     }
+    result = ensure_ppo_statistics_hart(hart);
+    if (!result)
+      return remember_failure(result);
+    auto &ppo_statistics = ppo_statistics_.at(hart);
+    constexpr auto max_count = std::numeric_limits<uint64_t>::max();
+    if (ppo_statistics.accepted_retirement_batches == max_count ||
+        front.instruction.memory.size() > max_count - ppo_statistics.accepted_memory_operations)
+      return remember_failure(invalid("checker PPO-statistics counter exhausted"));
     // Bind the most recent LR in architectural order. SC evidence was captured
     // at the write point, so unrelated later writes cannot alter this decision.
     for (auto &operation : front.instruction.memory) {
@@ -569,6 +586,8 @@ CheckResult Checker::drain(uint32_t hart) {
     result = ppo_.retire_deferred(front.instruction);
     if (!result)
       return remember_failure(result);
+    ++ppo_statistics.accepted_retirement_batches;
+    ppo_statistics.accepted_memory_operations += front.instruction.memory.size();
     for (const auto &operation: front.instruction.memory) {
       if (!operation.load)
         continue;
