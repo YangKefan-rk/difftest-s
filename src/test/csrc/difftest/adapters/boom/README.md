@@ -122,6 +122,17 @@ completion. Hart park, an empty STQ or a successful host conversion is not that
 verdict. Scalar integer RAM is the current generic path; unsupported architectural
 state, atomics/LRSC, split access, FP/vector, trap and MMIO must not be dropped.
 
+## Checked RAM address contract
+
+When the host supplies `NativeCollectorConfiguration::checked_ram_base` and
+`checked_ram_size` from its independently initialized GlobalMem, the private
+collector refuses final loads, local stores and cache publications outside
+that complete address interval **before** treating them as ordinary RAM.
+In particular, CLINT/IOMSHR writes cannot masquerade as L1 data-array
+publications. An unset range retains existing scalar-fixture compatibility;
+production workloads must set it, and genuine MMIO needs an independent device
+model and observation contract rather than an invented RAM write.
+
 ## Immutable per-hart CSR read
 
 Only `CSRRS rd,mhartid,x0` with `rd != x0` is in the scalar GPR path.
