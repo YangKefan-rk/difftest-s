@@ -1,19 +1,17 @@
 #include "difftrace.h"
+#include <stdexcept>
 #include <sys/stat.h>
 #include <sys/types.h>
 
 template <typename T>
 DiffTrace<T>::DiffTrace(const char *_trace_name, bool is_read, uint64_t _buffer_size) : is_read(is_read) {
+  if (!_trace_name || strlen(_trace_name) >= sizeof(trace_name))
+    throw std::invalid_argument("native trace name must contain at most 31 bytes");
+  strcpy(trace_name, _trace_name);
   buffer_size = _buffer_size;
   if (!is_read) {
     buffer = (T *)calloc(buffer_size, sizeof(T));
   }
-  if (strlen(trace_name) > 31) {
-    printf("Length of trace_name %s is more than 31 characters.\n", trace_name);
-    printf("Please use a shorter name.\n");
-    exit(0);
-  }
-  strcpy(trace_name, _trace_name);
 #ifdef CONFIG_IOTRACE_ZSTD
   trace_zstd = new DiffTraceZstd(buffer_size);
 #endif
