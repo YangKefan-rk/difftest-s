@@ -41,6 +41,7 @@
 Difftest **difftest = NULL;
 #if NUM_CORES > 1
 static std::unique_ptr<rvwmo::Runtime> multicore_session;
+static std::vector<int> native_exit_codes;
 static rvwmo::Runtime &multicore_runtime() {
   assert(multicore_session);
   return *multicore_session;
@@ -182,6 +183,7 @@ int difftest_init() {
 #if NUM_CORES > 1
   // A fuzzing process may initialize several independent DUT runs.
   multicore_session = std::make_unique<rvwmo::Runtime>(NUM_CORES);
+  native_exit_codes.assign(NUM_CORES, STATE_RUNNING);
 #endif
 #ifdef CONFIG_DIFFTEST_PERFCNT
   difftest_perfcnt_init();
@@ -236,6 +238,27 @@ int difftest_state() {
   return -1;
 }
 
+#if NUM_CORES > 1
+// Native tracing runs without REF execution or memory/PPO certification.
+// Its termination still requires a successful trap from every active hart.
+static int native_difftest_state() {
+  for (int hart = 0; hart < NUM_CORES; ++hart) {
+    if (!difftest[hart]->get_trap_valid())
+      continue;
+    const int code = difftest[hart]->get_trap_code();
+    if (code != STATE_GOODTRAP && code != STATE_SIM_EXIT)
+      return code;
+    if (native_exit_codes[hart] != STATE_RUNNING && native_exit_codes[hart] != code)
+      return STATE_ABORT;
+    native_exit_codes[hart] = code;
+  }
+  for (int code : native_exit_codes)
+    if (code == STATE_RUNNING)
+      return STATE_RUNNING;
+  return STATE_GOODTRAP;
+}
+#endif
+
 int difftest_nstep(int step, bool enable_diff) {
 #if CONFIG_DIFFTEST_ZONESIZE > 1
   difftest_switch_zone();
@@ -246,8 +269,15 @@ int difftest_nstep(int step, bool enable_diff) {
         return STATE_ABORT;
     } else {
       difftest_set_dut();
+#if NUM_CORES > 1
+      const int status = native_difftest_state();
+      if (status != STATE_RUNNING)
+        return status;
+      continue;
+#else
       if(difftest_check_trap())
         return STATE_GOODTRAP;
+#endif
     }
     int status = difftest_state();
     if (status != STATE_RUNNING)
