@@ -15,6 +15,24 @@ bool same_parent(const OperationId &operation, const OperationId &instruction) {
          operation.uid == instruction.uid;
 }
 
+// Atomic lifecycle operands use the LinkNan convention: an eight-byte aligned
+// address plus a byte mask selecting the lower word (0x0f), upper word (0xf0)
+// or the full doubleword (0xff). The shared LrScChecker trims the mask to its
+// contiguous enabled operand.
+std::vector<uint8_t> atomic_mask_bytes(uint8_t mask) {
+  std::vector<uint8_t> bytes(8);
+  for (unsigned byte = 0; byte < 8; ++byte)
+    bytes[byte] = (mask >> byte) & 1;
+  return bytes;
+}
+
+std::vector<uint8_t> atomic_data_bytes(uint64_t data) {
+  std::vector<uint8_t> bytes(8);
+  for (unsigned byte = 0; byte < 8; ++byte)
+    bytes[byte] = static_cast<uint8_t>(data >> (8 * byte));
+  return bytes;
+}
+
 } // namespace
 
 CheckerEventConsumer::CheckerEventConsumer(Memory::ReadGlobal read_global, Memory::WriteGlobal write_global,
@@ -178,6 +196,201 @@ CheckResult CheckerEventConsumer::consume_load_sample(const RuntimeEvent &event,
   remember_rank(event, time, certificate, operation.id, operation.attempt);
   loads_.emplace(key, LoadRecord{std::move(operation), sample.actual_bytes});
   return result;
+}
+
+CheckResult CheckerEventConsumer::consume_atomic(const RuntimeEvent &event,
+                                                       const AtomicLifecycleEvent &atomic) {
+  if (!failure_)
+    return failure_;
+  const auto parent = instruction_id(atomic.id);
+  if (!allocations_.count(parent))
+    return remember_failure(incomplete("atomic lifecycle has no closed parent allocation"));
+  if (atomic.id.subaccess != 0)
+    return remember_failure(unsupported("split or vector atomic lifecycle is not covered by this consumer"));
+
+  auto inflight = atomic_inflight_.find(atomic.id.hart);
+  if (atomic.phase == AtomicObservationPhase::Begin) {
+    if (inflight != atomic_inflight_.end())
+      return remember_failure(invalid("overlapping atomic lifecycles on one hart"));
+    if (atomics_.count(atomic.id) || stores_.count(atomic.id) ||
+        loads_.count({atomic.id, atomic.attempt}))
+      return remember_failure(invalid("duplicate atomic lifecycle identity"));
+    AtomicRecord record;
+    record.id = atomic.id;
+    record.attempt = atomic.attempt;
+    // Canonical LinkNan fuop classification: 2/3 = LR, 6/7 = SC, otherwise an
+    // ordinary AMO. Adapters must translate their decoded atomic kind into
+    // these canonical values; the raw core encoding is not a shared ABI.
+    record.lr = atomic.fuop == 2 || atomic.fuop == 3;
+    record.sc = atomic.fuop == 6 || atomic.fuop == 7;
+    record.rmw = !record.lr && !record.sc;
+    atomic_inflight_.emplace(atomic.id.hart, std::move(record));
+    return {};
+  }
+
+  if (inflight == atomic_inflight_.end()) {
+    // A Finish after a completed Response is the normal close; a duplicate
+    // Finish is not an effect and is rejected.
+    if (atomic.phase == AtomicObservationPhase::Finish && atomics_.count(atomic.id))
+      return {};
+    return remember_failure(invalid("atomic lifecycle effect has no active Begin"));
+  }
+  auto &record = inflight->second;
+  if (record.id != atomic.id)
+    return remember_failure(invalid("atomic lifecycle identity changed"));
+  const bool replay_request = atomic.phase == AtomicObservationPhase::Request && record.awaiting_retry &&
+                              atomic.attempt == record.attempt + 1;
+  if (!replay_request && record.attempt != atomic.attempt)
+    return remember_failure(invalid("atomic lifecycle attempt changed outside a replay request"));
+
+  switch (atomic.phase) {
+  case AtomicObservationPhase::Request: {
+    if (record.response_seen)
+      return remember_failure(invalid("atomic request follows its response"));
+    if (record.request_seen && !record.awaiting_retry)
+      return remember_failure(invalid("duplicate atomic request without replay"));
+    if (record.awaiting_retry && atomic.attempt != record.attempt + 1)
+      return remember_failure(invalid("atomic replay attempt does not follow its predecessor"));
+    if (!record.awaiting_retry && atomic.attempt != record.attempt)
+      return remember_failure(invalid("first atomic request attempt differs from Begin"));
+    if ((atomic.mask != 0x0f && atomic.mask != 0xf0 && atomic.mask != 0xff) || (atomic.address & 7))
+      return remember_failure(unsupported("atomic operand range or width is not supported"));
+    record.address = atomic.address;
+    record.mask = atomic.mask;
+    record.attempt = atomic.attempt;
+    record.request_seen = true;
+    record.awaiting_retry = false;
+    record.read_seen = false;
+    record.write_seen = false;
+    return {};
+  }
+  case AtomicObservationPhase::ReadEffect: {
+    if (!record.request_seen || record.awaiting_retry || record.sc)
+      return remember_failure(invalid("atomic read effect lacks a non-SC outstanding request"));
+    if (record.read_seen || record.write_seen)
+      return remember_failure(invalid("duplicate atomic read effect"));
+    if (atomic.address != record.address || atomic.mask != record.mask)
+      return remember_failure(invalid("atomic read operand differs from its request"));
+    ObservationTime time;
+    auto result = require_rank(event, time);
+    if (!result)
+      return result;
+    record.old_data = atomic.data;
+    record.read_seen = true;
+    MemoryOperation operation;
+    operation.id = record.id;
+    operation.attempt = record.attempt;
+    operation.address = record.address;
+    operation.byte_mask = atomic_mask_bytes(record.mask);
+    operation.load = true;
+    operation.store = false;
+    operation.atomic = record.rmw;
+    operation.lr = record.lr;
+    operation.sc = false;
+    operation.read_time = time;
+    operation.write_time = {};
+    operation.source_kind = ReadSourceKind::ModeledWitness;
+    operation.read_sources.clear();
+    result = checker_.observe_load(operation, record.id.uid, {}, false);
+    if (result.status != CheckStatus::Pass && result.status != CheckStatus::Pending)
+      return remember_failure(result);
+    const LoadKey atomic_load_key{record.id, record.attempt};
+    if (!loads_.emplace(atomic_load_key,
+                        LoadRecord{operation, atomic_data_bytes(atomic.data)}).second)
+      return remember_failure(invalid("duplicate atomic read sample"));
+    remember_rank(event, time, RankCertificate::None, record.id, record.attempt);
+    return result.status == CheckStatus::Pending ? result : CheckResult{};
+  }
+  case AtomicObservationPhase::WriteEffect: {
+    if (!record.request_seen || record.awaiting_retry || record.lr)
+      return remember_failure(invalid("atomic write effect lacks a non-LR outstanding request"));
+    if (record.write_seen)
+      return remember_failure(invalid("duplicate atomic write effect"));
+    if (record.rmw && !record.read_seen)
+      return remember_failure(invalid("atomic write precedes its read effect"));
+    if (record.sc && record.read_seen)
+      return remember_failure(invalid("SC must not have a read effect"));
+    if (atomic.address != record.address || atomic.mask != record.mask)
+      return remember_failure(invalid("atomic write operand differs from its request"));
+    ObservationTime time;
+    auto result = require_rank(event, time);
+    if (!result)
+      return result;
+    record.new_data = atomic.data;
+    record.write_seen = true;
+    MemoryOperation operation;
+    operation.id = record.id;
+    operation.attempt = record.attempt;
+    operation.address = record.address;
+    operation.byte_mask = atomic_mask_bytes(record.mask);
+    operation.load = false;
+    operation.store = true;
+    operation.atomic = record.rmw;
+    operation.lr = false;
+    operation.sc = record.sc;
+    operation.write_time = time;
+    MemoryWriter writer;
+    result = checker_.memory_writer(record.id, writer);
+    if (!result)
+      return remember_failure(result);
+    const auto bytes = atomic_data_bytes(atomic.data);
+    const auto mask = atomic_mask_bytes(record.mask);
+    MemoryStore store{writer, record.id.uid, record.address, bytes, mask};
+    result = checker_.record_store(store, operation, StoreVerification::Provisional);
+    if (result.status != CheckStatus::Pass && result.status != CheckStatus::Pending)
+      return remember_failure(result);
+    // The single atomic write point. For a successful SC this call captures the
+    // per-byte remote-writer evidence before the SC's own write is published.
+    result = checker_.observe_global(record.address, bytes, mask,
+                                     std::vector<MemoryWriter>(8, writer), {writer}, time);
+    if (result.status != CheckStatus::Pass && result.status != CheckStatus::Pending)
+      return remember_failure(result);
+    if (!stores_.emplace(record.id, StoreRecord{operation, store, false, true, false}).second)
+      return remember_failure(invalid("duplicate atomic write record"));
+    remember_rank(event, time, RankCertificate::None, record.id, record.attempt);
+    return result.status == CheckStatus::Pending ? result : CheckResult{};
+  }
+  case AtomicObservationPhase::Replay: {
+    if (!record.request_seen || record.awaiting_retry || record.read_seen || record.write_seen)
+      return remember_failure(invalid("atomic replay does not follow an outstanding request without effects"));
+    record.awaiting_retry = true;
+    return {};
+  }
+  case AtomicObservationPhase::Response: {
+    if (!record.request_seen || record.response_seen)
+      return remember_failure(invalid("duplicate atomic response or no outstanding request"));
+    record.success = atomic.success;
+    record.error = atomic.error;
+    record.response_seen = true;
+    if (atomic.error)
+      return remember_failure(unsupported("atomic observation reported an access error"));
+    if (record.sc) {
+      if (record.success != record.write_seen)
+        return remember_failure(invalid("SC response success disagrees with its write effect"));
+    } else if (!record.success) {
+      return remember_failure(unsupported("AMO/LR observation reported an unsuccessful atomic"));
+    }
+    atomics_.emplace(record.id, record);
+    atomic_inflight_.erase(inflight);
+    return {};
+  }
+  case AtomicObservationPhase::Finish: {
+    if (!record.response_seen)
+      return remember_failure(incomplete("atomic finish precedes its response"));
+    atomics_.emplace(record.id, record);
+    atomic_inflight_.erase(inflight);
+    return {};
+  }
+  case AtomicObservationPhase::Cancel: {
+    if (record.read_seen || record.write_seen)
+      return remember_failure(invalid("cancelled atomic already has a memory effect"));
+    atomic_inflight_.erase(inflight);
+    return {};
+  }
+  case AtomicObservationPhase::Begin:
+    break;
+  }
+  return remember_failure(invalid("unknown atomic lifecycle phase"));
 }
 
 CheckResult CheckerEventConsumer::consume_read_group_member(const RuntimeEvent &event, bool source_prefix_closed) {
@@ -431,6 +644,16 @@ CheckResult CheckerEventConsumer::consume_squash(const InstructionSquashEvent &e
     if (same_parent(store.first, parent))
       return remember_failure(invalid("architecturally committed LocalStore cannot be squashed"));
 
+  auto inflight = atomic_inflight_.find(parent.hart);
+  if (inflight != atomic_inflight_.end() && same_parent(inflight->second.id, parent))
+    atomic_inflight_.erase(inflight);
+  for (auto atomic = atomics_.begin(); atomic != atomics_.end();) {
+    if (same_parent(atomic->first, parent))
+      atomic = atomics_.erase(atomic);
+    else
+      ++atomic;
+  }
+
   for (auto load = loads_.begin(); load != loads_.end();) {
     if (!same_parent(load->first.first, parent)) {
       ++load;
@@ -454,8 +677,6 @@ CheckResult CheckerEventConsumer::consume_squash(const InstructionSquashEvent &e
 CheckResult CheckerEventConsumer::consume_retire(const InstructionRetireEvent &event) {
   auto instruction = event.instruction;
   const OperationId id{instruction.hart, instruction.epoch, instruction.uid, 0};
-  if (instruction.failed_sc)
-    return remember_failure(unsupported("failed SC retirement requires the atomic lifecycle checker"));
   auto allocation = allocations_.find(id);
   if (allocation == allocations_.end())
     return remember_failure(invalid("retirement has no live parent instruction allocation"));
@@ -499,44 +720,74 @@ CheckResult CheckerEventConsumer::consume_retire(const InstructionRetireEvent &e
       return remember_failure(invalid("compressed non-memory opcode carries a memory effect"));
   } else {
     const uint32_t opcode = instruction.instruction & 0x7f;
-    if (opcode == 0x2f)
-      return remember_failure(unsupported("atomic memory opcode needs its lifecycle checker"));
-    const bool fp_load = opcode == 0x07;
-    const bool fp_store = opcode == 0x27;
-    if (fp_load || fp_store) {
-      const unsigned width_encoding = (instruction.instruction >> 12) & 7;
-      if (width_encoding != 2 && width_encoding != 3)
-        return remember_failure(unsupported("vector or unsupported FP memory width lacks a scalar model"));
-      if (instruction.memory.size() != 1 || (fp_load && (!has_load || has_store)) ||
-          (fp_store && (!has_store || has_load)))
-        return remember_failure(incomplete("FP load/store retirement lacks one matching memory effect"));
-      const auto expected_width = size_t{1} << width_encoding;
-      if (instruction.memory.front().byte_mask.size() != expected_width)
-        return remember_failure(invalid("FP load/store memory width differs from instruction encoding"));
-      if (std::any_of(instruction.memory.front().byte_mask.begin(),
-            instruction.memory.front().byte_mask.end(), [](uint8_t byte) { return byte != 1; }))
-        return remember_failure(unsupported("FP scalar memory effect has a sparse byte mask"));
+    if (opcode == 0x2f) {
+      if (instruction.memory.empty())
+        return remember_failure(unsupported("atomic opcode retirement lacks its memory effect"));
+    } else {
+      const bool fp_load = opcode == 0x07;
+      const bool fp_store = opcode == 0x27;
+      if (fp_load || fp_store) {
+        const unsigned width_encoding = (instruction.instruction >> 12) & 7;
+        if (width_encoding != 2 && width_encoding != 3)
+          return remember_failure(unsupported("vector or unsupported FP memory width lacks a scalar model"));
+        if (instruction.memory.size() != 1 || (fp_load && (!has_load || has_store)) ||
+            (fp_store && (!has_store || has_load)))
+          return remember_failure(incomplete("FP load/store retirement lacks one matching memory effect"));
+        const auto expected_width = size_t{1} << width_encoding;
+        if (instruction.memory.front().byte_mask.size() != expected_width)
+          return remember_failure(invalid("FP load/store memory width differs from instruction encoding"));
+        if (std::any_of(instruction.memory.front().byte_mask.begin(),
+              instruction.memory.front().byte_mask.end(), [](uint8_t byte) { return byte != 1; }))
+          return remember_failure(unsupported("FP scalar memory effect has a sparse byte mask"));
+      }
+      if ((opcode == 0x03 && (!has_load || has_store)) || (opcode == 0x23 && (!has_store || has_load)))
+        return remember_failure(incomplete("scalar load/store retirement lacks its matching memory event"));
+      if (opcode != 0x03 && opcode != 0x23 && !fp_load && !fp_store && !instruction.memory.empty())
+        return remember_failure(invalid("non-load/store opcode carries a memory effect"));
+      if (opcode == 0x0f && ((instruction.instruction >> 12) & 7) == 2)
+        return remember_failure(unsupported("cache-block operation is not modeled by this consumer"));
     }
-    if ((opcode == 0x03 && (!has_load || has_store)) || (opcode == 0x23 && (!has_store || has_load)))
-      return remember_failure(incomplete("scalar load/store retirement lacks its matching memory event"));
-    if (opcode != 0x03 && opcode != 0x23 && !fp_load && !fp_store && !instruction.memory.empty())
-      return remember_failure(invalid("non-load/store opcode carries a memory effect"));
-    if (opcode == 0x0f && ((instruction.instruction >> 12) & 7) == 2)
-      return remember_failure(unsupported("cache-block operation is not modeled by this consumer"));
   }
 
   std::vector<RetiredLoad> actual_loads;
   std::set<LoadKey> selected_loads;
   std::set<OperationId> selected_stores;
+  std::set<OperationId> selected_atomics;
   for (auto &operation : instruction.memory) {
-    if (operation.atomic || operation.lr || operation.sc)
-      return remember_failure(unsupported("atomic retirement requires the atomic lifecycle checker"));
-    if (operation.load && operation.store)
-      return remember_failure(unsupported("split read/write effects are not represented by this consumer"));
     if (!same_parent(operation.id, id))
       return remember_failure(invalid("retired memory operation has a different instruction identity"));
     if (operation.id.subaccess != 0)
       return remember_failure(unsupported("split or vector retirement is not covered by this consumer"));
+    if (operation.atomic || operation.lr || operation.sc) {
+      auto found = atomics_.find(operation.id);
+      if (found == atomics_.end())
+        return remember_failure(incomplete("atomic retirement awaits its completed lifecycle"));
+      const auto &record = found->second;
+      if (operation.attempt != record.attempt || operation.address != record.address ||
+          operation.byte_mask != atomic_mask_bytes(record.mask))
+        return remember_failure(invalid("atomic retirement address, mask or attempt differs from its lifecycle"));
+      if (operation.atomic) {
+        if (!record.rmw || !record.success || !record.read_seen || !record.write_seen ||
+            !operation.load || !operation.store)
+          return remember_failure(invalid("AMO retirement lacks its read/write lifecycle"));
+      } else if (operation.lr) {
+        if (!record.lr || !record.success || !record.read_seen || !operation.load || operation.store)
+          return remember_failure(invalid("LR retirement lacks its read lifecycle"));
+      } else {
+        if (!record.sc)
+          return remember_failure(invalid("SC retirement has no SC lifecycle"));
+        if (instruction.failed_sc) {
+          if (record.success || record.write_seen || operation.load || operation.store)
+            return remember_failure(invalid("failed SC retirement carries a memory effect or success"));
+        } else if (!record.success || !record.write_seen || !operation.store || operation.load) {
+          return remember_failure(invalid("successful SC retirement lacks its write lifecycle"));
+        }
+      }
+      if (!selected_atomics.insert(operation.id).second)
+        return remember_failure(invalid("duplicate atomic retirement"));
+    } else if (operation.load && operation.store) {
+      return remember_failure(unsupported("split read/write effects are not represented by this consumer"));
+    }
     operation.read_time = {};
     operation.write_time = {};
     operation.source_kind = ReadSourceKind::ModeledWitness;
@@ -577,6 +828,16 @@ CheckResult CheckerEventConsumer::consume_retire(const InstructionRetireEvent &e
     if (same_parent(sample.first.first, id) && !selected_loads.count(sample.first))
       return remember_failure(invalid("retirement left an uncancelled load attempt unselected"));
 
+  // A failed SC has no read or write effect. Its only semantic content is the
+  // failed_sc status consumed by Checker::drain; do not present the empty SC
+  // operation as a successful SC to the checker's per-operation LR/SC binding.
+  if (instruction.failed_sc)
+    instruction.memory.erase(std::remove_if(instruction.memory.begin(), instruction.memory.end(),
+                                            [](const MemoryOperation &operation) {
+                                              return operation.sc && !operation.load && !operation.store;
+                                            }),
+                             instruction.memory.end());
+
   auto progress = checker_.poll();
   if (!progress && progress.status != CheckStatus::Pending)
     return remember_failure(progress);
@@ -599,6 +860,8 @@ CheckResult CheckerEventConsumer::consume_retire(const InstructionRetireEvent &e
         stores_.erase(store);
     }
   }
+  for (const auto &atomic_id : selected_atomics)
+    atomics_.erase(atomic_id);
   for (auto cancelled = cancelled_loads_.begin(); cancelled != cancelled_loads_.end();) {
     if (same_parent(cancelled->first, id))
       cancelled = cancelled_loads_.erase(cancelled);
@@ -643,7 +906,7 @@ CheckResult CheckerEventConsumer::consume_closed(const RuntimeEvent &event, bool
   case RuntimeEventKind::InstructionRetire:
     return consume_retire(std::get<InstructionRetireEvent>(event.payload));
   case RuntimeEventKind::AtomicLifecycle:
-    return remember_failure(unsupported("generic atomic lifecycle is not integrated with the semantic consumer"));
+    return consume_atomic(event, std::get<AtomicLifecycleEvent>(event.payload));
   case RuntimeEventKind::HartDone:
   case RuntimeEventKind::Trap:
     return remember_failure(unsupported("hart completion and trap events are not semantic memory events"));
