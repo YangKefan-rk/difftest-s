@@ -28,6 +28,7 @@ inline bool certified_csr_instruction(uint32_t instruction) {
   case 0x003: // fcsr
   case 0x105: // stvec
   case 0x140: // sscratch
+  case 0x141: // sepc
   case 0x142: // scause
   case 0x143: // stval
   case 0x300: // mstatus
