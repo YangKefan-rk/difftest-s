@@ -43,11 +43,35 @@ The matching Rocket branch enables its optional outputs using the default-false
 Only blocking DCache currently provides native observations. Other cache
 implementations expose `available=false`; scratchpad observation is rejected.
 The ordinary cached scalar profile must not silently accept unavailable probes,
-uncached/MMIO/implicit accesses, vector, or split accesses. AMO/LR/SC are
-accepted only through the native `NativeAdapter::atomic` ingress and the shared
-`CheckerEventConsumer`; the matching Rocket RTL branch must expose the actual
-read/write/cancel lifecycle points, and the default branch still rejects them
-until those observations are enabled.
+uncached/MMIO/implicit accesses, vector, or split accesses. Aligned cached-RAM
+AMO.W/D uses `NativeAdapter::atomic_candidate` with qualified old SRAM data,
+AMOALU final bytes and the matching physical drain. LR/SC retains a separate
+reservation/success lifecycle; its C++ ingress does not establish native RTL
+support.
+
+## AMO reference and ordering checks
+
+The nine RV64 AMO operations support low/high word lanes, doubleword, `rd=x0`
+and aq/rl annotations. The private adapter joins a candidate with the original
+ROB retirement and final writeback before emitting allocation, candidate and
+retirement. Retire-before-drain and drain-before-retire are both retained;
+unresolved attempts and publications prevent producer closure.
+
+The common consumer freezes an independent pre-write memory snapshot at the
+observed physical drain rank, then installs the provisional new bytes at that
+same rank. DUT old data is an actual value, never the expected REF input. Final
+acceptance requires modeled read-value comparison, a separate Spike-generated
+atomic-store trace audit, and PPO with equal AMO read/write ranks. The reference
+profile must advertise `DIFFTEST_REF_CAP_ATOMIC_STORE_TRACE_V1`; ordinary and
+atomic trace queues are counted independently. Word masks select the original
+aligned SRAM lanes; sign-extended architectural return values are compared
+separately.
+
+Cross-hart same-cycle effects on disjoint bytes may share an independent-effect
+group. Unqualified overlapping effects, split operations, MMIO and a physical
+group coalescing an AMO with another store remain outside this supported path.
+A successful ISA/PPO check under the observed order is not a formal proof of
+cache coherence, or proof that an arbitrary ELF has a complete terminal protocol.
 
 Collect observations on the modules' actual clock edges. A clock-gated module's
 held valid signal is not a new event on every ungated host clock. The shared
