@@ -4,6 +4,7 @@
 #include "session.h"
 #include "difftest/ref_api.h"
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -12,7 +13,8 @@ namespace rvwmo {
 class SpikeReferenceStepper {
 public:
   // Handles are borrowed and must remain alive until after this stepper is destroyed.
-  SpikeReferenceStepper(std::vector<void *> hart_handles, uint32_t expected_profile_id);
+  SpikeReferenceStepper(std::vector<void *> hart_handles, uint32_t expected_profile_id,
+                        std::function<bool(uint64_t, uint8_t *, size_t)> read_independent_instruction);
   ~SpikeReferenceStepper();
 
   SpikeReferenceStepper(const SpikeReferenceStepper &) = delete;
@@ -53,6 +55,9 @@ private:
   };
 
   std::vector<HartState> harts_;
+  std::function<bool(uint64_t, uint8_t *, size_t)> read_independent_instruction_;
+  ReferenceStepResult skip_device_store(const InstructionRetireEvent &retirement,
+                                        const ArchitecturalRetirement &snapshot);
 
   ReferenceStepResult step(const InstructionRetireEvent &retirement, const ArchitecturalRetirement &snapshot,
                            const std::vector<ReferenceLoadValue> &modeled_loads);

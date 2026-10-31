@@ -27,7 +27,8 @@ SpikeReferencePool::SpikeReferencePool(GlobalMem &memory, uint32_t profile_id,
     handles.push_back(reference.get());
     references_.push_back(std::move(reference));
   }
-  stepper_ = std::make_unique<SpikeReferenceStepper>(std::move(handles), profile_id);
+  stepper_ = std::make_unique<SpikeReferenceStepper>(std::move(handles), profile_id,
+      [this](uint64_t address, uint8_t *bytes, size_t size) { return memory_.read(address, bytes, size); });
   for (size_t hart = 0; hart < initial_states.size(); ++hart) {
     auto initialized = stepper_->initialize_hart(static_cast<uint32_t>(hart), initial_states[hart]);
     if (!initialized) {

@@ -118,6 +118,8 @@ struct RetiredInstruction {
   uint64_t pc = 0;
   uint32_t instruction = 0;
   bool failed_sc = false;
+  // Explicitly excluded physical device store. No coherent RAM effect or REF execution.
+  bool skipped_device_store = false;
   std::vector<MemoryOperation> memory;
   DependencyMetadata dependencies;
 };

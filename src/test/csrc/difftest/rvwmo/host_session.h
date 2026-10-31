@@ -19,6 +19,8 @@ struct HostSessionConfiguration {
   StreamContract stream;
   std::vector<ProducerCapability> producers;
   std::vector<difftest_ref_state_v1> initial_harts;
+  // Opt-in device writes are excluded from RAM/PPO and counted, not compared.
+  bool skip_device_stores = false;
   // Optional private-adapter bookkeeping over independently computed REF stores.
   // It must finish synchronously; it cannot change the REF result or memory.
   std::function<CheckResult(const ReferenceStoreValue &)> reference_store_observer;

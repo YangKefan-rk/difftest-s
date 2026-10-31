@@ -151,6 +151,9 @@ CheckResult HostSession::validate_batch(const EventBatch &batch) const {
         return {CheckStatus::Unsupported, 0, "local store targets MMIO or uninitialized reference RAM"};
     }
     if (event.kind == RuntimeEventKind::InstructionRetire) {
+      const auto &retirement = std::get<InstructionRetireEvent>(event.payload);
+      if (retirement.instruction.skipped_device_store && !configuration_.skip_device_stores)
+        return {CheckStatus::Unsupported, 0, "device-store skip not enabled by the host profile"};
       for (const auto &access : std::get<InstructionRetireEvent>(event.payload).instruction.memory)
         if (!access.byte_mask.empty() && !memory_.contains(access.address, access.byte_mask.size()))
           return {CheckStatus::Unsupported, 0, "retired memory access targets MMIO or uninitialized reference RAM"};
@@ -305,9 +308,12 @@ CheckResult HostSession::finalize(uint64_t completed_cycle) {
   for (uint32_t hart = 0; hart < configuration_.initial_harts.size(); ++hart) {
     const auto executed = statistics.find(hart);
     if (executed == statistics.end() || executed->second.retired_instructions == 0 ||
-        executed->second.reference_steps != executed->second.retired_instructions ||
-        executed->second.architecture_compared != executed->second.retired_instructions)
-      return reject(incomplete("required hart did not retire and complete every independent architecture comparison"));
+        executed->second.skipped_device_stores > executed->second.retired_instructions ||
+        executed->second.reference_steps !=
+            executed->second.retired_instructions - executed->second.skipped_device_stores ||
+        executed->second.architecture_compared !=
+            executed->second.retired_instructions - executed->second.skipped_device_stores)
+      return reject(incomplete("required hart lacks a checked retirement or explicitly counted device exclusion"));
   }
   finalized_ = true;
   return {};
@@ -339,6 +345,7 @@ std::string HostSession::final_report() const {
     output << "{\"hart\":" << hart << ",\"dut_retired\":" << statistics.retired_instructions
            << ",\"ref_steps\":" << statistics.reference_steps
            << ",\"arch_compares\":" << statistics.architecture_compared
+           << ",\"excluded_device_store_skips\":" << statistics.skipped_device_stores
            << ",\"accepted_load_operations\":" << statistics.retired_load_operations
            << ",\"accepted_store_operations\":" << statistics.retired_store_operations
            << ",\"load_compares\":" << memory_statistics.verified_load_operations

@@ -345,17 +345,28 @@ CheckResult ObservationSession::step_reference(const InstructionRetireEvent &ret
   if (statistics.reference_steps == std::numeric_limits<uint64_t>::max() ||
       statistics.architecture_compared == std::numeric_limits<uint64_t>::max())
     return invalid("session reference-statistics counter exhausted");
-  ++statistics.reference_steps;
+  if (!retirement.instruction.skipped_device_store)
+    ++statistics.reference_steps;
   auto result = reference_stepper_(retirement, snapshot, loads);
   if (result.check.status == CheckStatus::Pending)
     return invalid("reference step callback must finish synchronously once invoked");
   if (!result.check)
     return result.check;
+  if (result.skipped_device_store != retirement.instruction.skipped_device_store)
+    return invalid("reference device-store exclusion differs from declared retirement");
   if (result.reference_pc != retirement.instruction.pc ||
       result.reference_instruction != retirement.instruction.instruction)
     return {CheckStatus::Violation, 0, "reference PC or instruction differs from retirement"};
   if (result.took_trap)
     return {CheckStatus::Unsupported, 0, "reference instruction trapped outside generic trap semantics"};
+  if (result.skipped_device_store) {
+    if (statistics.skipped_device_stores == std::numeric_limits<uint64_t>::max())
+      return invalid("device-store skip statistics counter exhausted");
+    ++statistics.skipped_device_stores;
+    const OperationId id{retirement.instruction.hart, retirement.instruction.epoch, retirement.instruction.uid, 0};
+    reference_records_[id] = {{}, 0};
+    return {};
+  }
   if (snapshot.destination == ArchitecturalDestination::Integer) {
     if (!snapshot.destination_register || snapshot.destination_register >= 32 || !result.integer_write ||
         result.integer_write->destination_register != snapshot.destination_register ||

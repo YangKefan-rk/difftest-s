@@ -454,6 +454,9 @@ CheckResult CheckerEventConsumer::consume_squash(const InstructionSquashEvent &e
 CheckResult CheckerEventConsumer::consume_retire(const InstructionRetireEvent &event) {
   auto instruction = event.instruction;
   const OperationId id{instruction.hart, instruction.epoch, instruction.uid, 0};
+  if (instruction.skipped_device_store &&
+      ((instruction.instruction & 0x7f) != 0x23 || !instruction.memory.empty() || !event.loads.empty()))
+    return remember_failure(invalid("excluded device store carries a non-store or coherent RAM operation"));
   if (instruction.failed_sc)
     return remember_failure(unsupported("failed SC retirement requires the atomic lifecycle checker"));
   auto allocation = allocations_.find(id);
@@ -494,7 +497,8 @@ CheckResult CheckerEventConsumer::consume_retire(const InstructionRetireEvent &e
     const uint32_t opcode = instruction.instruction & 0x7f;
     if (opcode == 0x07 || opcode == 0x27 || opcode == 0x2f)
       return remember_failure(unsupported("floating/vector or atomic memory opcode needs a richer consumer"));
-    if ((opcode == 0x03 && (!has_load || has_store)) || (opcode == 0x23 && (!has_store || has_load)))
+    if ((opcode == 0x03 && (!has_load || has_store)) ||
+        (opcode == 0x23 && (!has_store || has_load) && !instruction.skipped_device_store))
       return remember_failure(incomplete("scalar load/store retirement lacks its matching memory event"));
     if (opcode != 0x03 && opcode != 0x23 && !instruction.memory.empty())
       return remember_failure(invalid("non-load/store opcode carries a memory effect"));

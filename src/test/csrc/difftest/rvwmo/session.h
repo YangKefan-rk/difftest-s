@@ -55,11 +55,13 @@ struct ReferenceStepResult {
   uint64_t reference_pc = 0;
   uint32_t reference_instruction = 0;
   bool took_trap = false;
+  bool skipped_device_store = false;
 };
 
 struct SessionHartStatistics {
   uint64_t reference_steps = 0;
   uint64_t architecture_compared = 0;
+  uint64_t skipped_device_stores = 0;
   // Retirement accepted by the consumer; final Pass certifies any deferred PPO
   // work. These are not counters for already completed PPO checks.
   uint64_t retired_instructions = 0;

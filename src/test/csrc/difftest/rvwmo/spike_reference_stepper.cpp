@@ -12,8 +12,9 @@ CheckResult violation(const std::string &message) { return {CheckStatus::Violati
 CheckResult unsupported(const std::string &message) { return {CheckStatus::Unsupported, 0, message}; }
 } // namespace
 
-SpikeReferenceStepper::SpikeReferenceStepper(std::vector<void *> hart_handles, uint32_t expected_profile_id)
-    : harts_(hart_handles.size()) {
+SpikeReferenceStepper::SpikeReferenceStepper(std::vector<void *> hart_handles, uint32_t expected_profile_id,
+    std::function<bool(uint64_t, uint8_t *, size_t)> read_independent_instruction)
+    : harts_(hart_handles.size()), read_independent_instruction_(std::move(read_independent_instruction)) {
   for (size_t hart = 0; hart < hart_handles.size(); ++hart) {
     auto &state = harts_[hart];
     state.handle = hart_handles[hart];
@@ -189,6 +190,64 @@ CheckResult SpikeReferenceStepper::collect_store(void *handle, const MemoryOpera
   return {};
 }
 
+ReferenceStepResult SpikeReferenceStepper::skip_device_store(
+    const InstructionRetireEvent &retirement, const ArchitecturalRetirement &snapshot) {
+  ReferenceStepResult result;
+  const auto hart = retirement.instruction.hart;
+  if (hart >= harts_.size() || !harts_[hart].handle || !harts_[hart].initialized ||
+      !harts_[hart].setup_error.empty() || harts_[hart].poisoned || !read_independent_instruction_) {
+    result.check = incomplete("device-store skip lacks an initialized per-hart reference");
+    return result;
+  }
+  auto &state = harts_[hart];
+  const auto &instruction = retirement.instruction;
+  if (!instruction.memory.empty() || !retirement.loads.empty() ||
+      (instruction.instruction & 0x7f) != 0x23 ||
+      ((instruction.instruction >> 12) & 7) != 3 ||
+      snapshot.destination != ArchitecturalDestination::None || snapshot.destination_register ||
+      snapshot.destination_value) {
+    result.check = invalid("device-store skip has a RAM effect, non-store opcode or architectural writeback");
+    return result;
+  }
+  uint8_t fetched[4]{};
+  if (!read_independent_instruction_(instruction.pc, fetched, sizeof(fetched))) {
+    result.check = incomplete("device-store skip cannot read independent instruction bytes");
+    return result;
+  }
+  uint32_t raw = 0;
+  for (size_t byte = 0; byte < sizeof(fetched); ++byte)
+    raw |= uint32_t(fetched[byte]) << (8 * byte);
+  if (raw != instruction.instruction) {
+    result.check = violation("device-store skip raw instruction differs from independent memory");
+    return result;
+  }
+  uint64_t pending_stores = 0;
+  if (difftest_ref_pending_store_traces_v1(state.handle, &pending_stores) != DIFFTEST_REF_API_OK || pending_stores) {
+    result.check = incomplete("device-store skip has pending reference RAM store traces");
+    return result;
+  }
+  difftest_ref_state_v1 before{}, after{};
+  before.abi_version = after.abi_version = DIFFTEST_REF_STATE_ABI_VERSION_1;
+  before.struct_size = after.struct_size = sizeof(before);
+  if (difftest_ref_get_state_v1(state.handle, &before) != DIFFTEST_REF_API_OK ||
+      before.pc != instruction.pc) {
+    result.check = violation("device-store skip reference PC differs from DUT retirement");
+    return result;
+  }
+  if (difftest_ref_skip_device_store_v1(state.handle, instruction.pc, raw) != DIFFTEST_REF_API_OK ||
+      difftest_ref_get_state_v1(state.handle, &after) != DIFFTEST_REF_API_OK ||
+      after.pc != before.pc + 4 || !std::equal(std::begin(before.gpr), std::end(before.gpr), std::begin(after.gpr))) {
+    state.poisoned = true;
+    state.failure = incomplete("device-store skip failed to advance only the per-hart reference PC");
+    result.check = state.failure;
+    return result;
+  }
+  result.reference_pc = before.pc;
+  result.reference_instruction = raw;
+  result.skipped_device_store = true;
+  return result;
+}
+
 ReferenceStepResult SpikeReferenceStepper::step(const InstructionRetireEvent &retirement,
                                                const ArchitecturalRetirement &snapshot,
                                                const std::vector<ReferenceLoadValue> &modeled_loads) {
@@ -199,6 +258,8 @@ ReferenceStepResult SpikeReferenceStepper::step(const InstructionRetireEvent &re
     return result;
   }
   auto &state = harts_[hart];
+  if (retirement.instruction.skipped_device_store)
+    return skip_device_store(retirement, snapshot);
   if (!state.setup_error.empty()) {
     result.check = incomplete(state.setup_error);
     return result;
