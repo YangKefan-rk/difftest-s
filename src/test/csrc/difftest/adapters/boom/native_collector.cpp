@@ -52,7 +52,8 @@ CaptureResult NativeCollector::capture(const NativeFrame &frame) {
   const size_t facts = frame.allocations.size() + frame.begins.size() + frame.cancellations.size() +
       frame.completions.size() + frame.local_stores.size() + frame.retirements.size() +
       frame.store_releases.size() + frame.squashes.size() + frame.publications.size() +
-      frame.merged_publications.size() + frame.csr_post.has_value() + frame.csr_write_post.has_value();
+      frame.merged_publications.size() + frame.csr_post.has_value() + frame.csr_write_post.has_value() +
+      frame.fp_posts.size();
   if (facts > configuration_.staged_events - std::min(configuration_.staged_events, staged_events_.size()))
     return {pending("BOOM source staging is full; retain the complete frame and drain before retrying"), false};
   if (facts > std::numeric_limits<uint64_t>::max() - capture_sequence_)
@@ -97,6 +98,18 @@ CheckResult NativeCollector::capture_frame(const NativeFrame &frame) {
         post.identity.rob_generation != expected->second.rob_generation)
       return invalid("BOOM post-retirement CSR value lacks its immediately preceding CSR owner");
     expected->second.after = post.value;
+  }
+  if (configuration_.check_fp_post) {
+    for (const auto &post : frame.fp_posts) {
+      const auto owner = pending_fp_.find(id(post.identity));
+      if (!frame.fp_probe_available || owner == pending_fp_.end() || owner->second.after ||
+          owner->second.retirement_cycle == UINT64_MAX ||
+          owner->second.retirement_cycle + 1 != frame.cycle ||
+          owner->second.retirement_cycle != post.source_cycle || owner->second.pc != post.pc ||
+          owner->second.rob_generation != post.identity.rob_generation)
+        return invalid("BOOM FP post-state lacks its immediately preceding transfer owner");
+      owner->second.after = FloatingPostState{post.fcsr, post.mstatus};
+    }
   }
   auto result = capture_allocations(frame);
   if (!result || !(result = capture_counter_write(frame)) || !(result = capture_attempts(frame)))
@@ -309,6 +322,13 @@ CheckResult NativeCollector::capture_retirements(const NativeFrame &frame) {
         skipped_device_stores_.erase(instruction_id);
       if (!result)
         return result;
+      if (configuration_.check_fp_post && decode_floating_transfer(core.instruction)) {
+        if (!frame.fp_probe_available)
+          return {CheckStatus::Unsupported, 0, "BOOM FP retirement lacks a physical status probe"};
+        if (!pending_fp_.emplace(instruction_id,
+              PendingFp{core.pc, frame.cycle, core.identity.rob_generation, std::nullopt}).second)
+          return invalid("BOOM FP retirement repeats an existing transfer owner");
+      }
       if (configuration_.check_csr_post && certified_csr_instruction(core.instruction)) {
         const bool counter_write = certified_counter_write(core.instruction);
         if (!(counter_write ? frame.csr_write_probe_available : frame.csr_probe_available))
@@ -327,8 +347,10 @@ CheckResult NativeCollector::capture_retirements(const NativeFrame &frame) {
           return invalid("BOOM CSR retirement repeats a pending CSR owner");
       }
     }
-    if (!core.architectural)
+    if (!core.architectural) {
       pending_counter_writes_.erase(instruction_id);
+      pending_fp_.erase(instruction_id);
+    }
     allocations_.erase(allocation);
     for (auto attempt = unresolved_samples_.begin(); attempt != unresolved_samples_.end();)
       if (attempt->first.first == instruction_id)
@@ -357,6 +379,7 @@ CheckResult NativeCollector::capture_terminations(const NativeFrame &frame) {
     if (!result)
       return result;
     pending_counter_writes_.erase(instruction_id);
+    pending_fp_.erase(instruction_id);
     allocations_.erase(allocation);
     for (auto attempt = unresolved_samples_.begin(); attempt != unresolved_samples_.end();)
       if (attempt->first.first == instruction_id)
@@ -400,6 +423,13 @@ CheckResult NativeCollector::take_ready(CollectedObservations &output) {
       through = std::min(through, csr.second.retirement_cycle - 1);
     }
   }
+  for (const auto &fp : pending_fp_) {
+    if (!fp.second.after) {
+      if (!fp.second.retirement_cycle)
+        return incomplete("BOOM FP retirement at cycle zero needs a delayed status sample");
+      through = std::min(through, fp.second.retirement_cycle - 1);
+    }
+  }
   for (const auto &attempt : unresolved_samples_) {
     if (!attempt.second)
       return pending("BOOM unresolved load can still sample cycle zero");
@@ -434,7 +464,7 @@ CheckResult NativeCollector::take_ready(CollectedObservations &output) {
     }
     ready.batch.events.push_back(std::move(converted));
   }
-  std::vector<OperationId> converted_csr;
+  std::vector<OperationId> converted_csr, converted_fp;
   for (const auto &retirement : staged_retirements_) {
     auto position = retirement_positions.find(retirement.id);
     if (position == retirement_positions.end())
@@ -446,6 +476,13 @@ CheckResult NativeCollector::take_ready(CollectedObservations &output) {
         return remember_failure(incomplete("BOOM CSR retirement escaped before its post-update sample"));
       captured.csr_post = std::make_pair(pending->second.address, *pending->second.after);
       converted_csr.push_back(retirement.id);
+    }
+    auto fp = pending_fp_.find(retirement.id);
+    if (fp != pending_fp_.end()) {
+      if (!fp->second.after)
+        return remember_failure(incomplete("BOOM FP retirement escaped without its physical status sample"));
+      captured.fp_post = *fp->second.after;
+      converted_fp.push_back(retirement.id);
     }
     ArchitecturalRetirement converted;
     result = convert_retirement_snapshot(captured, converted);
@@ -461,6 +498,8 @@ CheckResult NativeCollector::take_ready(CollectedObservations &output) {
       [&](const CapturedRetirement &event) { return retirement_positions.count(event.id); }), staged_retirements_.end());
   for (const auto &id : converted_csr)
     pending_csr_.erase(id);
+  for (const auto &id : converted_fp)
+    pending_fp_.erase(id);
   emitted_sequence_ = next_sequence;
   closed_cycle_ = through;
   output = std::move(ready);
@@ -482,7 +521,7 @@ CheckResult NativeCollector::completion() const {
   if (!captured_cycle_ || !closed_cycle_ || *closed_cycle_ != *captured_cycle_ ||
       !staged_events_.empty() || !staged_retirements_.empty() || !unresolved_samples_.empty() ||
       !allocations_.empty() || !pending_csr_.empty() || !pending_counter_writes_.empty() ||
-      !queues_empty_ || !cache_idle_)
+      !pending_fp_.empty() || !queues_empty_ || !cache_idle_)
     return incomplete("BOOM source, instruction or cache observations have not drained");
   return adapter_.completion();
 }

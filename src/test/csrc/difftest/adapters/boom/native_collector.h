@@ -37,6 +37,10 @@ struct NativeCsrPost {
   uint64_t source_cycle = 0, pc = 0, value = 0;
   uint16_t address = 0;
 };
+struct NativeFpPost {
+  ProbeIdentity identity;
+  uint64_t source_cycle = 0, pc = 0, fcsr = 0, mstatus = 0;
+};
 struct NativeFrame {
   uint32_t hart = 0;
   uint64_t epoch = 0;
@@ -55,6 +59,8 @@ struct NativeFrame {
   std::optional<NativeCsrPost> csr_post;
   bool csr_write_probe_available = false;
   std::optional<NativeCsrPost> csr_write_post;
+  bool fp_probe_available = false;
+  std::vector<NativeFpPost> fp_posts;
   std::vector<ProbeLoadRetirement> retired_loads;
   std::vector<NativeAttempt> store_releases;
   std::vector<NativeSquash> squashes;
@@ -79,6 +85,7 @@ struct NativeCollectorConfiguration {
   // Enables explicit device-store exclusion only for the opted-in DUT profile.
   bool skip_device_stores = false;
   bool check_csr_post = false;
+  bool check_fp_post = false;
 };
 struct CollectedObservations {
   EventBatch batch;
@@ -114,6 +121,13 @@ private:
   };
   std::map<OperationId, PendingCsr> pending_csr_;
   std::map<OperationId, NativeCsrPost> pending_counter_writes_;
+  struct PendingFp {
+    uint64_t pc = 0;
+    uint64_t retirement_cycle = 0;
+    uint64_t rob_generation = 0;
+    std::optional<FloatingPostState> after;
+  };
+  std::map<OperationId, PendingFp> pending_fp_;
   std::map<AttemptKey, uint64_t> unresolved_samples_;
   std::vector<RuntimeEvent> staged_events_;
   std::vector<CapturedRetirement> staged_retirements_;

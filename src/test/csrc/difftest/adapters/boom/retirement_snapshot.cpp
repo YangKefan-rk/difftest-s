@@ -1,6 +1,7 @@
 #include "retirement_snapshot.h"
 #include "csr_profile.h"
 #include "readonly_hartid.h"
+#include "../../rvwmo/dependency.h"
 #include <set>
 #include <utility>
 
@@ -55,8 +56,16 @@ CheckResult convert_retirement_snapshot(const CapturedRetirement &captured, Arch
       captured.csr_post->first == (captured.instruction >> 20);
   if (captured.csr_post && !checked_csr)
     return invalid("BOOM CSR post-state is not the retired instruction's physical CSR address");
-  result = checked_csr && captured.coverage == RetirementResultCoverage::CsrStateNeedsComparator
-      ? CheckResult{} : validate_coverage(captured.coverage);
+  const bool checked_fp = captured.fp_post.has_value() &&
+      decode_floating_transfer(captured.instruction).has_value();
+  if (captured.fp_post && !checked_fp)
+    return invalid("BOOM floating post-state belongs to an unsupported instruction");
+  const bool checked_fp_coverage = checked_fp &&
+      (captured.coverage == RetirementResultCoverage::FloatingRegisterAndFflagsNeedComparator ||
+       captured.coverage == RetirementResultCoverage::FloatingFlagsNeedComparator ||
+       captured.coverage == RetirementResultCoverage::Complete);
+  result = (checked_csr && captured.coverage == RetirementResultCoverage::CsrStateNeedsComparator) ||
+           checked_fp_coverage ? CheckResult{} : validate_coverage(captured.coverage);
   if (!result)
     return result;
   if ((captured.instruction & 0x7f) == 0x73 && ((captured.instruction >> 12) & 7) != 0) {
@@ -67,8 +76,10 @@ CheckResult convert_retirement_snapshot(const CapturedRetirement &captured, Arch
          *captured.destination_register != ((captured.instruction >> 7) & 31)))
       return invalid("BOOM read-only mhartid retirement omits its decoded integer destination");
   }
-  if (captured.destination_type == IntegerDestinationType::Floating)
-    return unsupported("BOOM floating destination is outside the scalar integer session");
+  if (decode_floating_transfer(captured.instruction) && !checked_fp)
+    return unsupported("BOOM floating transfer lacks physical FCSR and mstatus comparison");
+  if (captured.destination_type == IntegerDestinationType::Floating && !checked_fp)
+    return unsupported("BOOM floating destination lacks architectural result comparison");
 
   ArchitecturalRetirement converted;
   converted.id = captured.id;
@@ -76,6 +87,13 @@ CheckResult convert_retirement_snapshot(const CapturedRetirement &captured, Arch
   converted.instruction = captured.instruction;
   if (checked_csr)
     converted.csr_post = captured.csr_post;
+  if (checked_fp)
+    converted.fp_post = captured.fp_post;
+  if (captured.destination_type == IntegerDestinationType::Floating) {
+    converted.destination = ArchitecturalDestination::Floating;
+    converted.destination_register = *captured.destination_register;
+    converted.destination_value = *captured.destination_value;
+  }
   if (captured.destination_type == IntegerDestinationType::Integer && *captured.destination_register != 0) {
     converted.destination = ArchitecturalDestination::Integer;
     converted.destination_register = *captured.destination_register;

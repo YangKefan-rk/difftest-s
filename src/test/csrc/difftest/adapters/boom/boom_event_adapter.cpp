@@ -2,6 +2,7 @@
 #include "readonly_hartid.h"
 #include "../../rvwmo/checker_event_consumer.h"
 #include "../../rvwmo/stream.h"
+#include "../../rvwmo/dependency.h"
 #include "../../rvwmo/producer_ids.h"
 #include <algorithm>
 #include <limits>
@@ -23,6 +24,10 @@ bool valid_bytes(uint64_t address, const std::vector<uint8_t> &bytes, const std:
 }
 
 std::optional<uint8_t> scalar_memory_log2_size(uint32_t instruction, uint8_t length, bool load) {
+  const auto floating = decode_floating_transfer(instruction);
+  if (floating && ((load && floating->kind == FloatingTransferKind::Load) ||
+                   (!load && floating->kind == FloatingTransferKind::Store)))
+    return floating->bytes == 8 ? 3 : 2;
   unsigned function = 0;
   if (length == 4) {
     const unsigned expected_opcode = load ? 0x03 : 0x23;
@@ -134,8 +139,9 @@ std::optional<uint8_t> floating_rd(uint32_t instruction, uint8_t length) {
   if (length == 2) {
     const unsigned quadrant = instruction & 3;
     const unsigned function = (instruction >> 13) & 7;
-    if ((quadrant == 0 || quadrant == 2) && (function == 1 || function == 5))
-      return static_cast<uint8_t>((instruction >> 7) & 31);
+    if ((quadrant == 0 || quadrant == 2) && function == 1)
+      return static_cast<uint8_t>(quadrant == 0 ? 8 + ((instruction >> 2) & 7) :
+                                                 (instruction >> 7) & 31);
     return std::nullopt;
   }
   if (length != 4)
@@ -326,14 +332,18 @@ CheckResult BoomEventAdapter::allocate(const InstructionAllocation &record) {
   const unsigned opcode = record.instruction & 0x7f;
   const unsigned quadrant = record.instruction & 3;
   const unsigned compressed_function = (record.instruction >> 13) & 7;
+  const auto floating = decode_floating_transfer(record.instruction);
+  const bool floating_load = floating && floating->kind == FloatingTransferKind::Load;
+  const bool floating_store = floating && floating->kind == FloatingTransferKind::Store;
   const bool unsupported_memory =
-      (record.length == 4 && (opcode == 0x2f || opcode == 0x07 || opcode == 0x27)) ||
+      (record.length == 4 && (opcode == 0x2f ||
+        ((opcode == 0x07 || opcode == 0x27) && !floating))) ||
       (record.length == 2 && (quadrant == 0 || quadrant == 2) &&
-       (compressed_function == 1 || compressed_function == 5));
-  const bool load = record.length == 4 ? opcode == 0x03 :
-      (quadrant == 0 || quadrant == 2) && (compressed_function == 2 || compressed_function == 3);
-  const bool store = record.length == 4 ? opcode == 0x23 :
-      (quadrant == 0 || quadrant == 2) && (compressed_function == 6 || compressed_function == 7);
+       (compressed_function == 1 || compressed_function == 5) && !floating);
+  const bool load = floating_load || (record.length == 4 ? opcode == 0x03 :
+      (quadrant == 0 || quadrant == 2) && (compressed_function == 2 || compressed_function == 3));
+  const bool store = floating_store || (record.length == 4 ? opcode == 0x23 :
+      (quadrant == 0 || quadrant == 2) && (compressed_function == 6 || compressed_function == 7));
   if (!unsupported_memory && (load != record.ldq.has_value() ||
       (store != record.stq.has_value() && !(record.stq && fence_instruction(record.instruction)))))
     return invalid("BOOM raw scalar opcode does not match its LDQ/STQ allocation");

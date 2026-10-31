@@ -2,6 +2,7 @@
 #define DIFFTEST_ADAPTERS_BOOM_EVENT_ADAPTER_H
 
 #include "../../rvwmo/event.h"
+#include "../../rvwmo/session.h"
 #include <map>
 #include <optional>
 #include <utility>
@@ -134,6 +135,7 @@ struct CapturedRetirement {
   std::optional<uint64_t> destination_value;
   RetirementResultCoverage coverage = RetirementResultCoverage::Complete;
   std::optional<std::pair<uint16_t, uint64_t>> csr_post;
+  std::optional<FloatingPostState> fp_post;
 };
 
 struct Retirement {
