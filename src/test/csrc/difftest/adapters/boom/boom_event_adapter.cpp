@@ -453,18 +453,28 @@ CheckResult BoomEventAdapter::begin_load_attempt(const LoadAttempt &record, cons
   result = validate_source(source_lower_bound);
   if (!result)
     return result;
-  if (instruction->attempts.size() >= limits_.attempts_per_load)
-    return incomplete("BOOM load exceeded the configured attempt history bound");
+  std::optional<uint32_t> cancelled_predecessor;
   if (instruction->latest_attempt) {
     if (record.attempt <= *instruction->latest_attempt)
       return invalid("BOOM load attempt did not increase monotonically");
-    if (instruction->attempts.at(*instruction->latest_attempt).state != AttemptState::Cancelled)
+    const auto previous = instruction->attempts.find(*instruction->latest_attempt);
+    if (previous == instruction->attempts.end())
+      return invalid("BOOM latest load attempt has no live lifecycle record");
+    if (previous->second.state != AttemptState::Cancelled)
       return invalid("BOOM replay began before cancellation of the previous load attempt");
+    cancelled_predecessor = previous->first;
   }
   if (source_lower_bound.producer_id != hart_producer_id(hart_))
     return invalid("BOOM load attempt lower bound must use its hart-private producer");
   if (source_lower_bound.position.cycle < instruction->allocation.source.position.cycle)
     return invalid("BOOM load attempt precedes its instruction allocation");
+  const size_t retained_attempts = instruction->attempts.size() - (cancelled_predecessor ? 1U : 0U);
+  if (retained_attempts >= limits_.attempts_per_load)
+    return incomplete("BOOM live load attempt history exceeded its configured bound");
+  // The previous cancellation already has a public event. Its attempt number
+  // remains below latest_attempt, so late samples/cancels still fail lookup.
+  if (cancelled_predecessor)
+    instruction->attempts.erase(*cancelled_predecessor);
   // A begin is a private sampling lower bound, not a public stream event. Its
   // eventual sample can return after other observations with the same source
   // cycle and receives its public sequence only when that prefix is complete.
