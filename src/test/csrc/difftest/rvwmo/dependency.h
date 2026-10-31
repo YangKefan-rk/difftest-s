@@ -2,8 +2,20 @@
 #define DIFFTEST_RVWMO_DEPENDENCY_H
 #include "event.h"
 #include <map>
+#include <optional>
 
 namespace rvwmo {
+enum class FloatingTransferKind { Load, Store, FromInteger, ToInteger };
+struct FloatingTransfer {
+  FloatingTransferKind kind;
+  uint8_t integer_register = 0;
+  uint8_t floating_register = 0;
+  uint8_t bytes = 0;
+};
+// Only scalar floating data transfers are covered; arithmetic and vector
+// memory encodings remain unsupported until their own semantics are supplied.
+std::optional<FloatingTransfer> decode_floating_transfer(uint32_t instruction);
+
 struct DependencySummary {
   bool valid = false;
   uint64_t rank = 0;

@@ -26,7 +26,15 @@ struct ReferenceLoadValue {
   std::vector<uint8_t> expected_bytes;
 };
 
-enum class ArchitecturalDestination : uint8_t { None, Integer, Unsupported };
+enum class ArchitecturalDestination : uint8_t { None, Integer, Unsupported, Floating };
+
+struct FloatingPostState {
+  uint64_t fcsr = 0;
+  uint64_t mstatus = 0;
+  bool operator==(const FloatingPostState &other) const {
+    return fcsr == other.fcsr && mstatus == other.mstatus;
+  }
+};
 
 struct ArchitecturalRetirement {
   OperationId id;
@@ -37,9 +45,15 @@ struct ArchitecturalRetirement {
   uint64_t destination_value = 0;
   // Independently observed CSRFile state after this retirement; opt-in.
   std::optional<std::pair<uint16_t, uint64_t>> csr_post;
+  std::optional<FloatingPostState> fp_post;
 };
 
 struct ReferenceIntegerWrite {
+  uint8_t destination_register = 0;
+  uint64_t value = 0;
+};
+
+struct ReferenceFloatingWrite {
   uint8_t destination_register = 0;
   uint64_t value = 0;
 };
@@ -55,6 +69,8 @@ struct ReferenceStepResult {
   CheckResult check;
   std::vector<ReferenceStoreValue> stores;
   std::optional<ReferenceIntegerWrite> integer_write;
+  std::optional<ReferenceFloatingWrite> floating_write;
+  std::optional<FloatingPostState> fp_post;
   uint64_t reference_pc = 0;
   uint32_t reference_instruction = 0;
   bool took_trap = false;

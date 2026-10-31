@@ -318,7 +318,7 @@ CheckResult ObservationSession::step_reference(const InstructionRetireEvent &ret
   if (!reference_stepper_)
     return {CheckStatus::Unsupported, 0, "retirement has no independent reference-step callback"};
   if (snapshot.destination == ArchitecturalDestination::Unsupported)
-    return {CheckStatus::Unsupported, 0, "architectural destination type is outside the scalar integer session"};
+    return {CheckStatus::Unsupported, 0, "architectural destination type is outside the supported session"};
 
   std::vector<ReferenceLoadValue> loads;
   for (const auto &operation : retirement.instruction.memory) {
@@ -372,8 +372,25 @@ CheckResult ObservationSession::step_reference(const InstructionRetireEvent &ret
         result.integer_write->destination_register != snapshot.destination_register ||
         result.integer_write->value != snapshot.destination_value)
       return {CheckStatus::Violation, 0, "reference integer write differs from the DUT retirement snapshot"};
-  } else if (snapshot.destination_register != 0 || result.integer_write) {
-    return {CheckStatus::Violation, 0, "unexpected integer write for a non-writing retirement"};
+    if (result.floating_write)
+      return {CheckStatus::Violation, 0, "reference produced an unexpected floating-register write"};
+  } else if (snapshot.destination == ArchitecturalDestination::Floating) {
+    if (snapshot.destination_register >= 32 || !result.floating_write ||
+        result.floating_write->destination_register != snapshot.destination_register ||
+        result.floating_write->value != snapshot.destination_value)
+      return {CheckStatus::Violation, 0, "reference floating-register write differs from the DUT retirement snapshot"};
+    if (result.integer_write)
+      return {CheckStatus::Violation, 0, "reference produced an unexpected integer write"};
+  } else {
+    if (snapshot.destination_register != 0 || result.integer_write || result.floating_write)
+      return {CheckStatus::Violation, 0, "unexpected register write for a non-writing retirement"};
+  }
+  if (snapshot.fp_post) {
+    if (!result.fp_post || result.fp_post->fcsr != snapshot.fp_post->fcsr ||
+        result.fp_post->mstatus != snapshot.fp_post->mstatus)
+      return {CheckStatus::Violation, 0, "reference floating CSR state differs from the DUT retirement snapshot"};
+  } else if (result.fp_post) {
+    return {CheckStatus::Violation, 0, "reference produced an unexpected floating CSR state"};
   }
 
   ++statistics.architecture_compared;
@@ -481,12 +498,16 @@ SessionSubmitResult ObservationSession::submit(const EventBatch &batch,
   for (const auto &snapshot : retirements) {
     const bool supported_destination = snapshot.destination == ArchitecturalDestination::None ||
                                        snapshot.destination == ArchitecturalDestination::Integer ||
+                                       snapshot.destination == ArchitecturalDestination::Floating ||
                                        snapshot.destination == ArchitecturalDestination::Unsupported;
     if (!snapshot.id.uid || snapshot.id.subaccess != 0 || snapshot.pc % 2 ||
         !supported_destination ||
-        (snapshot.destination == ArchitecturalDestination::Integer &&
-         (snapshot.destination_register == 0 || snapshot.destination_register >= 32)) ||
-        (snapshot.destination != ArchitecturalDestination::Integer && snapshot.destination_register != 0) ||
+        ((snapshot.destination == ArchitecturalDestination::Integer &&
+          (snapshot.destination_register == 0 || snapshot.destination_register >= 32)) ||
+         (snapshot.destination == ArchitecturalDestination::Floating &&
+          snapshot.destination_register >= 32)) ||
+        ((snapshot.destination == ArchitecturalDestination::None ||
+          snapshot.destination == ArchitecturalDestination::Unsupported) && snapshot.destination_register != 0) ||
         architectural_retirements_.count(snapshot.id) || !new_retirement_ids.insert(snapshot.id).second) {
       result.transport = {EventValidationStatus::Invalid, "invalid or duplicate architectural retirement snapshot"};
       result.check = remember_failure(invalid("invalid or duplicate architectural retirement snapshot"));

@@ -174,10 +174,71 @@ CheckResult decode_system(uint32_t instruction, DependencyMetadata &metadata) {
 }
 } // namespace
 
+std::optional<FloatingTransfer> decode_floating_transfer(uint32_t instruction) {
+  const auto opcode = instruction & 0x7f;
+  const auto function = (instruction >> 12) & 7;
+  const auto rd = static_cast<uint8_t>((instruction >> 7) & 31);
+  const auto rs1 = static_cast<uint8_t>((instruction >> 15) & 31);
+  const auto rs2 = static_cast<uint8_t>((instruction >> 20) & 31);
+  if ((instruction & 3) != 3) {
+    const auto quadrant = instruction & 3;
+    const auto compressed_function = (instruction >> 13) & 7;
+    if (quadrant != 0 && quadrant != 2)
+      return std::nullopt;
+    const auto base = static_cast<uint8_t>(quadrant == 0 ? 8 + ((instruction >> 7) & 7) : 2);
+    if (compressed_function == 1) {
+      const auto target = static_cast<uint8_t>(quadrant == 0 ? 8 + ((instruction >> 2) & 7) : rd);
+      return FloatingTransfer{FloatingTransferKind::Load, base, target, 8};
+    }
+    if (compressed_function == 5) {
+      const auto source = static_cast<uint8_t>(quadrant == 0 ? 8 + ((instruction >> 2) & 7)
+                                                                           : (instruction >> 2) & 31);
+      return FloatingTransfer{FloatingTransferKind::Store, base, source, 8};
+    }
+    return std::nullopt;
+  }
+  if ((opcode == 0x07 || opcode == 0x27) && (function == 2 || function == 3))
+    return FloatingTransfer{opcode == 0x07 ? FloatingTransferKind::Load : FloatingTransferKind::Store,
+                            rs1, opcode == 0x07 ? rd : rs2, static_cast<uint8_t>(1U << function)};
+  if (opcode != 0x53 || function != 0 || rs2 != 0)
+    return std::nullopt;
+  switch (instruction >> 25) {
+  case 0x78: return FloatingTransfer{FloatingTransferKind::FromInteger, rs1, rd, 4};
+  case 0x79: return FloatingTransfer{FloatingTransferKind::FromInteger, rs1, rd, 8};
+  case 0x70: return FloatingTransfer{FloatingTransferKind::ToInteger, rd, rs1, 4};
+  case 0x71: return FloatingTransfer{FloatingTransferKind::ToInteger, rd, rs1, 8};
+  default: return std::nullopt;
+  }
+}
+
 CheckResult decode_dependencies(uint32_t inst, DependencyMetadata &m) {
   m = {};
   m.provided = true;
   const unsigned rd = (inst >> 7) & 31, rs1 = (inst >> 15) & 31, rs2 = (inst >> 20) & 31;
+  if (const auto transfer = decode_floating_transfer(inst)) {
+    const auto floating = 32U + transfer->floating_register;
+    switch (transfer->kind) {
+    case FloatingTransferKind::Load:
+      m.sources = m.address_sources = {transfer->integer_register};
+      m.destinations = {floating};
+      m.carries_to_destination = false;
+      break;
+    case FloatingTransferKind::Store:
+      m.sources = {transfer->integer_register, floating};
+      m.address_sources = {transfer->integer_register};
+      m.data_sources = {floating};
+      break;
+    case FloatingTransferKind::FromInteger:
+      m.sources = {transfer->integer_register};
+      m.destinations = {floating};
+      break;
+    case FloatingTransferKind::ToInteger:
+      m.sources = {floating};
+      m.destinations = {transfer->integer_register};
+      break;
+    }
+    return {};
+  }
   if ((inst & 3) != 3) {
     const unsigned quadrant = inst & 3, funct = (inst >> 13) & 7;
     const unsigned compact1 = 8 + ((inst >> 7) & 7), compact2 = 8 + ((inst >> 2) & 7);

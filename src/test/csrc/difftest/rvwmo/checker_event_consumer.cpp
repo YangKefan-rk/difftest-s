@@ -1,4 +1,5 @@
 #include "checker_event_consumer.h"
+#include "dependency.h"
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
@@ -482,25 +483,31 @@ CheckResult CheckerEventConsumer::consume_retire(const InstructionRetireEvent &e
                                     [](const MemoryOperation &operation) { return operation.load; });
   const bool has_store = std::any_of(instruction.memory.begin(), instruction.memory.end(),
                                      [](const MemoryOperation &operation) { return operation.store; });
+  const auto floating = decode_floating_transfer(instruction.instruction);
+  const bool floating_load = floating && floating->kind == FloatingTransferKind::Load;
+  const bool floating_store = floating && floating->kind == FloatingTransferKind::Store;
   if (allocation->second.length == 2) {
     const unsigned quadrant = instruction.instruction & 3;
     const unsigned funct3 = (instruction.instruction >> 13) & 7;
-    if ((quadrant == 0 || quadrant == 2) && (funct3 == 1 || funct3 == 5))
-      return remember_failure(unsupported("floating compressed memory instruction needs a wider REF adapter"));
-    const bool compressed_load = (quadrant == 0 || quadrant == 2) && (funct3 == 2 || funct3 == 3);
-    const bool compressed_store = (quadrant == 0 || quadrant == 2) && (funct3 == 6 || funct3 == 7);
+    const bool fp_memory = (quadrant == 0 || quadrant == 2) && (funct3 == 1 || funct3 == 5);
+    if (fp_memory && !floating)
+      return remember_failure(unsupported("compressed floating memory encoding lacks a verified transfer"));
+    const bool compressed_load = floating_load ||
+        ((quadrant == 0 || quadrant == 2) && (funct3 == 2 || funct3 == 3));
+    const bool compressed_store = floating_store ||
+        ((quadrant == 0 || quadrant == 2) && (funct3 == 6 || funct3 == 7));
     if ((compressed_load && (!has_load || has_store)) || (compressed_store && (!has_store || has_load)))
-      return remember_failure(incomplete("compressed scalar load/store lacks its matching memory event"));
+      return remember_failure(incomplete("compressed load/store lacks its matching memory event"));
     if (!compressed_load && !compressed_store && !instruction.memory.empty())
       return remember_failure(invalid("compressed non-memory opcode carries a memory effect"));
   } else {
     const uint32_t opcode = instruction.instruction & 0x7f;
-    if (opcode == 0x07 || opcode == 0x27 || opcode == 0x2f)
-      return remember_failure(unsupported("floating/vector or atomic memory opcode needs a richer consumer"));
-    if ((opcode == 0x03 && (!has_load || has_store)) ||
-        (opcode == 0x23 && (!has_store || has_load) && !instruction.skipped_device_store))
-      return remember_failure(incomplete("scalar load/store retirement lacks its matching memory event"));
-    if (opcode != 0x03 && opcode != 0x23 && !instruction.memory.empty())
+    if (opcode == 0x2f || ((opcode == 0x07 || opcode == 0x27) && !floating))
+      return remember_failure(unsupported("vector or atomic memory opcode needs a richer consumer"));
+    if (((opcode == 0x03 || floating_load) && (!has_load || has_store)) ||
+        ((opcode == 0x23 || floating_store) && (!has_store || has_load) && !instruction.skipped_device_store))
+      return remember_failure(incomplete("supported load/store retirement lacks its matching memory event"));
+    if (opcode != 0x03 && opcode != 0x23 && !floating_load && !floating_store && !instruction.memory.empty())
       return remember_failure(invalid("non-load/store opcode carries a memory effect"));
     if (opcode == 0x0f && ((instruction.instruction >> 12) & 7) == 2)
       return remember_failure(unsupported("cache-block operation is not modeled by this consumer"));

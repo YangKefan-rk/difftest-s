@@ -1,4 +1,5 @@
 #include "spike_reference_stepper.h"
+#include "dependency.h"
 
 #include <algorithm>
 #include <cstring>
@@ -206,7 +207,7 @@ ReferenceStepResult SpikeReferenceStepper::skip_device_store(
       (instruction.instruction & 0x7f) != 0x23 ||
       ((instruction.instruction >> 12) & 7) != 3 ||
       snapshot.destination != ArchitecturalDestination::None || snapshot.destination_register ||
-      snapshot.destination_value) {
+      snapshot.destination_value || snapshot.fp_post || snapshot.csr_post) {
     result.check = invalid("device-store skip has a RAM effect, non-store opcode or architectural writeback");
     return result;
   }
@@ -382,6 +383,33 @@ ReferenceStepResult SpikeReferenceStepper::step(const InstructionRetireEvent &re
   }
   if (state.wrote_integer && after.gpr[state.destination] != state.value) {
     return fail_after_step(invalid("Spike retirement observer differs from its post-step integer register state"));
+  }
+  const auto floating_transfer = decode_floating_transfer(retirement.instruction.instruction);
+  if (floating_transfer) {
+    if (!snapshot.fp_post)
+      return fail_after_step(incomplete("floating transfer lacks an independently observed FP CSR poststate"));
+    const bool writes_fpr = floating_transfer->kind == FloatingTransferKind::Load ||
+                            floating_transfer->kind == FloatingTransferKind::FromInteger;
+    const bool writes_gpr = floating_transfer->kind == FloatingTransferKind::ToInteger &&
+                            floating_transfer->integer_register != 0;
+    if ((writes_fpr && (snapshot.destination != ArchitecturalDestination::Floating ||
+                        snapshot.destination_register != floating_transfer->floating_register)) ||
+        (writes_gpr && (snapshot.destination != ArchitecturalDestination::Integer ||
+                        snapshot.destination_register != floating_transfer->integer_register)) ||
+        (!writes_fpr && !writes_gpr && snapshot.destination != ArchitecturalDestination::None))
+      return fail_after_step(invalid("floating transfer has an inconsistent retirement destination"));
+    for (uint8_t reg = 0; reg < 32; ++reg)
+      if ((!writes_fpr || reg != floating_transfer->floating_register) &&
+          before.fpr[reg] != after.fpr[reg])
+        return fail_after_step(violation("Spike changed an unrelated floating register during a transfer"));
+    if (before.fcsr != after.fcsr)
+      return fail_after_step(violation("floating data transfer unexpectedly changed Spike fcsr"));
+    if (writes_fpr)
+      result.floating_write = ReferenceFloatingWrite{floating_transfer->floating_register,
+                                                       after.fpr[floating_transfer->floating_register]};
+    result.fp_post = FloatingPostState{after.fcsr, after.mstatus};
+  } else if (snapshot.fp_post || snapshot.destination == ArchitecturalDestination::Floating) {
+    return fail_after_step(unsupported("floating architectural state requires a supported transfer instruction"));
   }
   if (snapshot.csr_post) {
     uint64_t reference_csr = 0;
