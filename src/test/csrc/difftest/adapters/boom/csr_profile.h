@@ -36,6 +36,7 @@ inline bool certified_csr_instruction(uint32_t instruction) {
   case 0x304: // mie
   case 0x305: // mtvec
   case 0x340: // mscratch
+  case 0x341: // mepc
   case 0x342: // mcause
   case 0x343: // mtval
   case 0x3a0: // pmpcfg0
