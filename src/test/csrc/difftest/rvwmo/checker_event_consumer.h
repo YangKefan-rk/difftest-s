@@ -120,7 +120,8 @@ private:
   CheckResult consume_load_sample(const RuntimeEvent &event, const LoadSampleEvent &sample,
                                   RankCertificate certificate = RankCertificate::None,
                                   bool source_prefix_closed = false);
-  CheckResult consume_atomic(const RuntimeEvent &event, const AtomicLifecycleEvent &atomic);
+  CheckResult consume_atomic(const RuntimeEvent &event, const AtomicLifecycleEvent &atomic,
+                             RankCertificate certificate = RankCertificate::None);
   CheckResult consume_store_publish(const RuntimeEvent &event, const StorePublishEvent &publish,
                                     RankCertificate certificate = RankCertificate::None);
   CheckResult consume_coalesced_store_publish(const RuntimeEvent &event, const StorePublishEvent &publish);

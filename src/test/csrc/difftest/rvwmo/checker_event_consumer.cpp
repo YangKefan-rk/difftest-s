@@ -108,6 +108,12 @@ CheckResult CheckerEventConsumer::require_rank(const RuntimeEvent &event, Observ
       if (certificate != RankCertificate::IndependentEffects || publish->members.size() != 1)
         return incomplete("equal-rank publication is not a certified independent effect");
       id = publish->members.front().id;
+    } else if (const auto *atomic = std::get_if<AtomicLifecycleEvent>(&event.payload)) {
+      if (certificate != RankCertificate::IndependentEffects ||
+          atomic->phase != AtomicObservationPhase::RmwEffect)
+        return incomplete("certified memory group contains an unsupported atomic effect");
+      id = atomic->id;
+      attempt = atomic->attempt;
     } else {
       return incomplete("certified memory group contains an unsupported event kind");
     }
@@ -226,7 +232,8 @@ CheckResult CheckerEventConsumer::consume_load_sample(const RuntimeEvent &event,
 }
 
 CheckResult CheckerEventConsumer::consume_atomic(const RuntimeEvent &event,
-                                                       const AtomicLifecycleEvent &atomic) {
+                                                 const AtomicLifecycleEvent &atomic,
+                                                 RankCertificate certificate) {
   if (!failure_)
     return failure_;
   const auto parent = instruction_id(atomic.id);
@@ -318,7 +325,7 @@ CheckResult CheckerEventConsumer::consume_atomic(const RuntimeEvent &event,
     if (loads_.size() >= max_live_instructions_ || stores_.size() >= max_live_instructions_)
       return pending("bounded AMO state is full before its indivisible memory effect");
     ObservationTime time;
-    auto result = require_rank(event, time);
+    auto result = require_rank(event, time, certificate);
     if (!result)
       return result;
     MemoryOperation read;
@@ -362,7 +369,7 @@ CheckResult CheckerEventConsumer::consume_atomic(const RuntimeEvent &event,
     record.old_data = atomic.data;
     record.new_data = atomic.new_data;
     record.request_seen = record.read_seen = record.write_seen = true;
-    remember_rank(event, time, RankCertificate::None, record.id, record.attempt);
+    remember_rank(event, time, certificate, record.id, record.attempt);
     return result.status == CheckStatus::Pending ? result : CheckResult{};
   }
   case AtomicObservationPhase::Replay: {
@@ -433,6 +440,11 @@ CheckResult CheckerEventConsumer::consume_independent_group_member(const Runtime
     const auto *publish = std::get_if<StorePublishEvent>(&event.payload);
     if (publish)
       return consume_store_publish(event, *publish, RankCertificate::IndependentEffects);
+  }
+  if (event.kind == RuntimeEventKind::AtomicLifecycle) {
+    const auto *atomic = std::get_if<AtomicLifecycleEvent>(&event.payload);
+    if (atomic && atomic->phase == AtomicObservationPhase::RmwEffect)
+      return consume_atomic(event, *atomic, RankCertificate::IndependentEffects);
   }
   return remember_failure(invalid("independent memory group contains an unsupported effect"));
 }
