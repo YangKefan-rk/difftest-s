@@ -25,7 +25,7 @@ struct ReferenceLoadValue {
   std::vector<uint8_t> expected_bytes;
 };
 
-enum class ArchitecturalDestination : uint8_t { None, Integer, Unsupported };
+enum class ArchitecturalDestination : uint8_t { None = 0, Integer = 1, Unsupported = 2, FloatingPoint = 3 };
 
 struct ArchitecturalRetirement {
   OperationId id;
@@ -34,9 +34,17 @@ struct ArchitecturalRetirement {
   ArchitecturalDestination destination = ArchitecturalDestination::None;
   uint8_t destination_register = 0;
   uint64_t destination_value = 0;
+  // Only provide a CSR snapshot aligned to this instruction's exact post-state.
+  // A delayed FPR writeback does not by itself identify such a CSR boundary.
+  std::optional<uint8_t> fcsr;
 };
 
 struct ReferenceIntegerWrite {
+  uint8_t destination_register = 0;
+  uint64_t value = 0;
+};
+
+struct ReferenceFloatingPointWrite {
   uint8_t destination_register = 0;
   uint64_t value = 0;
 };
@@ -55,6 +63,8 @@ struct ReferenceStepResult {
   uint64_t reference_pc = 0;
   uint32_t reference_instruction = 0;
   bool took_trap = false;
+  std::optional<ReferenceFloatingPointWrite> floating_point_write;
+  std::optional<uint8_t> fcsr;
 };
 
 struct SessionHartStatistics {

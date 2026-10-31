@@ -172,12 +172,197 @@ CheckResult decode_system(uint32_t instruction, DependencyMetadata &metadata) {
   }
   return {};
 }
+
+bool valid_rounding(unsigned mode) { return mode <= 4 || mode == 7; }
+
+unsigned floating_point_flag_mask(uint32_t instruction) {
+  const unsigned opcode = instruction & 127;
+  if (opcode == 0x43 || opcode == 0x47 || opcode == 0x4b || opcode == 0x4f)
+    return 0x17; // NV, OF, UF, NX; fused arithmetic cannot divide by zero.
+  if (opcode != 0x53)
+    return 0;
+  const unsigned operation = instruction >> 27;
+  switch (operation) {
+    case 0: case 1: case 2: return 0x17;
+    case 3: return 0x1f;
+    case 5: case 20: return 0x10;
+    case 8: return ((instruction >> 25) & 3) == 1 ? 0x10 : 0x17;
+    case 11: case 24: return 0x11;
+    case 26: return 1; // W/L conversions can round or raise inexact.
+    default: return 0;
+  }
+}
+
+void floating_point_dependencies(uint32_t instruction, const FloatingPointInstruction &decoded,
+                                 DependencyMetadata &metadata) {
+  const bool compressed = (instruction & 3) != 3;
+  const unsigned rs1 = (instruction >> 15) & 31;
+  const unsigned rs2 = (instruction >> 20) & 31;
+  const unsigned opcode = instruction & 127;
+  if (decoded.load || decoded.store) {
+    const unsigned address = compressed
+        ? ((instruction & 3) == 0 ? 8 + ((instruction >> 7) & 7) : 2) : rs1;
+    metadata.sources = metadata.address_sources = {address};
+    if (decoded.load) {
+      metadata.destinations = {floating_point_register_base + decoded.destination};
+      metadata.carries_to_destination = false;
+    } else {
+      const unsigned data = compressed
+          ? ((instruction & 3) == 0 ? 8 + ((instruction >> 2) & 7) : (instruction >> 2) & 31) : rs2;
+      metadata.data_sources = {floating_point_register_base + data};
+      metadata.sources.push_back(floating_point_register_base + data);
+    }
+    return;
+  }
+
+  const unsigned operation = instruction >> 27;
+  std::vector<unsigned> inputs;
+  if (opcode == 0x53 && (operation == 26 || operation == 30)) {
+    inputs = {rs1};
+  } else {
+    inputs = {floating_point_register_base + rs1};
+    if (opcode != 0x53 || operation <= 5 || operation == 20)
+      inputs.push_back(floating_point_register_base + rs2);
+    if (opcode != 0x53)
+      inputs.push_back(floating_point_register_base + ((instruction >> 27) & 31));
+  }
+  if (decoded.reads_rounding_mode)
+    inputs.push_back(frm_dependency);
+  metadata.sources = inputs;
+  if (decoded.writes_floating_point || decoded.writes_integer) {
+    metadata.destinations.push_back(decoded.writes_floating_point
+        ? floating_point_register_base + decoded.destination : decoded.destination);
+    metadata.destination_sources.push_back(inputs);
+  }
+  const unsigned flag_mask = floating_point_flag_mask(instruction);
+  for (unsigned bit = 0; bit < 5; ++bit) {
+    if (!(flag_mask & (1U << bit)))
+      continue;
+    const auto unit = fflags_dependency_base + bit;
+    metadata.sources.push_back(unit);
+    metadata.destinations.push_back(unit);
+    auto carriers = inputs;
+    carriers.push_back(unit); // Accrual preserves the previous flag value.
+    metadata.destination_sources.push_back(std::move(carriers));
+  }
+}
 } // namespace
+
+CheckResult decode_floating_point_instruction(uint32_t instruction, FloatingPointInstruction &decoded) {
+  decoded = {};
+  const unsigned rd = (instruction >> 7) & 31;
+  const unsigned rs2 = (instruction >> 20) & 31;
+  const unsigned rounding = (instruction >> 12) & 7;
+  if ((instruction & 3) != 3) {
+    const unsigned quadrant = instruction & 3;
+    const unsigned function = (instruction >> 13) & 7;
+    if (quadrant == 0 || quadrant == 2) {
+      if (function == 1) {
+        decoded.recognized = decoded.load = decoded.writes_floating_point = true;
+        decoded.destination = quadrant == 0 ? 8 + ((instruction >> 2) & 7) : rd;
+      } else if (function == 5) {
+        decoded.recognized = decoded.store = true;
+      } else if (function == 3 || function == 7) {
+        // In RV64 these encodings are C.LD/C.SD, not floating-point C.FLW/C.FSW.
+        return {};
+      }
+    }
+    return {};
+  }
+  const unsigned opcode = instruction & 127;
+  const bool fused = opcode == 0x43 || opcode == 0x47 || opcode == 0x4b || opcode == 0x4f;
+  if (opcode != 0x07 && opcode != 0x27 && opcode != 0x53 && !fused)
+    return {};
+  decoded.recognized = true;
+  decoded.destination = rd;
+  auto unsupported_encoding = [] {
+    return CheckResult{CheckStatus::Unsupported, 0, "floating-point encoding is outside RV64 F/D support"};
+  };
+  if (opcode == 0x07 || opcode == 0x27) {
+    if (rounding != 2 && rounding != 3)
+      return unsupported_encoding();
+    decoded.load = decoded.writes_floating_point = opcode == 0x07;
+    decoded.store = opcode == 0x27;
+    return {};
+  }
+  const unsigned format = (instruction >> 25) & 3;
+  if (format > 1)
+    return unsupported_encoding();
+  bool needs_rounding = fused;
+  decoded.writes_floating_point = true;
+  if (!fused) {
+    switch (instruction >> 27) {
+      case 0: case 1: case 2: case 3:
+        needs_rounding = true;
+        break;
+      case 4: // FSGNJ[N/X].S/D
+        if (rounding > 2)
+          return unsupported_encoding();
+        break;
+      case 5: // FMIN/FMAX.S/D
+        if (rounding > 1)
+          return unsupported_encoding();
+        break;
+      case 8: // FCVT.S.D / FCVT.D.S
+        if (rs2 > 1 || rs2 == format)
+          return unsupported_encoding();
+        needs_rounding = true;
+        break;
+      case 11: // FSQRT.S/D
+        if (rs2)
+          return unsupported_encoding();
+        needs_rounding = true;
+        break;
+      case 20: // FLE/FLT/FEQ.S/D
+        if (rounding > 2)
+          return unsupported_encoding();
+        decoded.writes_floating_point = false;
+        decoded.writes_integer = rd != 0;
+        break;
+      case 24: // FCVT.[W/WU/L/LU].S/D
+        if (rs2 > 3)
+          return unsupported_encoding();
+        decoded.writes_floating_point = false;
+        decoded.writes_integer = rd != 0;
+        needs_rounding = true;
+        break;
+      case 26: // FCVT.S/D.[W/WU/L/LU]
+        if (rs2 > 3)
+          return unsupported_encoding();
+        needs_rounding = true;
+        break;
+      case 28: // FMV.X.W/D and FCLASS.S/D
+        if (rs2 || rounding > 1)
+          return unsupported_encoding();
+        decoded.writes_floating_point = false;
+        decoded.writes_integer = rd != 0;
+        break;
+      case 30: // FMV.W/D.X
+        if (rs2 || rounding)
+          return unsupported_encoding();
+        break;
+      default: return unsupported_encoding();
+    }
+  }
+  if (needs_rounding && !valid_rounding(rounding))
+    return unsupported_encoding();
+  decoded.reads_rounding_mode = needs_rounding && rounding == 7;
+  decoded.updates_flags = floating_point_flag_mask(instruction) != 0;
+  return {};
+}
 
 CheckResult decode_dependencies(uint32_t inst, DependencyMetadata &m) {
   m = {};
   m.provided = true;
   const unsigned rd = (inst >> 7) & 31, rs1 = (inst >> 15) & 31, rs2 = (inst >> 20) & 31;
+  FloatingPointInstruction floating;
+  auto fp_decoded = decode_floating_point_instruction(inst, floating);
+  if (!fp_decoded)
+    return fp_decoded;
+  if (floating.recognized) {
+    floating_point_dependencies(inst, floating, m);
+    return {};
+  }
   if ((inst & 3) != 3) {
     const unsigned quadrant = inst & 3, funct = (inst >> 13) & 7;
     const unsigned compact1 = 8 + ((inst >> 7) & 7), compact2 = 8 + ((inst >> 2) & 7);

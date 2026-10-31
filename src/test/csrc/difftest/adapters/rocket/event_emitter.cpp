@@ -51,8 +51,10 @@ EventEmitter::MemoryKind EventEmitter::memory_kind(uint32_t instruction, uint8_t
       return MemoryKind::Load;
     if ((quadrant == 0 || quadrant == 2) && (function == 6 || function == 7))
       return MemoryKind::Store;
-    if ((quadrant == 0 || quadrant == 2) && (function == 1 || function == 5))
-      return MemoryKind::Unsupported;
+    if ((quadrant == 0 || quadrant == 2) && function == 1)
+      return MemoryKind::Load; // RV64D C.FLD and C.FLDSP.
+    if ((quadrant == 0 || quadrant == 2) && function == 5)
+      return MemoryKind::Store; // RV64D C.FSD and C.FSDSP.
     return MemoryKind::None;
   }
   if (length != 4)
@@ -63,8 +65,10 @@ EventEmitter::MemoryKind EventEmitter::memory_kind(uint32_t instruction, uint8_t
   switch (instruction & 0x7f) {
   case 0x03: return ((instruction >> 12) & 7) <= 6 ? MemoryKind::Load : MemoryKind::Unsupported;
   case 0x23: return ((instruction >> 12) & 7) <= 3 ? MemoryKind::Store : MemoryKind::Unsupported;
-  case 0x07:
-  case 0x27:
+  case 0x07: return ((instruction >> 12) & 7) == 2 || ((instruction >> 12) & 7) == 3
+                     ? MemoryKind::Load : MemoryKind::Unsupported;
+  case 0x27: return ((instruction >> 12) & 7) == 2 || ((instruction >> 12) & 7) == 3
+                     ? MemoryKind::Store : MemoryKind::Unsupported;
   case 0x2f: return MemoryKind::Unsupported;
   case 0x0f: return ((instruction >> 12) & 7) == 2 ? MemoryKind::Unsupported : MemoryKind::None;
   case 0x73: {
@@ -83,13 +87,14 @@ size_t EventEmitter::memory_width(uint32_t instruction, uint8_t length) {
     const auto function = (instruction >> 13) & 7;
     if ((quadrant == 0 || quadrant == 2) && (function == 2 || function == 6))
       return 4;
-    if ((quadrant == 0 || quadrant == 2) && (function == 3 || function == 7))
+    if ((quadrant == 0 || quadrant == 2) &&
+        (function == 1 || function == 3 || function == 5 || function == 7))
       return 8;
     return 0;
   }
   const auto opcode = instruction & 0x7f;
   const auto function = (instruction >> 12) & 7;
-  if (opcode == 0x03 || opcode == 0x23)
+  if (opcode == 0x03 || opcode == 0x23 || opcode == 0x07 || opcode == 0x27)
     return size_t{1} << (function & 3);
   return 0;
 }
@@ -128,14 +133,14 @@ CheckResult EventEmitter::begin(const InstructionObservation &allocation, Operat
   const auto opcode = allocation.instruction & 0x7f;
   const auto funct3 = (allocation.instruction >> 12) & 7;
   const auto funct7 = (allocation.instruction >> 25) & 0x7f;
-  const bool raw_integer_load = kind == MemoryKind::Load;
-  const bool raw_integer_store = kind == MemoryKind::Store;
-  if ((raw_integer_load || raw_integer_store) && !allocation.memory)
+  const bool raw_load = kind == MemoryKind::Load;
+  const bool raw_store = kind == MemoryKind::Store;
+  if ((raw_load || raw_store) && !allocation.memory)
     return reject(CheckStatus::Invalid, "Rocket raw memory opcode disagrees with decode memory qualifier");
-  if (raw_integer_load && allocation.memory_command != 0)
-    return reject(CheckStatus::Invalid, "Rocket integer load has a non-load memory command");
-  if (raw_integer_store && allocation.memory_command != 1)
-    return reject(CheckStatus::Invalid, "Rocket integer store has a non-store memory command");
+  if (raw_load && allocation.memory_command != 0)
+    return reject(CheckStatus::Invalid, "Rocket scalar load has a non-load memory command");
+  if (raw_store && allocation.memory_command != 1)
+    return reject(CheckStatus::Invalid, "Rocket scalar store has a non-store memory command");
   const bool base_fence = opcode == 0x0f && funct3 <= 1;
   const bool supervisor_fence = opcode == 0x73 && funct3 == 0 &&
                                  (funct7 == 0x09 || funct7 == 0x11 || funct7 == 0x31);

@@ -1,4 +1,5 @@
 #include "session.h"
+#include "dependency.h"
 #include <algorithm>
 #include <limits>
 #include <map>
@@ -318,7 +319,22 @@ CheckResult ObservationSession::step_reference(const InstructionRetireEvent &ret
   if (!reference_stepper_)
     return {CheckStatus::Unsupported, 0, "retirement has no independent reference-step callback"};
   if (snapshot.destination == ArchitecturalDestination::Unsupported)
-    return {CheckStatus::Unsupported, 0, "architectural destination type is outside the scalar integer session"};
+    return {CheckStatus::Unsupported, 0, "architectural destination type is outside the scalar session"};
+  if (snapshot.destination != ArchitecturalDestination::None &&
+      snapshot.destination != ArchitecturalDestination::Integer &&
+      snapshot.destination != ArchitecturalDestination::FloatingPoint)
+    return invalid("architectural retirement has an unknown destination type");
+  FloatingPointInstruction floating;
+  auto decoded_fp = decode_floating_point_instruction(snapshot.instruction, floating);
+  if (!decoded_fp)
+    return decoded_fp;
+  if (floating.recognized) {
+    const auto expected = floating.writes_floating_point ? ArchitecturalDestination::FloatingPoint
+        : floating.writes_integer ? ArchitecturalDestination::Integer : ArchitecturalDestination::None;
+    if (snapshot.destination != expected ||
+        (expected != ArchitecturalDestination::None && snapshot.destination_register != floating.destination))
+      return {CheckStatus::Violation, 0, "floating-point instruction destination differs from architectural snapshot"};
+  }
 
   std::vector<ReferenceLoadValue> loads;
   for (const auto &operation : retirement.instruction.memory) {
@@ -358,12 +374,19 @@ CheckResult ObservationSession::step_reference(const InstructionRetireEvent &ret
     return {CheckStatus::Unsupported, 0, "reference instruction trapped outside generic trap semantics"};
   if (snapshot.destination == ArchitecturalDestination::Integer) {
     if (!snapshot.destination_register || snapshot.destination_register >= 32 || !result.integer_write ||
-        result.integer_write->destination_register != snapshot.destination_register ||
+        result.floating_point_write || result.integer_write->destination_register != snapshot.destination_register ||
         result.integer_write->value != snapshot.destination_value)
       return {CheckStatus::Violation, 0, "reference integer write differs from the DUT retirement snapshot"};
-  } else if (snapshot.destination_register != 0 || result.integer_write) {
-    return {CheckStatus::Violation, 0, "unexpected integer write for a non-writing retirement"};
+  } else if (snapshot.destination == ArchitecturalDestination::FloatingPoint) {
+    if (snapshot.destination_register >= 32 || !result.floating_point_write || result.integer_write ||
+        result.floating_point_write->destination_register != snapshot.destination_register ||
+        result.floating_point_write->value != snapshot.destination_value)
+      return {CheckStatus::Violation, 0, "reference floating-point write differs from the DUT retirement snapshot"};
+  } else if (snapshot.destination_register != 0 || result.integer_write || result.floating_point_write) {
+    return {CheckStatus::Violation, 0, "unexpected register write for a non-writing retirement"};
   }
+  if (snapshot.fcsr && (!result.fcsr || *snapshot.fcsr != *result.fcsr))
+    return {CheckStatus::Violation, 0, "reference FCSR differs from the exact DUT retirement snapshot"};
 
   ++statistics.architecture_compared;
 
@@ -470,12 +493,15 @@ SessionSubmitResult ObservationSession::submit(const EventBatch &batch,
   for (const auto &snapshot : retirements) {
     const bool supported_destination = snapshot.destination == ArchitecturalDestination::None ||
                                        snapshot.destination == ArchitecturalDestination::Integer ||
-                                       snapshot.destination == ArchitecturalDestination::Unsupported;
+                                       snapshot.destination == ArchitecturalDestination::Unsupported ||
+                                       snapshot.destination == ArchitecturalDestination::FloatingPoint;
     if (!snapshot.id.uid || snapshot.id.subaccess != 0 || snapshot.pc % 2 ||
         !supported_destination ||
         (snapshot.destination == ArchitecturalDestination::Integer &&
          (snapshot.destination_register == 0 || snapshot.destination_register >= 32)) ||
-        (snapshot.destination != ArchitecturalDestination::Integer && snapshot.destination_register != 0) ||
+        (snapshot.destination == ArchitecturalDestination::FloatingPoint && snapshot.destination_register >= 32) ||
+        ((snapshot.destination == ArchitecturalDestination::None ||
+          snapshot.destination == ArchitecturalDestination::Unsupported) && snapshot.destination_register != 0) ||
         architectural_retirements_.count(snapshot.id) || !new_retirement_ids.insert(snapshot.id).second) {
       result.transport = {EventValidationStatus::Invalid, "invalid or duplicate architectural retirement snapshot"};
       result.check = remember_failure(invalid("invalid or duplicate architectural retirement snapshot"));
