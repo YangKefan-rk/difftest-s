@@ -47,6 +47,10 @@ EventEmitter::MemoryKind EventEmitter::memory_kind(uint32_t instruction, uint8_t
   if (length == 2) {
     const auto quadrant = instruction & 3;
     const auto function = (instruction >> 13) & 7;
+    // RV64 C.LWSP/C.LDSP with rd=x0 are reserved, not memory accesses.
+    // A wrong-path allocation may still be squashed; retirement fails closed.
+    if (quadrant == 2 && (function == 2 || function == 3) && ((instruction >> 7) & 0x1f) == 0)
+      return MemoryKind::Unsupported;
     if ((quadrant == 0 || quadrant == 2) && (function == 2 || function == 3))
       return MemoryKind::Load;
     if ((quadrant == 0 || quadrant == 2) && (function == 6 || function == 7))
