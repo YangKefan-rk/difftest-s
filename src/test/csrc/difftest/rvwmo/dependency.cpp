@@ -458,12 +458,16 @@ CheckResult decode_dependencies(uint32_t inst, DependencyMetadata &m) {
       m.control_transfer = true;
       break;
     case 0x0f:
-      // FENCE.I synchronizes instruction fetch; it is not a data-memory fence.
-      if (inst == 0x0000100f)
+      // Rocket ignores FENCE.I's reserved immediate/register fields. It orders
+      // instruction fetch, not data memory, even when those fields are nonzero.
+      if (((inst >> 12) & 7) == 1)
         break;
       if (((inst >> 12) & 7) != 0)
         return {CheckStatus::Unsupported, 0, "non-data fence requires adapter metadata"};
-      if ((inst >> 28) != 0)
+      // FENCE.TSO's R/W predecessor/successor masks do not require W->R.
+      if (inst == 0x8330000f)
+        m.fence_tso = true;
+      else if ((inst >> 28) != 0)
         return {CheckStatus::Unsupported, 0, "non-base fence requires adapter metadata"};
       m.fence = true;
       m.fence_predecessor = (inst >> 24) & 15;
