@@ -530,6 +530,27 @@ CheckResult BoomEventAdapter::commit_store(const StoreCommit &record) {
   return {};
 }
 
+CheckResult BoomEventAdapter::skip_device_store(const StoreCommit &record) {
+  auto result = validate_id(record.id);
+  if (!result)
+    return result;
+  result = owned_slot(stq_, record.stq, record.id);
+  if (!result)
+    return result;
+  auto found = instructions_.find(record.id);
+  if (found == instructions_.end() || found->second.retired || !found->second.allocation.stq ||
+      found->second.store || found->second.skipped_device_store)
+    return invalid("BOOM excluded device store has no unique live STQ owner");
+  const auto &allocation = found->second.allocation;
+  const auto width = scalar_memory_log2_size(allocation.instruction, allocation.length, false);
+  if (found->second.unsupported_memory || !record.architecturally_committed || !width ||
+      record.bytes.size() != (size_t{1} << *width) || !complete_scalar_mask(record.byte_mask) ||
+      !valid_bytes(record.address, record.bytes, record.byte_mask))
+    return unsupported("BOOM excluded device store lacks a committed scalar STQ value");
+  found->second.skipped_device_store = true;
+  return {};
+}
+
 CheckResult BoomEventAdapter::release_store_slot(const OperationId &id, const SlotGeneration &stq) {
   auto result = validate_id(id);
   if (!result)
@@ -539,7 +560,8 @@ CheckResult BoomEventAdapter::release_store_slot(const OperationId &id, const Sl
     return result;
   auto found = instructions_.find(id);
   if (found == instructions_.end() || found->second.stq_released ||
-      (!found->second.store && !fence_instruction(found->second.allocation.instruction)))
+      (!found->second.store && !found->second.skipped_device_store &&
+       !fence_instruction(found->second.allocation.instruction)))
     return invalid("BOOM STQ release has no committed store/fence or was already released");
   release_slot(stq_, stq);
   found->second.stq_released = true;
@@ -741,11 +763,14 @@ CheckResult BoomEventAdapter::retire(const Retirement &record) {
     return invalid("BOOM non-load retirement carries a load attempt/result");
   }
   if (state.allocation.stq) {
-    if (!state.store && !fence_instruction(record.instruction))
+    if (record.skipped_device_store != state.skipped_device_store)
+      return invalid("BOOM device-store retirement differs from its local store exclusion");
+    if (!state.store && !state.skipped_device_store && !fence_instruction(record.instruction))
       return incomplete("BOOM store retirement lacks its architectural LocalStore");
     if (state.store)
       retirement.instruction.memory.push_back(*state.store);
   }
+  retirement.instruction.skipped_device_store = state.skipped_device_store;
   result = append(record.source, RuntimeEventKind::InstructionRetire, std::move(retirement));
   if (!result)
     return result;
@@ -828,7 +853,8 @@ CheckResult BoomEventAdapter::squash(const OperationId &id, const SlotGeneration
   if (!result)
     return result;
   auto found = instructions_.find(id);
-  if (found == instructions_.end() || found->second.retired || found->second.store)
+  if (found == instructions_.end() || found->second.retired || found->second.store ||
+      found->second.skipped_device_store)
     return invalid("BOOM cannot squash an unknown, retired or architecturally committed store");
   result = append(source, RuntimeEventKind::InstructionSquash, InstructionSquashEvent{id});
   if (!result)

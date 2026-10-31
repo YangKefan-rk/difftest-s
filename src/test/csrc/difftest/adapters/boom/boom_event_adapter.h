@@ -149,6 +149,7 @@ struct Retirement {
   IntegerDestinationType destination_type = IntegerDestinationType::None;
   uint8_t logical_destination = 0;
   uint64_t writeback_value = 0;
+  bool skipped_device_store = false;
 };
 
 struct ReferenceStoreAudit {
@@ -178,6 +179,8 @@ public:
   CheckResult sample_load(const LoadObservation &record);
   CheckResult cancel_load_attempt(const LoadAttempt &record, const EventSource &source);
   CheckResult commit_store(const StoreCommit &record);
+  // Explicit device exclusion; no LocalStore or coherent-RAM StorePublish.
+  CheckResult skip_device_store(const StoreCommit &record);
   // A physical STQ entry can be reused while its logical store is still
   // travelling through the cache/MSHR. This does not emit StorePublish.
   CheckResult release_store_slot(const OperationId &id, const SlotGeneration &stq);
@@ -213,6 +216,7 @@ private:
     std::optional<uint32_t> latest_attempt;
     std::optional<MemoryOperation> store;
     std::vector<uint8_t> store_bytes;
+    bool skipped_device_store = false;
     bool stq_released = false;
     bool published = false;
     bool audited = false;

@@ -5,6 +5,7 @@
 #include "word_bytes.h"
 #include <map>
 #include <optional>
+#include <set>
 #include <vector>
 
 namespace rvwmo {
@@ -66,6 +67,8 @@ struct NativeCollectorConfiguration {
   // must supply the bounds of their independently initialized GlobalMem.
   uint64_t checked_ram_base = 0;
   uint64_t checked_ram_size = 0;
+  // Enables explicit device-store exclusion only for the opted-in DUT profile.
+  bool skip_device_stores = false;
 };
 struct CollectedObservations {
   EventBatch batch;
@@ -92,6 +95,7 @@ private:
   NativeCollectorConfiguration configuration_;
   BoomEventAdapter adapter_;
   std::map<OperationId, InstructionAllocation> allocations_;
+  std::set<OperationId> skipped_device_stores_;
   std::map<AttemptKey, uint64_t> unresolved_samples_;
   std::vector<RuntimeEvent> staged_events_;
   std::vector<CapturedRetirement> staged_retirements_;

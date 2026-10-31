@@ -93,7 +93,20 @@ CheckResult NativeCollector::capture_frame(const NativeFrame &frame) {
     if (!result)
       return result;
     result = require_checked_ram(local.address, local.bytes.size());
-    if (!result || !(result = adapter_.commit_store(local)))
+    if (!result) {
+      const uint64_t ram_end = configuration_.checked_ram_base + configuration_.checked_ram_size;
+      const bool outside_ram = local.address >= ram_end ||
+          (local.address < configuration_.checked_ram_base &&
+           local.bytes.size() <= configuration_.checked_ram_base - local.address);
+      if (!configuration_.skip_device_stores || result.status != CheckStatus::Unsupported || !outside_ram)
+        return result;
+      result = adapter_.skip_device_store(local);
+      if (result && !skipped_device_stores_.insert(local.id).second)
+        return invalid("BOOM device store has duplicate local commit");
+    } else {
+      result = adapter_.commit_store(local);
+    }
+    if (!result)
       return result;
   }
   result = capture_retirements(frame);
@@ -258,7 +271,10 @@ CheckResult NativeCollector::capture_retirements(const NativeFrame &frame) {
         if (!result)
           return result;
       }
+      retirement.skipped_device_store = skipped_device_stores_.count(instruction_id) != 0;
       result = adapter_.retire(retirement);
+      if (result)
+        skipped_device_stores_.erase(instruction_id);
       if (!result)
         return result;
     }
