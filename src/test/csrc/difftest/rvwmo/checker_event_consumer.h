@@ -72,6 +72,7 @@ private:
     bool read_seen = false;
     bool write_seen = false;
     bool response_seen = false;
+    bool finish_seen = false;
     bool awaiting_retry = false;
     bool success = false;
     bool error = false;
@@ -120,7 +121,15 @@ private:
   CheckResult consume_load_sample(const RuntimeEvent &event, const LoadSampleEvent &sample,
                                   RankCertificate certificate = RankCertificate::None,
                                   bool source_prefix_closed = false);
-  CheckResult consume_atomic(const RuntimeEvent &event, const AtomicLifecycleEvent &atomic);
+  CheckResult consume_atomic(const RuntimeEvent &event, const AtomicLifecycleEvent &atomic,
+                             bool source_prefix_closed);
+  CheckResult consume_atomic_candidate(const RuntimeEvent &event, const AtomicCommitCandidateEvent &candidate,
+                                      bool source_prefix_closed,
+                                      RankCertificate certificate = RankCertificate::None);
+  CheckResult consume_amo_point(const RuntimeEvent &event, const OperationId &id, uint32_t attempt,
+                               uint64_t address, uint8_t mask, uint64_t old_data, uint64_t new_data,
+                               bool source_prefix_closed,
+                               RankCertificate certificate = RankCertificate::None);
   CheckResult consume_store_publish(const RuntimeEvent &event, const StorePublishEvent &publish,
                                     RankCertificate certificate = RankCertificate::None);
   CheckResult consume_coalesced_store_publish(const RuntimeEvent &event, const StorePublishEvent &publish);

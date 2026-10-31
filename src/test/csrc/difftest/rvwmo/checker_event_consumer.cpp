@@ -81,6 +81,11 @@ CheckResult CheckerEventConsumer::require_rank(const RuntimeEvent &event, Observ
       if (certificate != RankCertificate::IndependentEffects || publish->members.size() != 1)
         return incomplete("equal-rank publication is not a certified independent effect");
       id = publish->members.front().id;
+    } else if (const auto *candidate = std::get_if<AtomicCommitCandidateEvent>(&event.payload)) {
+      if (certificate != RankCertificate::IndependentEffects)
+        return incomplete("equal-rank AMO is not a certified independent effect");
+      id = candidate->id;
+      attempt = candidate->attempt;
     } else {
       return incomplete("certified memory group contains an unsupported event kind");
     }
@@ -199,7 +204,8 @@ CheckResult CheckerEventConsumer::consume_load_sample(const RuntimeEvent &event,
 }
 
 CheckResult CheckerEventConsumer::consume_atomic(const RuntimeEvent &event,
-                                                       const AtomicLifecycleEvent &atomic) {
+                                                 const AtomicLifecycleEvent &atomic,
+                                                 bool source_prefix_closed) {
   if (!failure_)
     return failure_;
   const auto parent = instruction_id(atomic.id);
@@ -231,8 +237,13 @@ CheckResult CheckerEventConsumer::consume_atomic(const RuntimeEvent &event,
   if (inflight == atomic_inflight_.end()) {
     // A Finish after a completed Response is the normal close; a duplicate
     // Finish is not an effect and is rejected.
-    if (atomic.phase == AtomicObservationPhase::Finish && atomics_.count(atomic.id))
+    auto completed = atomics_.find(atomic.id);
+    if (atomic.phase == AtomicObservationPhase::Finish && completed != atomics_.end()) {
+      if (completed->second.finish_seen)
+        return remember_failure(invalid("duplicate atomic lifecycle Finish"));
+      completed->second.finish_seen = true;
       return {};
+    }
     return remember_failure(invalid("atomic lifecycle effect has no active Begin"));
   }
   auto &record = inflight->second;
@@ -271,12 +282,16 @@ CheckResult CheckerEventConsumer::consume_atomic(const RuntimeEvent &event,
       return remember_failure(invalid("duplicate atomic read effect"));
     if (atomic.address != record.address || atomic.mask != record.mask)
       return remember_failure(invalid("atomic read operand differs from its request"));
+    record.old_data = atomic.data;
+    record.read_seen = true;
+    // A speculative/early RMW read is a source fact, not a separate GMO point.
+    // Its matching write will snapshot the independent old bytes at one rank.
+    if (record.rmw)
+      return {};
     ObservationTime time;
     auto result = require_rank(event, time);
     if (!result)
       return result;
-    record.old_data = atomic.data;
-    record.read_seen = true;
     MemoryOperation operation;
     operation.id = record.id;
     operation.attempt = record.attempt;
@@ -312,6 +327,15 @@ CheckResult CheckerEventConsumer::consume_atomic(const RuntimeEvent &event,
       return remember_failure(invalid("SC must not have a read effect"));
     if (atomic.address != record.address || atomic.mask != record.mask)
       return remember_failure(invalid("atomic write operand differs from its request"));
+    if (record.rmw) {
+      auto result = consume_amo_point(event, record.id, record.attempt, record.address, record.mask,
+                                      record.old_data, atomic.data, source_prefix_closed);
+      if (!result)
+        return result;
+      record.new_data = atomic.data;
+      record.write_seen = true;
+      return {};
+    }
     ObservationTime time;
     auto result = require_rank(event, time);
     if (!result)
@@ -393,6 +417,117 @@ CheckResult CheckerEventConsumer::consume_atomic(const RuntimeEvent &event,
   return remember_failure(invalid("unknown atomic lifecycle phase"));
 }
 
+CheckResult CheckerEventConsumer::consume_amo_point(const RuntimeEvent &event, const OperationId &id,
+                                                     uint32_t attempt, uint64_t address, uint8_t mask,
+                                                     uint64_t old_data, uint64_t new_data,
+                                                     bool source_prefix_closed,
+                                                     RankCertificate certificate) {
+  const auto allocated = allocations_.find(instruction_id(id));
+  if (allocated == allocations_.end())
+    return remember_failure(incomplete("AMO point has no allocated instruction"));
+  const uint32_t raw = allocated->second.instruction;
+  const unsigned width = (raw >> 12) & 7;
+  const unsigned function = raw >> 27;
+  if ((raw & 0x7f) != 0x2f || (width != 2 && width != 3))
+    return remember_failure(unsupported("AMO point requires an aligned RV64 W/D atomic opcode"));
+  switch (function) {
+  case 0: case 1: case 4: case 8: case 12: case 16: case 20: case 24: case 28:
+    break;
+  default:
+    return remember_failure(unsupported("AMO point excludes LR/SC and unknown atomic functions"));
+  }
+  if (id.subaccess || (address & 7) ||
+      (width == 3 ? mask != 0xff : (mask != 0x0f && mask != 0xf0)))
+    return remember_failure(invalid("AMO point byte extent differs from its instruction width"));
+  if (loads_.count({id, attempt}) || stores_.count(id))
+    return remember_failure(invalid("duplicate AMO single-point read/write effect"));
+  if (loads_.size() >= max_live_instructions_ || stores_.size() >= max_live_instructions_)
+    return pending("AMO single-point record capacity reached");
+  ObservationTime time;
+  auto result = require_rank(event, time, certificate);
+  if (!result)
+    return remember_failure(result);
+
+  MemoryOperation operation;
+  operation.id = id;
+  operation.attempt = attempt;
+  operation.address = address;
+  operation.byte_mask = atomic_mask_bytes(mask);
+  operation.atomic = operation.load = operation.store = true;
+  operation.acquire = (raw >> 26) & 1;
+  operation.release = (raw >> 25) & 1;
+  operation.rcsc = operation.acquire || operation.release;
+  operation.read_time = operation.write_time = time;
+  operation.source_kind = ReadSourceKind::ModeledWitness;
+  // Freeze the independently modeled pre-write bytes, not the DUT's old value.
+  result = checker_.observe_load(operation, id.uid, {}, source_prefix_closed);
+  if (!result && result.status != CheckStatus::Pending)
+    return remember_failure(result);
+  loads_.emplace(LoadKey{id, attempt}, LoadRecord{operation, atomic_data_bytes(old_data)});
+
+  MemoryWriter writer;
+  result = checker_.memory_writer(id, writer);
+  if (!result)
+    return remember_failure(result);
+  const auto bytes = atomic_data_bytes(new_data);
+  MemoryStore store{writer, id.uid, address, bytes, operation.byte_mask};
+  result = checker_.record_store(store, operation, StoreVerification::Provisional);
+  if (!result && result.status != CheckStatus::Pending)
+    return remember_failure(result);
+  result = checker_.observe_global(address, bytes, operation.byte_mask,
+                                   std::vector<MemoryWriter>(8, writer), {writer}, time);
+  if (!result && result.status != CheckStatus::Pending)
+    return remember_failure(result);
+  stores_.emplace(id, StoreRecord{operation, store, false, true, false});
+  remember_rank(event, time, certificate, id, attempt);
+  // As with ordinary provisional stores, REF auditing and actual old-value/PPO
+  // checks remain mandatory before any dependent retirement can earn Pass.
+  return {};
+}
+
+CheckResult CheckerEventConsumer::consume_atomic_candidate(const RuntimeEvent &event,
+    const AtomicCommitCandidateEvent &candidate, bool source_prefix_closed,
+    RankCertificate certificate) {
+  if (!source_prefix_closed)
+    return remember_failure(incomplete("AMO candidate lacks a closed producer source prefix"));
+  const auto valid_position = [](const SourcePosition &source) {
+    return source.producer_sequence && source.qualified_phase != SourcePosition::cycle_closed_phase;
+  };
+  const auto &drain = candidate.physical_drain;
+  if (!candidate.request_id || !valid_position(candidate.sampled_read) ||
+      !valid_position(candidate.computed_write) || !valid_position(drain) ||
+      candidate.sampled_read.cycle >= candidate.computed_write.cycle ||
+      candidate.computed_write.cycle > drain.cycle || drain.cycle != event.source.cycle ||
+      drain.producer_sequence != event.source.producer_sequence ||
+      drain.qualified_phase != event.source.qualified_phase ||
+      drain.order_qualified != event.source.order_qualified)
+    return remember_failure(invalid("AMO candidate has inconsistent source read/write/drain positions"));
+  if (atomic_inflight_.count(candidate.id.hart) || atomics_.count(candidate.id))
+    return remember_failure(invalid("AMO candidate duplicates an existing atomic lifecycle"));
+  for (unsigned byte = 0; byte < 8; ++byte)
+    if ((candidate.byte_mask & (1U << byte)) &&
+        static_cast<uint8_t>(candidate.computed_new >> (8 * byte)) !=
+            static_cast<uint8_t>(candidate.drained_new >> (8 * byte)))
+      return remember_failure({CheckStatus::Violation, 0,
+                               "physical AMO byte differs from its source-computed value"});
+  auto result = consume_amo_point(event, candidate.id, candidate.attempt, candidate.address,
+                                 candidate.byte_mask, candidate.observed_old, candidate.drained_new,
+                                 source_prefix_closed, certificate);
+  if (!result)
+    return result;
+  AtomicRecord record;
+  record.id = candidate.id;
+  record.attempt = candidate.attempt;
+  record.rmw = record.request_seen = record.read_seen = record.write_seen = true;
+  record.response_seen = record.finish_seen = record.success = true;
+  record.address = candidate.address;
+  record.mask = candidate.byte_mask;
+  record.old_data = candidate.observed_old;
+  record.new_data = candidate.drained_new;
+  atomics_.emplace(record.id, std::move(record));
+  return {};
+}
+
 CheckResult CheckerEventConsumer::consume_read_group_member(const RuntimeEvent &event, bool source_prefix_closed) {
   if (!failure_)
     return failure_;
@@ -410,6 +545,12 @@ CheckResult CheckerEventConsumer::consume_independent_group_member(const Runtime
     return failure_;
   if (!event.producer_id)
     return remember_failure(invalid("independent memory group has no producer"));
+  if (event.kind == RuntimeEventKind::AtomicCommitCandidate) {
+    const auto *candidate = std::get_if<AtomicCommitCandidateEvent>(&event.payload);
+    if (!candidate)
+      return remember_failure(invalid("independent AMO candidate kind/payload mismatch"));
+    return consume_atomic_candidate(event, *candidate, source_prefix_closed, RankCertificate::IndependentEffects);
+  }
   if (event.kind == RuntimeEventKind::LoadSample) {
     const auto *sample = std::get_if<LoadSampleEvent>(&event.payload);
     if (!sample || !sample->operation.load || sample->operation.store || sample->operation.atomic ||
@@ -785,6 +926,11 @@ CheckResult CheckerEventConsumer::consume_retire(const InstructionRetireEvent &e
       }
       if (!selected_atomics.insert(operation.id).second)
         return remember_failure(invalid("duplicate atomic retirement"));
+      const bool aq = (instruction.instruction >> 26) & 1;
+      const bool rl = (instruction.instruction >> 25) & 1;
+      operation.acquire = operation.sc ? (aq && rl) : aq;
+      operation.release = operation.lr ? (aq && rl) : rl;
+      operation.rcsc = operation.acquire || operation.release;
     } else if (operation.load && operation.store) {
       return remember_failure(unsupported("split read/write effects are not represented by this consumer"));
     }
@@ -906,28 +1052,10 @@ CheckResult CheckerEventConsumer::consume_closed(const RuntimeEvent &event, bool
   case RuntimeEventKind::InstructionRetire:
     return consume_retire(std::get<InstructionRetireEvent>(event.payload));
   case RuntimeEventKind::AtomicLifecycle:
-    return consume_atomic(event, std::get<AtomicLifecycleEvent>(event.payload));
-  case RuntimeEventKind::AtomicCommitCandidate: {
-    // This is source evidence, not permission to publish or advance PPO/REF.
-    const auto &candidate = std::get<AtomicCommitCandidateEvent>(event.payload);
-    const auto parent = instruction_id(candidate.id);
-    const auto allocation = allocations_.find(parent);
-    if (allocation == allocations_.end())
-      return remember_failure(incomplete("atomic candidate has no allocated instruction"));
-    if ((allocation->second.instruction & 0x7f) != 0x2f)
-      return remember_failure(invalid("atomic candidate belongs to a non-atomic instruction"));
-    if (!source_prefix_closed)
-      return remember_failure(incomplete("atomic candidate lacks a closed producer source prefix"));
-    for (unsigned byte = 0; byte < 8; ++byte) {
-      if (!(candidate.byte_mask & (1U << byte)))
-        continue;
-      if (((candidate.computed_new >> (byte * 8)) & 0xff) !=
-          ((candidate.drained_new >> (byte * 8)) & 0xff))
-        return remember_failure({CheckStatus::Violation, 0,
-                                 "physical AMO byte differs from its source-computed value"});
-    }
-    return remember_failure(incomplete("atomic candidate lacks independent REF and global-order certificate"));
-  }
+    return consume_atomic(event, std::get<AtomicLifecycleEvent>(event.payload), source_prefix_closed);
+  case RuntimeEventKind::AtomicCommitCandidate:
+    return consume_atomic_candidate(event, std::get<AtomicCommitCandidateEvent>(event.payload),
+                                    source_prefix_closed);
   case RuntimeEventKind::HartDone:
   case RuntimeEventKind::Trap:
     return remember_failure(unsupported("hart completion and trap events are not semantic memory events"));
