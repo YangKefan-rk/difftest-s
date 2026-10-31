@@ -104,8 +104,9 @@ size_t EventEmitter::memory_width(uint32_t instruction, uint8_t length) {
 
 void EventEmitter::append(RuntimeEventKind kind, RuntimeEventPayload payload, SourcePosition source) {
   RuntimeEvent event;
-  event.producer_id = kind == RuntimeEventKind::StorePublish ? configuration_.publication_producer
-                                                           : configuration_.producer;
+  const bool fabric_event = kind == RuntimeEventKind::StorePublish ||
+                            kind == RuntimeEventKind::AtomicCommitCandidate;
+  event.producer_id = fabric_event ? configuration_.publication_producer : configuration_.producer;
   event.source = source;
   event.kind = kind;
   event.payload = std::move(payload);
@@ -270,6 +271,43 @@ CheckResult EventEmitter::atomic(uint64_t token, const AtomicLifecycleEvent &rec
   return {};
 }
 
+CheckResult EventEmitter::atomic_candidate(uint64_t token, const AtomicCommitCandidateEvent &candidate,
+                                                const SourcePosition &source) {
+  auto result = validate_source(source);
+  if (!result)
+    return result;
+  const auto found = instructions_.find(token);
+  if (!configuration_.publication_producer || found == instructions_.end() || found->second.retired)
+    return reject(CheckStatus::Invalid, "Rocket AMO candidate has no live instruction or fabric channel");
+  auto &instruction = found->second;
+  const auto raw = instruction.allocation.instruction;
+  const auto function = raw >> 27;
+  const auto width = (raw >> 12) & 7;
+  if (instruction.kind != MemoryKind::Atomic || function == 2 || function == 3)
+    return reject(CheckStatus::Unsupported, "Rocket AMO candidate does not represent an AMO W/D instruction");
+  if (instruction.atomic.begun || instruction.atomic_candidate || candidate.id != instruction.id ||
+      !candidate.request_id || (candidate.address & 7) ||
+      (width == 3 ? candidate.byte_mask != 0xff :
+          (width != 2 || (candidate.byte_mask != 0x0f && candidate.byte_mask != 0xf0))))
+    return reject(CheckStatus::Invalid, "Rocket AMO candidate identity, width or lifecycle is invalid");
+  if (candidate.physical_drain.cycle != source.cycle ||
+      candidate.physical_drain.producer_sequence != source.producer_sequence ||
+      candidate.physical_drain.qualified_phase != source.qualified_phase ||
+      candidate.physical_drain.order_qualified != source.order_qualified ||
+      candidate.sampled_read.cycle >= candidate.computed_write.cycle ||
+      candidate.computed_write.cycle > source.cycle)
+    return reject(CheckStatus::Invalid, "Rocket AMO candidate changed its physical source edges");
+  auto &atomic = instruction.atomic;
+  atomic.begun = atomic.request = atomic.read = atomic.write = atomic.response = atomic.success = true;
+  atomic.rmw = atomic.has_old = true;
+  atomic.address = candidate.address;
+  atomic.mask = candidate.byte_mask;
+  atomic.attempt = candidate.attempt;
+  atomic.old_data = candidate.observed_old;
+  instruction.atomic_candidate = candidate;
+  return {};
+}
+
 CheckResult EventEmitter::cancel_load(uint64_t token, uint32_t attempt) {
   if (!failure_)
     return failure_;
@@ -358,6 +396,9 @@ CheckResult EventEmitter::retire(uint64_t token, SourcePosition source) {
   retired.pc = allocation.pc;
   retired.instruction = allocation.instruction;
   InstructionRetireEvent retirement{retired, {}};
+  if (instruction.atomic_candidate)
+    append(RuntimeEventKind::AtomicCommitCandidate, *instruction.atomic_candidate,
+           instruction.atomic_candidate->physical_drain);
   if (instruction.kind == MemoryKind::Atomic) {
     const auto &atomic = instruction.atomic;
     if (!atomic.begun || !atomic.request || !atomic.response)
@@ -576,7 +617,7 @@ CheckResult EventEmitter::squash(uint64_t token) {
       return {};
     return reject(CheckStatus::Invalid, "Rocket squash has no live or recently terminated instruction");
   }
-  if (found->second.retired || found->second.store)
+  if (found->second.retired || found->second.store || found->second.atomic_candidate)
     return reject(CheckStatus::Invalid, "Rocket squash cannot retract a committed instruction");
   instructions_.erase(found);
   unretired_tokens_.erase(token);

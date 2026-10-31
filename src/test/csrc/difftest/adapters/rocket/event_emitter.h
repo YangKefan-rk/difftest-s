@@ -71,6 +71,10 @@ public:
   // only validates source order and stages the event.
   rvwmo::CheckResult atomic(uint64_t token, const rvwmo::AtomicLifecycleEvent &record,
                             const rvwmo::SourcePosition &source);
+  // Retain one physical-drain AMO witness until architectural retirement joins.
+  // This path emits no legacy separately ranked read/write lifecycle phases.
+  rvwmo::CheckResult atomic_candidate(uint64_t token, const rvwmo::AtomicCommitCandidateEvent &candidate,
+                                      const rvwmo::SourcePosition &source);
   rvwmo::CheckResult cancel_load(uint64_t token, uint32_t attempt);
   rvwmo::CheckResult commit_store(const StoreObservation &store);
   rvwmo::CheckResult publish_store(const StoreObservation &store, uint64_t transaction);
@@ -108,6 +112,7 @@ private:
       uint32_t attempt = 0;
       uint64_t old_data = 0;
     } atomic;
+    std::optional<rvwmo::AtomicCommitCandidateEvent> atomic_candidate;
     bool retired = false;
   };
 
