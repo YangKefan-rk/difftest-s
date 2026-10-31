@@ -4,6 +4,7 @@
 #include "../../rvwmo/event.h"
 #include <map>
 #include <optional>
+#include <utility>
 
 namespace rvwmo {
 class CheckerEventConsumer;
@@ -132,6 +133,7 @@ struct CapturedRetirement {
   // Raw architectural destination bits. Interpreted by destination_type.
   std::optional<uint64_t> destination_value;
   RetirementResultCoverage coverage = RetirementResultCoverage::Complete;
+  std::optional<std::pair<uint16_t, uint64_t>> csr_post;
 };
 
 struct Retirement {

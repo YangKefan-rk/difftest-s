@@ -8,6 +8,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <utility>
 #include <vector>
 
 namespace rvwmo {
@@ -34,6 +35,8 @@ struct ArchitecturalRetirement {
   ArchitecturalDestination destination = ArchitecturalDestination::None;
   uint8_t destination_register = 0;
   uint64_t destination_value = 0;
+  // Independently observed CSRFile state after this retirement; opt-in.
+  std::optional<std::pair<uint16_t, uint64_t>> csr_post;
 };
 
 struct ReferenceIntegerWrite {

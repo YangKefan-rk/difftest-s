@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <sstream>
 #include <utility>
 
 namespace rvwmo {
@@ -381,6 +382,22 @@ ReferenceStepResult SpikeReferenceStepper::step(const InstructionRetireEvent &re
   }
   if (state.wrote_integer && after.gpr[state.destination] != state.value) {
     return fail_after_step(invalid("Spike retirement observer differs from its post-step integer register state"));
+  }
+  if (snapshot.csr_post) {
+    uint64_t reference_csr = 0;
+    const int csr_status = difftest_ref_peek_arch_csr_v1(state.handle, snapshot.csr_post->first, &reference_csr);
+    if (csr_status == DIFFTEST_REF_API_UNSUPPORTED)
+      return fail_after_step(unsupported("Spike has no independent readback for the retired CSR"));
+    if (csr_status != DIFFTEST_REF_API_OK)
+      return fail_after_step(incomplete("Spike could not read the post-step architectural CSR"));
+    if (snapshot.csr_post->second != reference_csr) {
+      std::ostringstream message;
+      message << "BOOM post-retirement CSR differs from independent Spike: hart=" << hart
+              << std::hex << " pc=0x" << retirement.instruction.pc << " csr=0x"
+              << snapshot.csr_post->first << " dut=0x" << snapshot.csr_post->second
+              << " ref=0x" << reference_csr;
+      return fail_after_step(violation(message.str()));
+    }
   }
   if (difftest_ref_pending_store_traces_v1(state.handle, &pending_stores) != DIFFTEST_REF_API_OK) {
     return fail_after_step(incomplete("Spike could not report post-step reference store traces"));

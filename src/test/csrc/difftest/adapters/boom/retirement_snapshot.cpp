@@ -1,4 +1,5 @@
 #include "retirement_snapshot.h"
+#include "csr_profile.h"
 #include "readonly_hartid.h"
 #include <set>
 #include <utility>
@@ -48,14 +49,22 @@ CheckResult convert_retirement_snapshot(const CapturedRetirement &captured, Arch
   auto result = validate_destination(captured);
   if (!result)
     return result;
-  result = validate_coverage(captured.coverage);
+  const bool checked_csr = captured.csr_post.has_value() &&
+      (captured.instruction & 0x7f) == 0x73 && ((captured.instruction >> 12) & 7) != 0 &&
+      certified_csr_instruction(captured.instruction) &&
+      captured.csr_post->first == (captured.instruction >> 20);
+  if (captured.csr_post && !checked_csr)
+    return invalid("BOOM CSR post-state is not the retired instruction's physical CSR address");
+  result = checked_csr && captured.coverage == RetirementResultCoverage::CsrStateNeedsComparator
+      ? CheckResult{} : validate_coverage(captured.coverage);
   if (!result)
     return result;
   if ((captured.instruction & 0x7f) == 0x73 && ((captured.instruction >> 12) & 7) != 0) {
-    if (!is_observable_readonly_hartid(captured.instruction))
+    if (!is_observable_readonly_hartid(captured.instruction) && !checked_csr)
       return unsupported("BOOM CSR instruction requires architectural CSR-state comparison");
-    if (captured.destination_type != IntegerDestinationType::Integer || !captured.destination_register ||
-        *captured.destination_register != ((captured.instruction >> 7) & 31))
+    if (!checked_csr &&
+        (captured.destination_type != IntegerDestinationType::Integer || !captured.destination_register ||
+         *captured.destination_register != ((captured.instruction >> 7) & 31)))
       return invalid("BOOM read-only mhartid retirement omits its decoded integer destination");
   }
   if (captured.destination_type == IntegerDestinationType::Floating)
@@ -65,6 +74,8 @@ CheckResult convert_retirement_snapshot(const CapturedRetirement &captured, Arch
   converted.id = captured.id;
   converted.pc = captured.pc;
   converted.instruction = captured.instruction;
+  if (checked_csr)
+    converted.csr_post = captured.csr_post;
   if (captured.destination_type == IntegerDestinationType::Integer && *captured.destination_register != 0) {
     converted.destination = ArchitecturalDestination::Integer;
     converted.destination_register = *captured.destination_register;

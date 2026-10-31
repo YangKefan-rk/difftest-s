@@ -32,6 +32,11 @@ struct NativeSquash {
   ProbeIdentity identity;
   uint32_t rob_index = 0;
 };
+struct NativeCsrPost {
+  ProbeIdentity identity;
+  uint64_t source_cycle = 0, pc = 0, value = 0;
+  uint16_t address = 0;
+};
 struct NativeFrame {
   uint32_t hart = 0;
   uint64_t epoch = 0;
@@ -46,6 +51,10 @@ struct NativeFrame {
   std::vector<NativeLoad> completions;
   std::vector<ProbeStore> local_stores;
   std::vector<ProbeInstruction> retirements;
+  bool csr_probe_available = false;
+  std::optional<NativeCsrPost> csr_post;
+  bool csr_write_probe_available = false;
+  std::optional<NativeCsrPost> csr_write_post;
   std::vector<ProbeLoadRetirement> retired_loads;
   std::vector<NativeAttempt> store_releases;
   std::vector<NativeSquash> squashes;
@@ -69,6 +78,7 @@ struct NativeCollectorConfiguration {
   uint64_t checked_ram_size = 0;
   // Enables explicit device-store exclusion only for the opted-in DUT profile.
   bool skip_device_stores = false;
+  bool check_csr_post = false;
 };
 struct CollectedObservations {
   EventBatch batch;
@@ -96,6 +106,14 @@ private:
   BoomEventAdapter adapter_;
   std::map<OperationId, InstructionAllocation> allocations_;
   std::set<OperationId> skipped_device_stores_;
+  struct PendingCsr {
+    uint64_t pc = 0, retirement_cycle = 0;
+    uint16_t address = 0;
+    std::optional<uint64_t> after;
+    uint64_t rob_generation = 0;
+  };
+  std::map<OperationId, PendingCsr> pending_csr_;
+  std::map<OperationId, NativeCsrPost> pending_counter_writes_;
   std::map<AttemptKey, uint64_t> unresolved_samples_;
   std::vector<RuntimeEvent> staged_events_;
   std::vector<CapturedRetirement> staged_retirements_;
@@ -110,6 +128,7 @@ private:
   EventSource capture_source(uint64_t cycle);
   CheckResult capture_frame(const NativeFrame &frame);
   CheckResult capture_allocations(const NativeFrame &frame);
+  CheckResult capture_counter_write(const NativeFrame &frame);
   CheckResult capture_attempts(const NativeFrame &frame);
   CheckResult capture_cancellation(const NativeAttempt &cancel, uint64_t cycle);
   CheckResult capture_retirements(const NativeFrame &frame);
