@@ -334,8 +334,9 @@ CheckResult decode_dependencies(uint32_t inst, DependencyMetadata &m) {
       m.control_transfer = true;
       break;
     case 0x0f:
-      // FENCE.I synchronizes instruction fetch; it is not a data-memory fence.
-      if (inst == 0x0000100f)
+      // BOOM and Spike decode FENCE.I by opcode/funct3, irrespective of its
+      // other encoded fields. It synchronizes fetch, not data-memory accesses.
+      if ((inst & 0x707fU) == 0x100fU)
         break;
       if (((inst >> 12) & 7) != 0)
         return {CheckStatus::Unsupported, 0, "non-data fence requires adapter metadata"};
