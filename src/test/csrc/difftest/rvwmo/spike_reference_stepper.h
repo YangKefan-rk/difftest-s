@@ -68,6 +68,7 @@ private:
                                    const std::vector<ReferenceLoadValue> &modeled_loads,
                                    std::vector<LoadRequest> &requests);
   static CheckResult collect_store(void *handle, const MemoryOperation &operation, ReferenceStoreValue &store);
+  static CheckResult collect_atomic_store(void *handle, const MemoryOperation &operation, ReferenceStoreValue &store);
 };
 
 } // namespace rvwmo
