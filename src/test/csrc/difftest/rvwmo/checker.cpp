@@ -315,9 +315,19 @@ CheckResult Checker::observe_load(const MemoryOperation &operation, uint64_t po,
   auto statistics = ensure_statistics_hart(operation.id.hart);
   if (!statistics)
     return remember_failure(statistics);
+  std::optional<MemoryWriter> atomic_writer;
+  if (operation.atomic && operation.load && operation.store) {
+    if (!operation.write_time.valid || operation.write_time.rank != operation.read_time.rank)
+      return remember_failure(invalid("AMO read and write must name one global rank"));
+    MemoryWriter writer;
+    auto allocated = memory_writer(operation.id, writer);
+    if (!allocated)
+      return allocated;
+    atomic_writer = writer;
+  }
   MemorySnapshot snapshot;
   auto error = memory_.sample(operation.id.hart, po, operation.read_time.rank, operation.address, operation.byte_mask,
-                              forwarded, snapshot, source_prefix_closed);
+                              forwarded, snapshot, source_prefix_closed, atomic_writer);
   if (!error.empty())
     return remember_failure(invalid(error));
   loads_.emplace(key, LoadSample{operation, std::move(snapshot)});
