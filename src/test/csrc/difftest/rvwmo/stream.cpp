@@ -351,6 +351,9 @@ bool ObservationStream::payload_has_valid_shape(const RuntimeEvent &event) {
     return p.id.uid && p.id.subaccess == 0 && p.request_id && (p.address & 7) == 0 &&
            (p.byte_mask == 0x0f || p.byte_mask == 0xf0 || p.byte_mask == 0xff) &&
            p.sampled_read.producer_sequence && p.computed_write.producer_sequence &&
+           p.sampled_read.qualified_phase != SourcePosition::cycle_closed_phase &&
+           p.computed_write.qualified_phase != SourcePosition::cycle_closed_phase &&
+           drain.qualified_phase != SourcePosition::cycle_closed_phase &&
            drain.producer_sequence == event.source.producer_sequence &&
            drain.cycle == event.source.cycle && drain.qualified_phase == event.source.qualified_phase &&
            drain.order_qualified == event.source.order_qualified &&
@@ -405,6 +408,11 @@ std::optional<ObservationStream::MemoryEffect> ObservationStream::memory_effect(
   case RuntimeEventKind::AtomicLifecycle: {
     const auto &atomic = std::get<AtomicLifecycleEvent>(event.payload);
     if (atomic.phase != AtomicObservationPhase::ReadEffect && atomic.phase != AtomicObservationPhase::WriteEffect)
+      return std::nullopt;
+    // An AMO's earlier physical read is provenance. Its single architectural
+    // read/write point is the WriteEffect; LR retains its own read point.
+    const bool load_reserved = atomic.fuop == 2 || atomic.fuop == 3;
+    if (atomic.phase == AtomicObservationPhase::ReadEffect && !load_reserved)
       return std::nullopt;
     effect.address = atomic.address;
     effect.write = atomic.phase == AtomicObservationPhase::WriteEffect;
