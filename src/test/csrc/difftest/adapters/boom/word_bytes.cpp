@@ -131,6 +131,8 @@ CheckResult convert_allocation(uint32_t hart, const ProbeInstruction &probe, con
                                 InstructionAllocation &result) {
   // Allocations may be speculative. Confirm unsupported memory semantics only
   // at architectural commit/retirement; whole-instruction squash is supported.
+  if (supported_amo_rmw(probe.instruction) && !probe.atomic)
+    return {CheckStatus::Invalid, 0, "BOOM AMO opcode lacks its hardware atomic marker"};
   InstructionAllocation converted;
   converted.id = operation_id(hart, probe.identity);
   converted.rob = {probe.rob_index, probe.identity.rob_generation};
@@ -208,14 +210,14 @@ CheckResult convert_single_store_publication(uint32_t hart, const ProbeStore &pr
 CheckResult convert_retirement(uint32_t hart, const ProbeInstruction &probe, const EventSource &source,
                                 std::optional<uint64_t> physical_load_address,
                                 std::optional<uint64_t> independent_retire_data, Retirement &result) {
-  auto status = unsupported_atomic(probe.atomic);
-  if (!status)
-    return status;
+  if (probe.atomic && !supported_amo_rmw(probe.instruction))
+    return unsupported_atomic(true);
+  CheckResult status;
   if (!probe.architectural)
     return {CheckStatus::Incomplete, 0, "BOOM predicated-off retirement needs whole-instruction discard semantics"};
   Retirement converted{operation_id(hart, probe.identity), {probe.rob_index, probe.identity.rob_generation},
                        probe.pc, probe.instruction, {}, {}, source, {}, {}, probe.destination_type,
-                       probe.logical_destination, probe.writeback_value};
+                       probe.logical_destination, probe.writeback_value, false, {}, {}};
   if (probe.uses_ldq) {
     if (!physical_load_address || !independent_retire_data)
       return {CheckStatus::Incomplete, 0, "BOOM load retirement lacks physical address or independent LDQ result"};

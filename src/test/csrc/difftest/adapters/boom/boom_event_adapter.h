@@ -11,6 +11,9 @@ namespace rvwmo {
 class CheckerEventConsumer;
 namespace boom {
 
+// Only ordinary AMO W/D RMW encodings are in the initial certified profile.
+bool supported_amo_rmw(uint32_t instruction);
+
 // Private BOOM records; this header is not a DPI/wire ABI. Producer registration
 // and source-clock/phase qualification belong to the simulation integration.
 struct EventSource {
@@ -35,6 +38,28 @@ struct InstructionAllocation {
   uint32_t instruction = 0;
   uint8_t length = 0;
   EventSource source;
+};
+
+// AMO W/D effects from one exclusive L1 data-array write, never a request
+// or a StorePublish assembled from two independent memory operations.
+struct AtomicApplied {
+  OperationId id;
+  SlotGeneration stq;
+  uint32_t attempt = 0;
+  uint64_t address = 0;
+  uint64_t old_word = 0;
+  uint64_t new_word = 0;
+  uint8_t mask = 0;
+  uint8_t command = 0;
+  bool exclusive_valid = false;
+  EventSource source;
+};
+struct AtomicLocalCommit {
+  OperationId id;
+  SlotGeneration stq;
+  uint64_t address = 0;
+  uint8_t mask = 0;
+  uint8_t command = 0;
 };
 
 struct LoadAttempt {
@@ -154,6 +179,8 @@ struct Retirement {
   uint8_t logical_destination = 0;
   uint64_t writeback_value = 0;
   bool skipped_device_store = false;
+  std::optional<EventSource> atomic_response_source;
+  std::optional<EventSource> atomic_finish_source;
 };
 
 struct ReferenceStoreAudit {
@@ -183,6 +210,8 @@ public:
   CheckResult sample_load(const LoadObservation &record);
   CheckResult cancel_load_attempt(const LoadAttempt &record, const EventSource &source);
   CheckResult commit_store(const StoreCommit &record);
+  CheckResult commit_atomic_local(const AtomicLocalCommit &record);
+  CheckResult apply_atomic(const AtomicApplied &record);
   // Explicit device exclusion; no LocalStore or coherent-RAM StorePublish.
   CheckResult skip_device_store(const StoreCommit &record);
   // A physical STQ entry can be reused while its logical store is still
@@ -216,6 +245,17 @@ private:
   struct Instruction {
     InstructionAllocation allocation;
     bool unsupported_memory = false;
+    bool is_atomic_rmw = false;
+    bool atomic_local_committed = false;
+    uint64_t atomic_local_address = 0;
+    uint8_t atomic_local_mask = 0;
+    bool atomic_applied = false;
+    uint64_t atomic_address = 0;
+    uint64_t atomic_old_word = 0;
+    uint64_t atomic_new_word = 0;
+    uint8_t atomic_mask = 0;
+    uint8_t atomic_command = 0;
+    uint32_t atomic_attempt = 0;
     std::map<uint32_t, Attempt> attempts;
     std::optional<uint32_t> latest_attempt;
     std::optional<MemoryOperation> store;

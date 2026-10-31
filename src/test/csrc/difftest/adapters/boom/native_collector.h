@@ -41,6 +41,21 @@ struct NativeFpPost {
   ProbeIdentity identity;
   uint64_t source_cycle = 0, pc = 0, fcsr = 0, mstatus = 0;
 };
+// One physically indivisible AMO W/D cache-array update. Old/new full words
+// are captured at the same exclusive write edge, not inferred from the REF.
+struct NativeAtomicApplied {
+  ProbeIdentity identity;
+  uint64_t source_cycle = 0;
+  uint64_t address = 0;
+  uint64_t old_word = 0;
+  uint64_t new_word = 0;
+  uint8_t byte_mask = 0;
+  uint32_t queue_index = 0;
+  uint8_t mem_size = 0;
+  uint8_t command = 0;
+  bool exclusive_valid = false;
+  EventSource source;
+};
 struct NativeFrame {
   uint32_t hart = 0;
   uint64_t epoch = 0;
@@ -65,6 +80,7 @@ struct NativeFrame {
   std::vector<NativeAttempt> store_releases;
   std::vector<NativeSquash> squashes;
   std::vector<NativePublication> publications;
+  std::vector<NativeAtomicApplied> atomic_applied;
   bool trap = false;
   bool queues_empty = false;
   bool cache_idle = false;

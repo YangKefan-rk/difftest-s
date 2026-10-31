@@ -71,6 +71,8 @@ struct ProbeStore {
   uint8_t log2_size = 0;
   uint8_t byte_mask = 0;
   bool atomic = false;
+  // Raw BOOM mem_cmd; checked independently against the AMO instruction.
+  uint8_t command = 0;
 };
 
 struct ProbeQueueAllocation {

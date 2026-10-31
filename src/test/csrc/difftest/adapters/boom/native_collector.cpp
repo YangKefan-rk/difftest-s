@@ -49,11 +49,17 @@ CaptureResult NativeCollector::capture(const NativeFrame &frame) {
   if ((captured_cycle_ && *captured_cycle_ == std::numeric_limits<uint64_t>::max()) ||
       frame.hart != configuration_.hart || frame.epoch != configuration_.epoch || frame.cycle != expected)
     return {remember_failure(invalid("BOOM source frame is missing, repeated or from another hart/epoch")), false};
+  // Each retired AMO produces Response and Finish as well as InstructionRetire.
+  // Reserve the whole source frame up front; a partial frame cannot be retried.
+  const size_t atomic_retirements = std::count_if(frame.retirements.begin(), frame.retirements.end(),
+      [](const ProbeInstruction &instruction) {
+        return instruction.atomic && supported_amo_rmw(instruction.instruction);
+      });
   const size_t facts = frame.allocations.size() + frame.begins.size() + frame.cancellations.size() +
       frame.completions.size() + frame.local_stores.size() + frame.retirements.size() +
-      frame.store_releases.size() + frame.squashes.size() + frame.publications.size() +
-      frame.merged_publications.size() + frame.csr_post.has_value() + frame.csr_write_post.has_value() +
-      frame.fp_posts.size();
+      2 * atomic_retirements + frame.store_releases.size() + frame.squashes.size() +
+      frame.publications.size() + frame.merged_publications.size() + frame.atomic_applied.size() +
+      frame.csr_post.has_value() + frame.csr_write_post.has_value() + frame.fp_posts.size();
   if (facts > configuration_.staged_events - std::min(configuration_.staged_events, staged_events_.size()))
     return {pending("BOOM source staging is full; retain the complete frame and drain before retrying"), false};
   if (facts > std::numeric_limits<uint64_t>::max() - capture_sequence_)
@@ -115,6 +121,26 @@ CheckResult NativeCollector::capture_frame(const NativeFrame &frame) {
   if (!result || !(result = capture_counter_write(frame)) || !(result = capture_attempts(frame)))
     return result;
   for (const auto &store : frame.local_stores) {
+    if (store.atomic) {
+      const auto instruction_id = id(store.identity);
+      const auto allocation = allocations_.find(instruction_id);
+      if (allocation == allocations_.end() ||
+          allocation->second.rob.generation != store.identity.rob_generation ||
+          !supported_amo_rmw(allocation->second.instruction) || !allocation->second.stq ||
+          allocation->second.stq->index != store.queue_index ||
+          allocation->second.stq->generation != store.identity.memory_generation ||
+          store.log2_size != ((allocation->second.instruction >> 12) & 7))
+        return invalid("BOOM local AMO commit lacks matching ROB/STQ generation or width");
+      const unsigned width = store.log2_size == 3 ? 8 : 4;
+      auto checked = require_checked_ram(store.address, width);
+      if (!checked)
+        return checked;
+      checked = adapter_.commit_atomic_local({instruction_id, *allocation->second.stq,
+          store.address, store.byte_mask, store.command});
+      if (!checked)
+        return checked;
+      continue;
+    }
     StoreCommit local;
     auto result = convert_store(configuration_.hart, store, capture_source(frame.cycle), local);
     if (!result)
@@ -133,6 +159,28 @@ CheckResult NativeCollector::capture_frame(const NativeFrame &frame) {
     } else {
       result = adapter_.commit_store(local);
     }
+    if (!result)
+      return result;
+  }
+  for (const auto &effect : frame.atomic_applied) {
+    const auto instruction_id = id(effect.identity);
+    const auto allocation = allocations_.find(instruction_id);
+    if (allocation == allocations_.end() ||
+        allocation->second.rob.generation != effect.identity.rob_generation ||
+        !supported_amo_rmw(allocation->second.instruction) || !allocation->second.stq ||
+        allocation->second.stq->index != effect.queue_index ||
+        allocation->second.stq->generation != effect.identity.memory_generation ||
+        effect.mem_size != ((allocation->second.instruction >> 12) & 7))
+      return invalid("BOOM physical AMO effect lacks its exact live ROB/STQ owner");
+    if (effect.source_cycle != frame.cycle || effect.source.position.cycle != effect.source_cycle)
+      return invalid("BOOM physical AMO effect source cycle differs from actual cache-write edge");
+    const unsigned width = effect.mem_size == 3 ? 8 : 4;
+    result = require_checked_ram(effect.address, width);
+    if (!result)
+      return result;
+    result = adapter_.apply_atomic({instruction_id, *allocation->second.stq, effect.identity.attempt,
+        effect.address, effect.old_word, effect.new_word, effect.byte_mask, effect.command,
+        effect.exclusive_valid, effect.source});
     if (!result)
       return result;
   }
@@ -306,11 +354,19 @@ CheckResult NativeCollector::capture_retirements(const NativeFrame &frame) {
         load = candidate;
       }
       Retirement retirement;
+      const bool amo_rmw = core.atomic && supported_amo_rmw(core.instruction);
+      std::optional<EventSource> response_source, finish_source;
+      if (amo_rmw) {
+        response_source = capture_source(frame.cycle);
+        finish_source = capture_source(frame.cycle);
+      }
       auto result = merge_retirement(configuration_.hart, core, allocation->second, load,
                                      configuration_.limits.ldq_slots, configuration_.limits.stq_slots,
                                      capture_source(frame.cycle), retirement);
       if (!result)
         return result;
+      retirement.atomic_response_source = response_source;
+      retirement.atomic_finish_source = finish_source;
       if (retirement.load_address && retirement.load_log2_size && *retirement.load_log2_size <= 3) {
         result = require_checked_ram(*retirement.load_address, size_t{1} << *retirement.load_log2_size);
         if (!result)

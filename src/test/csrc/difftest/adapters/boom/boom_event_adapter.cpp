@@ -11,10 +11,45 @@
 namespace rvwmo {
 namespace boom {
 namespace {
+// BOOM uses the Rocket memory-command ABI, not the RISC-V funct5 encoding.
+std::optional<uint8_t> amo_command(uint32_t instruction) {
+  if ((instruction & 0x7f) != 0x2f ||
+      (((instruction >> 12) & 7) != 2 && ((instruction >> 12) & 7) != 3))
+    return std::nullopt;
+  switch ((instruction >> 27) & 31) {
+  case 0: return 8;   // M_XA_ADD
+  case 1: return 4;   // M_XA_SWAP
+  case 4: return 9;   // M_XA_XOR
+  case 8: return 10;  // M_XA_OR
+  case 12: return 11; // M_XA_AND
+  case 16: return 12; // M_XA_MIN
+  case 20: return 13; // M_XA_MAX
+  case 24: return 14; // M_XA_MINU
+  case 28: return 15; // M_XA_MAXU
+  default: return std::nullopt; // LR/SC/Zacas and unknown extensions.
+  }
+}
+}
+bool supported_amo_rmw(uint32_t instruction) { return amo_command(instruction).has_value(); }
+namespace {
 CheckResult invalid(const char *message) { return {CheckStatus::Invalid, 0, message}; }
 CheckResult incomplete(const char *message) { return {CheckStatus::Incomplete, 0, message}; }
 CheckResult pending(const char *message) { return {CheckStatus::Pending, 0, message}; }
 CheckResult unsupported(const char *message) { return {CheckStatus::Unsupported, 0, message}; }
+
+CheckResult verify_atomic_store_bytes(uint64_t physical_address, uint8_t physical_mask,
+                                      uint64_t physical_new_word, const ReferenceStoreAudit &reference) {
+  if (reference.address != (physical_address & ~UINT64_C(7)) ||
+      reference.byte_mask.size() != 8 || reference.bytes.size() != 8)
+    return {CheckStatus::Violation, 0, "BOOM REF AMO store address or width differs from physical RMW"};
+  for (unsigned byte = 0; byte < 8; ++byte) {
+    const bool selected = physical_mask & (1U << byte);
+    if (reference.byte_mask[byte] != static_cast<uint8_t>(selected) ||
+        (selected && reference.bytes[byte] != static_cast<uint8_t>(physical_new_word >> (byte * 8))))
+      return {CheckStatus::Violation, 0, "BOOM REF AMO store bytes/mask differ from physical RMW"};
+  }
+  return {};
+}
 
 bool valid_bytes(uint64_t address, const std::vector<uint8_t> &bytes, const std::vector<uint8_t> &mask) {
   return (bytes.size() == 1 || bytes.size() == 2 || bytes.size() == 4 || bytes.size() == 8) &&
@@ -86,6 +121,9 @@ std::optional<uint8_t> integer_rd(uint32_t instruction, uint8_t length) {
       if (function <= 6)
         return static_cast<uint8_t>((instruction >> 7) & 31);
       return std::nullopt;
+    case 0x2f:
+      return supported_amo_rmw(instruction) ?
+          std::optional<uint8_t>{static_cast<uint8_t>((instruction >> 7) & 31)} : std::nullopt;
     case 0x13: case 0x17: case 0x1b: case 0x33: case 0x37: case 0x3b:
     case 0x67: case 0x6f:
       return static_cast<uint8_t>((instruction >> 7) & 31);
@@ -269,12 +307,13 @@ CheckResult BoomEventAdapter::validate_event_source(RuntimeEventKind kind, const
   if (!result)
     return result;
   const bool publication = kind == RuntimeEventKind::StorePublish;
-  const uint32_t expected = publication ? kMemoryFabricProducerBase + 0 : hart_producer_id(hart_);
-  const bool valid_channel = publication ? source.producer_id >= kMemoryFabricProducerBase
-                                         : source.producer_id == expected;
+  const bool atomic = kind == RuntimeEventKind::AtomicLifecycle;
+  const bool fabric = source.producer_id >= kMemoryFabricProducerBase;
+  const bool valid_channel = publication ? fabric :
+      atomic ? (fabric || source.producer_id == hart_producer_id(hart_)) :
+               source.producer_id == hart_producer_id(hart_);
   if (!valid_channel)
-    return invalid(publication ? "BOOM StorePublish must use a registered shared-fabric producer"
-                               : "BOOM hart-private event must use the configured hart producer");
+    return invalid("BOOM event uses an unregistered hart or fabric producer channel");
   return {};
 }
 
@@ -335,8 +374,9 @@ CheckResult BoomEventAdapter::allocate(const InstructionAllocation &record) {
   const auto floating = decode_floating_transfer(record.instruction);
   const bool floating_load = floating && floating->kind == FloatingTransferKind::Load;
   const bool floating_store = floating && floating->kind == FloatingTransferKind::Store;
+  const bool atomic_rmw = record.length == 4 && supported_amo_rmw(record.instruction);
   const bool unsupported_memory =
-      (record.length == 4 && (opcode == 0x2f ||
+      (record.length == 4 && ((opcode == 0x2f && !atomic_rmw) ||
         ((opcode == 0x07 || opcode == 0x27) && !floating))) ||
       (record.length == 2 && (quadrant == 0 || quadrant == 2) &&
        (compressed_function == 1 || compressed_function == 5) && !floating);
@@ -344,9 +384,13 @@ CheckResult BoomEventAdapter::allocate(const InstructionAllocation &record) {
       (quadrant == 0 || quadrant == 2) && (compressed_function == 2 || compressed_function == 3));
   const bool store = floating_store || (record.length == 4 ? opcode == 0x23 :
       (quadrant == 0 || quadrant == 2) && (compressed_function == 6 || compressed_function == 7));
-  if (!unsupported_memory && (load != record.ldq.has_value() ||
-      (store != record.stq.has_value() && !(record.stq && fence_instruction(record.instruction)))))
+  if (atomic_rmw) {
+    if (record.ldq || !record.stq)
+      return unsupported("BOOM AMO RMW needs the observed exclusive STQ-only lifecycle");
+  } else if (!unsupported_memory && (load != record.ldq.has_value() ||
+      (store != record.stq.has_value() && !(record.stq && fence_instruction(record.instruction))))) {
     return invalid("BOOM raw scalar opcode does not match its LDQ/STQ allocation");
+  }
   if (load && !scalar_memory_log2_size(record.instruction, record.length, true))
     return unsupported("BOOM load encoding is not a supported scalar integer width");
   if (store && !scalar_memory_log2_size(record.instruction, record.length, false))
@@ -354,7 +398,7 @@ CheckResult BoomEventAdapter::allocate(const InstructionAllocation &record) {
   if (record.length == 4 && ((record.instruction >> 2) & 7) == 7)
     return unsupported("BOOM extended-length instruction exceeds the scalar consumer decode width");
   if (record.ldq && record.stq)
-    return unsupported("BOOM atomic read/write allocation needs the public atomic lifecycle consumer");
+    return unsupported("BOOM two-queue atomic lifecycle needs independent LDQ/STQ evidence");
   result = available_slot(rob_, record.rob);
   if (!result)
     return result;
@@ -375,6 +419,7 @@ CheckResult BoomEventAdapter::allocate(const InstructionAllocation &record) {
   Instruction state;
   state.allocation = record;
   state.unsupported_memory = unsupported_memory;
+  state.is_atomic_rmw = atomic_rmw;
   instructions_.emplace(record.id, std::move(state));
   claim_slot(rob_, record.rob, record.id);
   if (record.ldq)
@@ -540,6 +585,95 @@ CheckResult BoomEventAdapter::commit_store(const StoreCommit &record) {
   return {};
 }
 
+CheckResult BoomEventAdapter::commit_atomic_local(const AtomicLocalCommit &record) {
+  auto result = validate_id(record.id);
+  if (!result)
+    return result;
+  auto owner = instructions_.find(record.id);
+  if (owner == instructions_.end() || !owner->second.is_atomic_rmw || !owner->second.allocation.stq ||
+      !(*owner->second.allocation.stq == record.stq) || owner->second.atomic_local_committed ||
+      owner->second.retired)
+    return invalid("BOOM AMO local commitment lacks one live matching STQ owner");
+  if (!owner->second.stq_released) {
+    result = owned_slot(stq_, record.stq, record.id);
+    if (!result)
+      return result;
+  }
+  const auto width = ((owner->second.allocation.instruction >> 12) & 7) == 3 ? 8U : 4U;
+  const auto expected_mask = static_cast<uint8_t>(((1U << width) - 1) << (record.address & 7));
+  if (record.address % width || record.mask != expected_mask ||
+      record.address > UINT64_MAX - (width - 1) ||
+      record.command != amo_command(owner->second.allocation.instruction))
+    return invalid("BOOM AMO LocalStore address, mask or command differs from its encoding");
+  if (owner->second.atomic_applied &&
+      (record.address != owner->second.atomic_address || record.mask != owner->second.atomic_mask))
+    return invalid("BOOM AMO local commitment differs from the physical RMW effect");
+  auto &atomic = owner->second;
+  atomic.atomic_local_committed = true;
+  atomic.atomic_local_address = record.address;
+  atomic.atomic_local_mask = record.mask;
+  return {};
+}
+
+CheckResult BoomEventAdapter::apply_atomic(const AtomicApplied &record) {
+  auto result = validate_id(record.id);
+  if (!result)
+    return result;
+  auto found = instructions_.find(record.id);
+  if (found == instructions_.end() || !found->second.is_atomic_rmw || found->second.atomic_applied ||
+      found->second.retired || !found->second.allocation.stq ||
+      !(*found->second.allocation.stq == record.stq))
+    return invalid("BOOM RMW effect lacks one live matching AMO/STQ identity");
+  if (!record.exclusive_valid || !record.source.position.order_qualified)
+    return incomplete("BOOM AMO old/new words lack one certified exclusive cache write point");
+  if (record.source.position.cycle == 0 ||
+      record.source.producer_id != memory_fabric_producer_id(hart_) ||
+      record.attempt != 0)
+    return incomplete("BOOM AMO physical effect lacks its source channel or final attempt certificate");
+  const auto width = ((found->second.allocation.instruction >> 12) & 7) == 3 ? 8U : 4U;
+  const auto offset = static_cast<unsigned>(record.address & 7);
+  if (record.address % width || record.address > UINT64_MAX - (width - 1) ||
+      record.mask != static_cast<uint8_t>(((1U << width) - 1) << offset) ||
+      record.command != amo_command(found->second.allocation.instruction))
+    return invalid("BOOM RMW effect address, byte mask or command differs from its instruction");
+  if (!found->second.stq_released) {
+    result = owned_slot(stq_, record.stq, record.id);
+    if (!result)
+      return result;
+  }
+  if (found->second.atomic_local_committed &&
+      (record.address != found->second.atomic_local_address ||
+       record.mask != found->second.atomic_local_mask))
+    return invalid("BOOM RMW effect differs from the locally committed atomic instruction");
+  const uint64_t selected_mask = width == 8 ? UINT64_MAX : UINT64_C(0xffffffff) << (offset * 8);
+  if (((record.old_word ^ record.new_word) & ~selected_mask) != 0)
+    return {CheckStatus::Violation, 0, "BOOM word AMO changed preserved byte lanes"};
+  AtomicLifecycleEvent effect;
+  effect.id = record.id;
+  effect.attempt = record.attempt;
+  effect.phase = AtomicObservationPhase::RmwEffect;
+  effect.address = record.address & ~UINT64_C(7);
+  effect.data = record.old_word;
+  effect.new_data = record.new_word;
+  effect.mask = record.mask;
+  effect.command = record.command;
+  effect.fuop = width == 8 ? 5 : 4;
+  effect.success = true;
+  effect.exclusive_write_witness = true;
+  result = append(record.source, RuntimeEventKind::AtomicLifecycle, effect);
+  if (!result)
+    return result;
+  auto &atomic = found->second;
+  atomic.atomic_applied = true;
+  atomic.atomic_address = record.address;
+  atomic.atomic_old_word = record.old_word;
+  atomic.atomic_new_word = record.new_word;
+  atomic.atomic_mask = record.mask;
+  atomic.atomic_command = record.command;
+  atomic.atomic_attempt = record.attempt;
+  return {};
+}
+
 CheckResult BoomEventAdapter::skip_device_store(const StoreCommit &record) {
   auto result = validate_id(record.id);
   if (!result)
@@ -571,6 +705,7 @@ CheckResult BoomEventAdapter::release_store_slot(const OperationId &id, const Sl
   auto found = instructions_.find(id);
   if (found == instructions_.end() || found->second.stq_released ||
       (!found->second.store && !found->second.skipped_device_store &&
+       !(found->second.is_atomic_rmw && found->second.atomic_local_committed) &&
        !fence_instruction(found->second.allocation.instruction)))
     return invalid("BOOM STQ release has no committed store/fence or was already released");
   release_slot(stq_, stq);
@@ -714,7 +849,7 @@ CheckResult BoomEventAdapter::retire(const Retirement &record) {
   auto found = instructions_.find(record.id);
   if (found == instructions_.end() || found->second.retired || record.id.uid <= last_retired_uid_)
     return invalid("BOOM retirement is stale, duplicated or out of architectural program order");
-  if (found->second.unsupported_memory)
+  if (found->second.unsupported_memory && !found->second.is_atomic_rmw)
     return unsupported("BOOM retired memory instruction exceeds the scalar consumer profile");
   if (captured_retirements_.size() >= limits_.captured_retirements)
     return pending("BOOM architectural result queue is full; retrieve captured retirements and retry");
@@ -747,6 +882,60 @@ CheckResult BoomEventAdapter::retire(const Retirement &record) {
   retirement.instruction.uid = record.id.uid;
   retirement.instruction.pc = record.pc;
   retirement.instruction.instruction = record.instruction;
+  if (state.is_atomic_rmw) {
+    if (!state.atomic_applied || !state.atomic_local_committed)
+      return incomplete("BOOM AMO retirement lacks its local commit or exclusive RMW witness");
+    if (record.skipped_device_store || record.load_attempt || record.load_address ||
+        record.load_log2_size || !record.load_bytes.empty())
+      return invalid("BOOM AMO retirement carries scalar-load or excluded-device metadata");
+    if (!record.atomic_response_source || !record.atomic_finish_source)
+      return incomplete("BOOM AMO retirement lacks independent response/finish source evidence");
+    const unsigned width = ((record.instruction >> 12) & 7) == 3 ? 8 : 4;
+    const unsigned offset = state.atomic_address & 7;
+    const uint64_t selected = state.atomic_old_word >> (offset * 8);
+    const uint64_t expected_response = width == 8 ? selected :
+        static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(selected)));
+    if (record.logical_destination != 0 && record.writeback_value != expected_response)
+      return {CheckStatus::Violation, 0, "BOOM AMO ROB old-value response differs from cache RMW old word"};
+    MemoryOperation operation;
+    operation.id = record.id;
+    operation.attempt = state.atomic_attempt;
+    operation.address = state.atomic_address & ~UINT64_C(7);
+    operation.byte_mask.resize(8);
+    for (unsigned byte = 0; byte < 8; ++byte)
+      operation.byte_mask[byte] = (state.atomic_mask >> byte) & 1;
+    operation.atomic = operation.load = operation.store = true;
+    operation.acquire = (record.instruction >> 26) & 1;
+    operation.release = (record.instruction >> 25) & 1;
+    operation.rcsc = operation.acquire || operation.release;
+    operation.source_kind = ReadSourceKind::ModeledWitness;
+    retirement.instruction.memory.push_back(operation);
+    std::vector<uint8_t> actual(8);
+    for (unsigned byte = 0; byte < 8; ++byte)
+      actual[byte] = static_cast<uint8_t>(state.atomic_old_word >> (byte * 8));
+    retirement.loads.push_back({record.id, state.atomic_attempt, std::move(actual)});
+
+    AtomicLifecycleEvent response;
+    response.id = record.id;
+    response.attempt = state.atomic_attempt;
+    response.phase = AtomicObservationPhase::Response;
+    response.address = operation.address;
+    // x0 discards the ROB result; the cache old word remains the witnessed
+    // response value for the lifecycle, without an architectural rd compare.
+    response.data = record.logical_destination == 0 ? expected_response : record.writeback_value;
+    response.mask = state.atomic_mask;
+    response.command = state.atomic_command;
+    response.fuop = width == 8 ? 5 : 4;
+    response.success = true;
+    result = append(*record.atomic_response_source, RuntimeEventKind::AtomicLifecycle, response);
+    if (!result)
+      return result;
+    auto finish = response;
+    finish.phase = AtomicObservationPhase::Finish;
+    result = append(*record.atomic_finish_source, RuntimeEventKind::AtomicLifecycle, finish);
+    if (!result)
+      return result;
+  } else {
   if (state.allocation.ldq) {
     if (!record.load_attempt)
       return incomplete("BOOM load retirement lacks its final attempt identity");
@@ -780,6 +969,7 @@ CheckResult BoomEventAdapter::retire(const Retirement &record) {
     if (state.store)
       retirement.instruction.memory.push_back(*state.store);
   }
+  }
   retirement.instruction.skipped_device_store = state.skipped_device_store;
   result = append(record.source, RuntimeEventKind::InstructionRetire, std::move(retirement));
   if (!result)
@@ -787,7 +977,7 @@ CheckResult BoomEventAdapter::retire(const Retirement &record) {
   state.retired = true;
   CapturedRetirement captured{record.id, record.pc, record.instruction, record.source,
                               record.destination_type, {}, {},
-                              retirement_coverage(record.instruction, record.destination_type)};
+                              retirement_coverage(record.instruction, record.destination_type), {}, {}};
   if (record.destination_type == IntegerDestinationType::Integer && record.logical_destination != 0) {
     captured.destination_register = record.logical_destination;
     captured.destination_value = record.writeback_value;
@@ -812,6 +1002,23 @@ CheckResult BoomEventAdapter::audit_reference_store(CheckerEventConsumer &consum
   if (!result)
     return result;
   auto found = instructions_.find(record.id);
+  if (found != instructions_.end() && found->second.is_atomic_rmw) {
+    auto &atomic = found->second;
+    if (!atomic.atomic_applied || !atomic.atomic_local_committed)
+      return pending("BOOM REF AMO audit awaits the committed physical RMW effect");
+    if (atomic.audited)
+      return invalid("BOOM REF AMO store was already audited");
+    result = verify_atomic_store_bytes(atomic.atomic_address, atomic.atomic_mask,
+                                       atomic.atomic_new_word, record);
+    if (!result)
+      return result;
+    result = consumer.audit_store(record.id, record.address, record.bytes, record.byte_mask);
+    if (!result)
+      return result;
+    atomic.audited = true;
+    collect(record.id);
+    return {};
+  }
   if (found == instructions_.end() || !found->second.store)
     return pending("BOOM reference store audit awaits LocalStore conversion");
   if (found->second.audited)
@@ -830,6 +1037,20 @@ CheckResult BoomEventAdapter::audit_reference_store(const ReferenceStoreAudit &r
   if (!result)
     return result;
   auto found = instructions_.find(record.id);
+  if (found != instructions_.end() && found->second.is_atomic_rmw) {
+    auto &atomic = found->second;
+    if (!atomic.atomic_applied || !atomic.atomic_local_committed)
+      return pending("BOOM REF AMO audit awaits the committed physical RMW effect");
+    if (atomic.audited)
+      return invalid("BOOM REF AMO store was already audited");
+    result = verify_atomic_store_bytes(atomic.atomic_address, atomic.atomic_mask,
+                                       atomic.atomic_new_word, record);
+    if (!result)
+      return result;
+    atomic.audited = true;
+    collect(record.id);
+    return {};
+  }
   if (found == instructions_.end() || !found->second.store)
     return pending("BOOM reference store audit awaits LocalStore conversion");
   if (found->second.audited)
@@ -850,6 +1071,9 @@ void BoomEventAdapter::collect(const OperationId &id) {
   const auto &instruction = found->second;
   if (instruction.store && (!instruction.published || !instruction.audited))
     return;
+  if (instruction.is_atomic_rmw && (!instruction.atomic_applied || !instruction.atomic_local_committed ||
+                                    !instruction.audited))
+    return;
   if (instruction.allocation.stq && !instruction.stq_released)
     return;
   instructions_.erase(found);
@@ -864,8 +1088,9 @@ CheckResult BoomEventAdapter::squash(const OperationId &id, const SlotGeneration
     return result;
   auto found = instructions_.find(id);
   if (found == instructions_.end() || found->second.retired || found->second.store ||
-      found->second.skipped_device_store)
-    return invalid("BOOM cannot squash an unknown, retired or architecturally committed store");
+      found->second.skipped_device_store ||
+      (found->second.is_atomic_rmw && (found->second.atomic_local_committed || found->second.atomic_applied)))
+    return invalid("BOOM cannot squash an unknown, retired or architecturally committed effect");
   result = append(source, RuntimeEventKind::InstructionSquash, InstructionSquashEvent{id});
   if (!result)
     return result;
