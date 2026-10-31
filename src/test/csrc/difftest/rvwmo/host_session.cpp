@@ -163,10 +163,20 @@ CheckResult HostSession::validate_batch(const EventBatch &batch) const {
       if (!store.bytes.empty() && !memory_.contains(store.address, store.bytes.size()))
         return {CheckStatus::Unsupported, 0, "publication targets MMIO or uninitialized reference RAM"};
     }
+    const bool physical_atomic = event.kind == RuntimeEventKind::AtomicLifecycle &&
+        std::get<AtomicLifecycleEvent>(event.payload).phase == AtomicObservationPhase::RmwEffect;
+    if (physical_atomic) {
+      const auto &atomic = std::get<AtomicLifecycleEvent>(event.payload);
+      if (!memory_.contains(atomic.address, 8))
+        return {CheckStatus::Unsupported, 0, "atomic RMW targets MMIO or uninitialized reference RAM"};
+    }
     for (const uint32_t hart : event_harts(event)) {
       if (!registered_hart(hart))
         return invalid("host event names a hart outside the fixed reference roster");
-      if (event.kind != RuntimeEventKind::StorePublish && event.producer_id != hart_producer_id(hart))
+      if (physical_atomic && event.producer_id != memory_fabric_producer_id(hart))
+        return invalid("atomic RMW effect is not on its matching physical fabric channel");
+      if (!physical_atomic && event.kind != RuntimeEventKind::StorePublish &&
+          event.producer_id != hart_producer_id(hart))
         return invalid("hart event is not on its registered private source channel");
       const auto done = completed_harts_.find(hart);
       const bool architectural = event.kind == RuntimeEventKind::InstructionAllocate ||

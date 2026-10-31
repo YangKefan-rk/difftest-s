@@ -19,7 +19,8 @@ bool is_memory_event_kind(const RuntimeEvent &event) {
     return true;
   case RuntimeEventKind::AtomicLifecycle: {
     const auto phase = std::get<AtomicLifecycleEvent>(event.payload).phase;
-    return phase == AtomicObservationPhase::ReadEffect || phase == AtomicObservationPhase::WriteEffect;
+    return phase == AtomicObservationPhase::ReadEffect || phase == AtomicObservationPhase::WriteEffect ||
+           phase == AtomicObservationPhase::RmwEffect;
   }
   default:
     return false;

@@ -339,7 +339,8 @@ bool ObservationStream::payload_has_valid_shape(const RuntimeEvent &event) {
   case RuntimeEventKind::AtomicLifecycle: {
     const auto &p = std::get<AtomicLifecycleEvent>(event.payload);
     return p.id.uid && ((p.phase != AtomicObservationPhase::ReadEffect &&
-                         p.phase != AtomicObservationPhase::WriteEffect) || p.mask != 0);
+                         p.phase != AtomicObservationPhase::WriteEffect &&
+                         p.phase != AtomicObservationPhase::RmwEffect) || p.mask != 0);
   }
   case RuntimeEventKind::InstructionRetire: {
     const auto &p = std::get<InstructionRetireEvent>(event.payload);
@@ -389,10 +390,12 @@ std::optional<ObservationStream::MemoryEffect> ObservationStream::memory_effect(
   }
   case RuntimeEventKind::AtomicLifecycle: {
     const auto &atomic = std::get<AtomicLifecycleEvent>(event.payload);
-    if (atomic.phase != AtomicObservationPhase::ReadEffect && atomic.phase != AtomicObservationPhase::WriteEffect)
+    if (atomic.phase != AtomicObservationPhase::ReadEffect &&
+        atomic.phase != AtomicObservationPhase::WriteEffect &&
+        atomic.phase != AtomicObservationPhase::RmwEffect)
       return std::nullopt;
     effect.address = atomic.address;
-    effect.write = atomic.phase == AtomicObservationPhase::WriteEffect;
+    effect.write = atomic.phase != AtomicObservationPhase::ReadEffect;
     for (unsigned byte = 0; byte < 8; ++byte)
       effect.byte_mask.push_back((atomic.mask >> byte) & 1);
     return effect;
@@ -424,7 +427,10 @@ StreamResult ObservationStream::validate_transaction(const ObservationStream &st
     auto closed_sequence = stream.closed_source_sequences_.find(event.producer_id);
     if (closed_sequence != stream.closed_source_sequences_.end() &&
         event.source.producer_sequence <= closed_sequence->second)
-      return invalid("producer source sequence did not advance beyond the closed prefix");
+      return {EventValidationStatus::Invalid, "producer source sequence did not advance beyond the closed prefix: " +
+          std::to_string(event.producer_id) + "/" + std::to_string(event.source.producer_sequence) +
+          " <= " + std::to_string(closed_sequence->second) + ", cycle " +
+          std::to_string(event.source.cycle) + ", event kind " + std::to_string(unsigned(event.kind))};
     auto watermark = stream.watermarks_.find(event.producer_id);
     if (watermark != stream.watermarks_.end()) {
       if (position_is_closed(event.producer_id, event.source, watermark->second))

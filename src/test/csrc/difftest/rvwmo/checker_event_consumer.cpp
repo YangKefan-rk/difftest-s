@@ -1,5 +1,6 @@
 #include "checker_event_consumer.h"
 #include "dependency.h"
+#include "producer_ids.h"
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
@@ -14,6 +15,49 @@ CheckResult pending(const char *message) { return {CheckStatus::Pending, 0, mess
 bool same_parent(const OperationId &operation, const OperationId &instruction) {
   return operation.hart == instruction.hart && operation.epoch == instruction.epoch &&
          operation.uid == instruction.uid;
+}
+
+// Atomic lifecycle operands use the LinkNan convention: an eight-byte aligned
+// address plus a byte mask selecting the lower word (0x0f), upper word (0xf0)
+// or the full doubleword (0xff). The shared LrScChecker trims the mask to its
+// contiguous enabled operand.
+std::vector<uint8_t> atomic_mask_bytes(uint8_t mask) {
+  std::vector<uint8_t> bytes(8);
+  for (unsigned byte = 0; byte < 8; ++byte)
+    bytes[byte] = (mask >> byte) & 1;
+  return bytes;
+}
+
+std::vector<uint8_t> atomic_data_bytes(uint64_t data) {
+  std::vector<uint8_t> bytes(8);
+  for (unsigned byte = 0; byte < 8; ++byte)
+    bytes[byte] = static_cast<uint8_t>(data >> (8 * byte));
+  return bytes;
+}
+
+// Certify only architectural AMO W/D operations. LR/SC reservations and
+// optional Zacas encodings need their own hardware witness and REF semantics.
+bool supported_rmw_instruction(uint32_t instruction) {
+  if ((instruction & 0x7f) != 0x2f)
+    return false;
+  const unsigned width = (instruction >> 12) & 7;
+  const unsigned operation = (instruction >> 27) & 31;
+  if (width != 2 && width != 3)
+    return false;
+  switch (operation) {
+  case 0: case 1: case 4: case 8: case 12:
+  case 16: case 20: case 24: case 28:
+    return true;
+  default:
+    return false;
+  }
+}
+
+uint64_t architectural_old_value(uint64_t aligned_old, uint8_t byte_mask) {
+  if (byte_mask == 0xff)
+    return aligned_old;
+  const uint32_t lane = byte_mask == 0xf0 ? uint32_t(aligned_old >> 32) : uint32_t(aligned_old);
+  return uint64_t(int64_t(int32_t(lane)));
 }
 
 } // namespace
@@ -179,6 +223,185 @@ CheckResult CheckerEventConsumer::consume_load_sample(const RuntimeEvent &event,
   remember_rank(event, time, certificate, operation.id, operation.attempt);
   loads_.emplace(key, LoadRecord{std::move(operation), sample.actual_bytes});
   return result;
+}
+
+CheckResult CheckerEventConsumer::consume_atomic(const RuntimeEvent &event,
+                                                       const AtomicLifecycleEvent &atomic) {
+  if (!failure_)
+    return failure_;
+  const auto parent = instruction_id(atomic.id);
+  if (!allocations_.count(parent))
+    return remember_failure(incomplete("atomic lifecycle has no closed parent allocation"));
+  if (atomic.id.subaccess != 0)
+    return remember_failure(unsupported("split or vector atomic lifecycle is not covered by this consumer"));
+
+  const uint32_t instruction = allocations_.at(parent).instruction;
+  if (!supported_rmw_instruction(instruction))
+    return remember_failure(unsupported("only AMO.W/.D has an indivisible lifecycle certificate"));
+
+  auto inflight = atomic_inflight_.find(atomic.id.hart);
+  if (atomic.phase == AtomicObservationPhase::Begin) {
+    if (inflight != atomic_inflight_.end() || atomics_.count(atomic.id))
+      return remember_failure(invalid("overlapping or duplicate AMO lifecycle"));
+    AtomicRecord record;
+    record.id = atomic.id;
+    record.attempt = atomic.attempt;
+    record.rmw = true;
+    atomic_inflight_.emplace(atomic.id.hart, std::move(record));
+    return {};
+  }
+  // An accepted cache write is a sufficient, independent begin witness. Do
+  // not synthesize accepted requests or replay tokens that RTL did not expose.
+  if (atomic.phase == AtomicObservationPhase::RmwEffect && inflight == atomic_inflight_.end()) {
+    if (atomics_.count(atomic.id) || atomic.attempt != 0)
+      return remember_failure(invalid("duplicate AMO effect or unobserved replay attempt"));
+    AtomicRecord record;
+    record.id = atomic.id;
+    record.attempt = atomic.attempt;
+    record.rmw = true;
+    inflight = atomic_inflight_.emplace(atomic.id.hart, std::move(record)).first;
+  }
+
+  if (inflight == atomic_inflight_.end()) {
+    // A Finish after a completed Response is the normal close; a duplicate
+    // Finish is not an effect and is rejected.
+    if (atomic.phase == AtomicObservationPhase::Finish && atomics_.count(atomic.id))
+      return remember_failure(invalid("duplicate AMO Finish after completed lifecycle"));
+    return remember_failure(invalid("atomic lifecycle effect has no active Begin"));
+  }
+  auto &record = inflight->second;
+  if (record.id != atomic.id)
+    return remember_failure(invalid("atomic lifecycle identity changed"));
+  const bool replay_request = atomic.phase == AtomicObservationPhase::Request && record.awaiting_retry &&
+                              atomic.attempt == record.attempt + 1;
+  if (!replay_request && record.attempt != atomic.attempt)
+    return remember_failure(invalid("atomic lifecycle attempt changed outside a replay request"));
+
+  switch (atomic.phase) {
+  case AtomicObservationPhase::Request: {
+    if (record.response_seen)
+      return remember_failure(invalid("atomic request follows its response"));
+    if (record.request_seen && !record.awaiting_retry)
+      return remember_failure(invalid("duplicate atomic request without replay"));
+    if (record.awaiting_retry && atomic.attempt != record.attempt + 1)
+      return remember_failure(invalid("atomic replay attempt does not follow its predecessor"));
+    if (!record.awaiting_retry && atomic.attempt != record.attempt)
+      return remember_failure(invalid("first atomic request attempt differs from Begin"));
+    if ((atomic.mask != 0x0f && atomic.mask != 0xf0 && atomic.mask != 0xff) || (atomic.address & 7))
+      return remember_failure(unsupported("atomic operand range or width is not supported"));
+    record.address = atomic.address;
+    record.mask = atomic.mask;
+    record.attempt = atomic.attempt;
+    record.request_seen = true;
+    record.awaiting_retry = false;
+    record.read_seen = false;
+    record.write_seen = false;
+    return {};
+  }
+  case AtomicObservationPhase::ReadEffect:
+  case AtomicObservationPhase::WriteEffect:
+    return remember_failure(unsupported("AMO cannot split its read and write into separately ranked effects"));
+  case AtomicObservationPhase::RmwEffect: {
+    if (!record.rmw || record.read_seen || record.write_seen || record.awaiting_retry || record.response_seen ||
+        (record.request_seen && (record.address != atomic.address || record.mask != atomic.mask)) ||
+        atomic.address & 7 ||
+        (((instruction >> 12) & 7) == 3 && atomic.mask != 0xff) ||
+        (((instruction >> 12) & 7) == 2 && atomic.mask != 0x0f && atomic.mask != 0xf0))
+      return remember_failure(invalid("indivisible AMO effect disagrees with its instruction or prior request"));
+    if (!atomic.exclusive_write_witness || !event.source.order_qualified ||
+        event.producer_id != memory_fabric_producer_id(record.id.hart))
+      return remember_failure(incomplete("AMO lacks certified exclusive array-write GMO witness"));
+    for (unsigned byte = 0; byte < 8; ++byte)
+      if (!(atomic.mask & (1U << byte)) &&
+          uint8_t(atomic.data >> (byte * 8)) != uint8_t(atomic.new_data >> (byte * 8)))
+        return remember_failure(invalid("AMO rewrote an unselected cache-word byte"));
+    if (loads_.size() >= max_live_instructions_ || stores_.size() >= max_live_instructions_)
+      return pending("bounded AMO state is full before its indivisible memory effect");
+    ObservationTime time;
+    auto result = require_rank(event, time);
+    if (!result)
+      return result;
+    MemoryOperation read;
+    read.id = record.id;
+    read.attempt = record.attempt;
+    read.address = atomic.address;
+    read.byte_mask = atomic_mask_bytes(atomic.mask);
+    read.load = read.atomic = true;
+    read.read_time = time;
+    read.source_kind = ReadSourceKind::ModeledWitness;
+    result = checker_.observe_load(read, record.id.uid, {}, false);
+    if (result.status != CheckStatus::Pass && result.status != CheckStatus::Pending)
+      return remember_failure(result);
+    if (!loads_.emplace(LoadKey{record.id, record.attempt},
+                        LoadRecord{read, atomic_data_bytes(atomic.data)}).second)
+      return remember_failure(invalid("AMO repeated its old-value sample"));
+    MemoryOperation write;
+    write.id = record.id;
+    write.attempt = record.attempt;
+    write.address = atomic.address;
+    write.byte_mask = read.byte_mask;
+    write.store = write.atomic = true;
+    write.write_time = time;
+    MemoryWriter writer;
+    result = checker_.memory_writer(record.id, writer);
+    if (!result)
+      return remember_failure(result);
+    const auto bytes = atomic_data_bytes(atomic.new_data);
+    MemoryStore store{writer, record.id.uid, atomic.address, bytes, write.byte_mask};
+    result = checker_.record_store(store, write, StoreVerification::Provisional);
+    if (result.status != CheckStatus::Pass && result.status != CheckStatus::Pending)
+      return remember_failure(result);
+    result = checker_.observe_global(atomic.address, bytes, write.byte_mask,
+                                     std::vector<MemoryWriter>(8, writer), {writer}, time);
+    if (result.status != CheckStatus::Pass && result.status != CheckStatus::Pending)
+      return remember_failure(result);
+    if (!stores_.emplace(record.id, StoreRecord{write, store, false, true, false}).second)
+      return remember_failure(invalid("AMO repeated its atomic store"));
+    record.address = atomic.address;
+    record.mask = atomic.mask;
+    record.old_data = atomic.data;
+    record.new_data = atomic.new_data;
+    record.request_seen = record.read_seen = record.write_seen = true;
+    remember_rank(event, time, RankCertificate::None, record.id, record.attempt);
+    return result.status == CheckStatus::Pending ? result : CheckResult{};
+  }
+  case AtomicObservationPhase::Replay: {
+    if (!record.request_seen || record.awaiting_retry || record.read_seen || record.write_seen)
+      return remember_failure(invalid("atomic replay does not follow an outstanding request without effects"));
+    record.awaiting_retry = true;
+    return {};
+  }
+  case AtomicObservationPhase::Response: {
+    if (!record.request_seen || record.response_seen)
+      return remember_failure(invalid("duplicate atomic response or no outstanding request"));
+    if (!record.read_seen || !record.write_seen || atomic.data != architectural_old_value(record.old_data, record.mask))
+      return remember_failure({CheckStatus::Violation, 0, "AMO response differs from the selected old cache word"});
+    record.success = atomic.success;
+    record.error = atomic.error;
+    record.response_seen = true;
+    if (atomic.error)
+      return remember_failure(unsupported("atomic observation reported an access error"));
+    if (!record.success)
+      return remember_failure(unsupported("AMO hardware response reported an unsuccessful atomic"));
+    return {};
+  }
+  case AtomicObservationPhase::Finish: {
+    if (!record.response_seen || !record.read_seen || !record.write_seen)
+      return remember_failure(incomplete("AMO finish precedes its independently observed result/effect"));
+    atomics_.emplace(record.id, record);
+    atomic_inflight_.erase(inflight);
+    return {};
+  }
+  case AtomicObservationPhase::Cancel: {
+    if (record.read_seen || record.write_seen)
+      return remember_failure(invalid("cancelled atomic already has a memory effect"));
+    atomic_inflight_.erase(inflight);
+    return {};
+  }
+  case AtomicObservationPhase::Begin:
+    break;
+  }
+  return remember_failure(invalid("unknown atomic lifecycle phase"));
 }
 
 CheckResult CheckerEventConsumer::consume_read_group_member(const RuntimeEvent &event, bool source_prefix_closed) {
@@ -432,6 +655,16 @@ CheckResult CheckerEventConsumer::consume_squash(const InstructionSquashEvent &e
     if (same_parent(store.first, parent))
       return remember_failure(invalid("architecturally committed LocalStore cannot be squashed"));
 
+  auto inflight = atomic_inflight_.find(parent.hart);
+  if (inflight != atomic_inflight_.end() && same_parent(inflight->second.id, parent))
+    atomic_inflight_.erase(inflight);
+  for (auto atomic = atomics_.begin(); atomic != atomics_.end();) {
+    if (same_parent(atomic->first, parent))
+      atomic = atomics_.erase(atomic);
+    else
+      ++atomic;
+  }
+
   for (auto load = loads_.begin(); load != loads_.end();) {
     if (!same_parent(load->first.first, parent)) {
       ++load;
@@ -459,7 +692,7 @@ CheckResult CheckerEventConsumer::consume_retire(const InstructionRetireEvent &e
       ((instruction.instruction & 0x7f) != 0x23 || !instruction.memory.empty() || !event.loads.empty()))
     return remember_failure(invalid("excluded device store carries a non-store or coherent RAM operation"));
   if (instruction.failed_sc)
-    return remember_failure(unsupported("failed SC retirement requires the atomic lifecycle checker"));
+    return remember_failure(unsupported("failed SC retirement remains outside the AMO-only profile"));
   auto allocation = allocations_.find(id);
   if (allocation == allocations_.end())
     return remember_failure(invalid("retirement has no live parent instruction allocation"));
@@ -502,29 +735,71 @@ CheckResult CheckerEventConsumer::consume_retire(const InstructionRetireEvent &e
       return remember_failure(invalid("compressed non-memory opcode carries a memory effect"));
   } else {
     const uint32_t opcode = instruction.instruction & 0x7f;
-    if (opcode == 0x2f || ((opcode == 0x07 || opcode == 0x27) && !floating))
-      return remember_failure(unsupported("vector or atomic memory opcode needs a richer consumer"));
-    if (((opcode == 0x03 || floating_load) && (!has_load || has_store)) ||
-        ((opcode == 0x23 || floating_store) && (!has_store || has_load) && !instruction.skipped_device_store))
-      return remember_failure(incomplete("supported load/store retirement lacks its matching memory event"));
-    if (opcode != 0x03 && opcode != 0x23 && !floating_load && !floating_store && !instruction.memory.empty())
-      return remember_failure(invalid("non-load/store opcode carries a memory effect"));
-    if (opcode == 0x0f && ((instruction.instruction >> 12) & 7) == 2)
-      return remember_failure(unsupported("cache-block operation is not modeled by this consumer"));
+    if ((opcode == 0x07 || opcode == 0x27) && !floating)
+      return remember_failure(unsupported("vector memory opcode needs a richer consumer"));
+    if (opcode == 0x2f) {
+      if (instruction.memory.empty())
+        return remember_failure(incomplete("AMO retirement lacks its certified indivisible memory effect"));
+    } else {
+      if (((opcode == 0x03 || floating_load) && (!has_load || has_store)) ||
+          ((opcode == 0x23 || floating_store) && (!has_store || has_load) && !instruction.skipped_device_store))
+        return remember_failure(incomplete("supported load/store retirement lacks its matching memory event"));
+      if (opcode != 0x03 && opcode != 0x23 && !floating_load && !floating_store && !instruction.memory.empty())
+        return remember_failure(invalid("non-load/store opcode carries a memory effect"));
+      if (opcode == 0x0f && ((instruction.instruction >> 12) & 7) == 2)
+        return remember_failure(unsupported("cache-block operation is not modeled by this consumer"));
+    }
   }
 
   std::vector<RetiredLoad> actual_loads;
   std::set<LoadKey> selected_loads;
   std::set<OperationId> selected_stores;
+  std::set<OperationId> selected_atomics;
   for (auto &operation : instruction.memory) {
-    if (operation.atomic || operation.lr || operation.sc)
-      return remember_failure(unsupported("atomic retirement requires the atomic lifecycle checker"));
-    if (operation.load && operation.store)
-      return remember_failure(unsupported("split read/write effects are not represented by this consumer"));
     if (!same_parent(operation.id, id))
       return remember_failure(invalid("retired memory operation has a different instruction identity"));
     if (operation.id.subaccess != 0)
       return remember_failure(unsupported("split or vector retirement is not covered by this consumer"));
+    if (operation.atomic || operation.lr || operation.sc) {
+      auto found = atomics_.find(operation.id);
+      if (found == atomics_.end())
+        return remember_failure(incomplete("atomic retirement awaits its completed lifecycle"));
+      const auto &record = found->second;
+      if (operation.attempt != record.attempt || operation.address != record.address ||
+          operation.byte_mask != atomic_mask_bytes(record.mask))
+        return remember_failure(invalid("atomic retirement address, mask or attempt differs from its lifecycle"));
+      if (operation.atomic) {
+        if (!record.rmw || !record.success || !record.read_seen || !record.write_seen ||
+            !operation.load || !operation.store)
+          return remember_failure(invalid("AMO retirement lacks its indivisible read/write lifecycle"));
+        const bool aq = (instruction.instruction & (1U << 26)) != 0;
+        const bool rl = (instruction.instruction & (1U << 25)) != 0;
+        if (operation.acquire != aq || operation.release != rl || operation.rcsc != (aq || rl))
+          return remember_failure(invalid("AMO aq/rl annotations differ from the retired instruction"));
+        const auto read = loads_.find({operation.id, operation.attempt});
+        const auto write = stores_.find(operation.id);
+        if (read == loads_.end() || write == stores_.end() ||
+            !read->second.operation.read_time.valid || !write->second.operation.write_time.valid ||
+            read->second.operation.read_time.rank != write->second.operation.write_time.rank)
+          return remember_failure(incomplete("AMO read and write lack one indivisible GMO rank"));
+      } else if (operation.lr) {
+        if (!record.lr || !record.success || !record.read_seen || !operation.load || operation.store)
+          return remember_failure(invalid("LR retirement lacks its read lifecycle"));
+      } else {
+        if (!record.sc)
+          return remember_failure(invalid("SC retirement has no SC lifecycle"));
+        if (instruction.failed_sc) {
+          if (record.success || record.write_seen || operation.load || operation.store)
+            return remember_failure(invalid("failed SC retirement carries a memory effect or success"));
+        } else if (!record.success || !record.write_seen || !operation.store || operation.load) {
+          return remember_failure(invalid("successful SC retirement lacks its write lifecycle"));
+        }
+      }
+      if (!selected_atomics.insert(operation.id).second)
+        return remember_failure(invalid("duplicate atomic retirement"));
+    } else if (operation.load && operation.store) {
+      return remember_failure(unsupported("split read/write effects are not represented by this consumer"));
+    }
     operation.read_time = {};
     operation.write_time = {};
     operation.source_kind = ReadSourceKind::ModeledWitness;
@@ -565,6 +840,16 @@ CheckResult CheckerEventConsumer::consume_retire(const InstructionRetireEvent &e
     if (same_parent(sample.first.first, id) && !selected_loads.count(sample.first))
       return remember_failure(invalid("retirement left an uncancelled load attempt unselected"));
 
+  // A failed SC has no read or write effect. Its only semantic content is the
+  // failed_sc status consumed by Checker::drain; do not present the empty SC
+  // operation as a successful SC to the checker's per-operation LR/SC binding.
+  if (instruction.failed_sc)
+    instruction.memory.erase(std::remove_if(instruction.memory.begin(), instruction.memory.end(),
+                                            [](const MemoryOperation &operation) {
+                                              return operation.sc && !operation.load && !operation.store;
+                                            }),
+                             instruction.memory.end());
+
   auto progress = checker_.poll();
   if (!progress && progress.status != CheckStatus::Pending)
     return remember_failure(progress);
@@ -587,6 +872,8 @@ CheckResult CheckerEventConsumer::consume_retire(const InstructionRetireEvent &e
         stores_.erase(store);
     }
   }
+  for (const auto &atomic_id : selected_atomics)
+    atomics_.erase(atomic_id);
   for (auto cancelled = cancelled_loads_.begin(); cancelled != cancelled_loads_.end();) {
     if (same_parent(cancelled->first, id))
       cancelled = cancelled_loads_.erase(cancelled);
@@ -631,7 +918,7 @@ CheckResult CheckerEventConsumer::consume_closed(const RuntimeEvent &event, bool
   case RuntimeEventKind::InstructionRetire:
     return consume_retire(std::get<InstructionRetireEvent>(event.payload));
   case RuntimeEventKind::AtomicLifecycle:
-    return remember_failure(unsupported("generic atomic lifecycle is not integrated with the semantic consumer"));
+    return consume_atomic(event, std::get<AtomicLifecycleEvent>(event.payload));
   case RuntimeEventKind::HartDone:
   case RuntimeEventKind::Trap:
     return remember_failure(unsupported("hart completion and trap events are not semantic memory events"));

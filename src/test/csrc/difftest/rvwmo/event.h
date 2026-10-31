@@ -154,7 +154,9 @@ enum class AtomicObservationPhase : uint8_t {
   Replay = 5,
   Response = 6,
   Finish = 7,
-  Cancel = 8
+  Cancel = 8,
+  // One certified physical RMW point; data=old and new_data=written word.
+  RmwEffect = 9
 };
 
 struct InstructionAllocateEvent {
@@ -224,6 +226,8 @@ struct AtomicLifecycleEvent {
   uint8_t fuop = 0;
   bool success = false;
   bool error = false;
+  uint64_t new_data = 0; // Used only by indivisible RmwEffect.
+  bool exclusive_write_witness = false; // Only from the physical exclusive cache data-array write.
 };
 
 struct ActualLoadValue {
