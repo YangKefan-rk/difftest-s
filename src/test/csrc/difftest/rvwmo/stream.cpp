@@ -32,6 +32,8 @@ std::optional<uint32_t> memory_hart(const RuntimeEvent &event) {
   }
   case RuntimeEventKind::AtomicLifecycle:
     return std::get<AtomicLifecycleEvent>(event.payload).id.hart;
+  case RuntimeEventKind::AtomicCommitCandidate:
+    return std::get<AtomicCommitCandidateEvent>(event.payload).id.hart;
   default:
     return std::nullopt;
   }
@@ -298,6 +300,8 @@ bool ObservationStream::payload_matches_kind(const RuntimeEvent &event) {
   case RuntimeEventKind::HartDone: return std::holds_alternative<HartDoneEvent>(event.payload);
   case RuntimeEventKind::Trap: return std::holds_alternative<TrapEvent>(event.payload);
   case RuntimeEventKind::InstructionSquash: return std::holds_alternative<InstructionSquashEvent>(event.payload);
+  case RuntimeEventKind::AtomicCommitCandidate:
+    return std::holds_alternative<AtomicCommitCandidateEvent>(event.payload);
   }
   return false;
 }
@@ -340,6 +344,17 @@ bool ObservationStream::payload_has_valid_shape(const RuntimeEvent &event) {
     const auto &p = std::get<AtomicLifecycleEvent>(event.payload);
     return p.id.uid && ((p.phase != AtomicObservationPhase::ReadEffect &&
                          p.phase != AtomicObservationPhase::WriteEffect) || p.mask != 0);
+  }
+  case RuntimeEventKind::AtomicCommitCandidate: {
+    const auto &p = std::get<AtomicCommitCandidateEvent>(event.payload);
+    const auto &drain = p.physical_drain;
+    return p.id.uid && p.id.subaccess == 0 && p.request_id && (p.address & 7) == 0 &&
+           (p.byte_mask == 0x0f || p.byte_mask == 0xf0 || p.byte_mask == 0xff) &&
+           p.sampled_read.producer_sequence && p.computed_write.producer_sequence &&
+           drain.producer_sequence == event.source.producer_sequence &&
+           drain.cycle == event.source.cycle && drain.qualified_phase == event.source.qualified_phase &&
+           drain.order_qualified == event.source.order_qualified &&
+           p.sampled_read.cycle <= p.computed_write.cycle && p.computed_write.cycle <= drain.cycle;
   }
   case RuntimeEventKind::InstructionRetire: {
     const auto &p = std::get<InstructionRetireEvent>(event.payload);
@@ -395,6 +410,14 @@ std::optional<ObservationStream::MemoryEffect> ObservationStream::memory_effect(
     effect.write = atomic.phase == AtomicObservationPhase::WriteEffect;
     for (unsigned byte = 0; byte < 8; ++byte)
       effect.byte_mask.push_back((atomic.mask >> byte) & 1);
+    return effect;
+  }
+  case RuntimeEventKind::AtomicCommitCandidate: {
+    const auto &candidate = std::get<AtomicCommitCandidateEvent>(event.payload);
+    effect.address = candidate.address;
+    effect.write = true; // Reject unordered overlapping reads *and* writes before semantic consumption.
+    for (unsigned byte = 0; byte < 8; ++byte)
+      effect.byte_mask.push_back((candidate.byte_mask >> byte) & 1);
     return effect;
   }
   default: return std::nullopt;

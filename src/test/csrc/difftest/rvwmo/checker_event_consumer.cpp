@@ -907,6 +907,27 @@ CheckResult CheckerEventConsumer::consume_closed(const RuntimeEvent &event, bool
     return consume_retire(std::get<InstructionRetireEvent>(event.payload));
   case RuntimeEventKind::AtomicLifecycle:
     return consume_atomic(event, std::get<AtomicLifecycleEvent>(event.payload));
+  case RuntimeEventKind::AtomicCommitCandidate: {
+    // This is source evidence, not permission to publish or advance PPO/REF.
+    const auto &candidate = std::get<AtomicCommitCandidateEvent>(event.payload);
+    const auto parent = instruction_id(candidate.id);
+    const auto allocation = allocations_.find(parent);
+    if (allocation == allocations_.end())
+      return remember_failure(incomplete("atomic candidate has no allocated instruction"));
+    if ((allocation->second.instruction & 0x7f) != 0x2f)
+      return remember_failure(invalid("atomic candidate belongs to a non-atomic instruction"));
+    if (!source_prefix_closed)
+      return remember_failure(incomplete("atomic candidate lacks a closed producer source prefix"));
+    for (unsigned byte = 0; byte < 8; ++byte) {
+      if (!(candidate.byte_mask & (1U << byte)))
+        continue;
+      if (((candidate.computed_new >> (byte * 8)) & 0xff) !=
+          ((candidate.drained_new >> (byte * 8)) & 0xff))
+        return remember_failure({CheckStatus::Violation, 0,
+                                 "physical AMO byte differs from its source-computed value"});
+    }
+    return remember_failure(incomplete("atomic candidate lacks independent REF and global-order certificate"));
+  }
   case RuntimeEventKind::HartDone:
   case RuntimeEventKind::Trap:
     return remember_failure(unsupported("hart completion and trap events are not semantic memory events"));

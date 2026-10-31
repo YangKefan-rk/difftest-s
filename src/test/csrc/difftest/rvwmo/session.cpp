@@ -22,6 +22,9 @@ bool is_memory_event_kind(const RuntimeEvent &event) {
     const auto phase = std::get<AtomicLifecycleEvent>(event.payload).phase;
     return phase == AtomicObservationPhase::ReadEffect || phase == AtomicObservationPhase::WriteEffect;
   }
+  case RuntimeEventKind::AtomicCommitCandidate:
+    // A source candidate gets no GMO rank while independent proof is unavailable.
+    return false;
   default:
     return false;
   }

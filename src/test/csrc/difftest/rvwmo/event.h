@@ -226,6 +226,23 @@ struct AtomicLifecycleEvent {
   bool error = false;
 };
 
+// Source facts for a *candidate* atomic commit. This typed transport is not
+// itself an atomic-order certificate. In particular, S2 computed_new is not
+// GlobalMem publication, and observed_old cannot become a REF oracle.
+struct AtomicCommitCandidateEvent {
+  OperationId id;
+  uint32_t attempt = 0;
+  uint64_t request_id = 0;
+  uint64_t address = 0;  // Canonical aligned RV64 data word.
+  uint8_t byte_mask = 0; // 0x0f, 0xf0 or 0xff only.
+  uint64_t observed_old = 0;
+  uint64_t computed_new = 0;
+  uint64_t drained_new = 0;
+  SourcePosition sampled_read;
+  SourcePosition computed_write;
+  SourcePosition physical_drain;
+};
+
 struct ActualLoadValue {
   OperationId id;
   uint32_t attempt = 0;
@@ -261,12 +278,14 @@ enum class RuntimeEventKind : uint8_t {
   InstructionRetire,
   HartDone,
   Trap,
-  InstructionSquash
+  InstructionSquash,
+  AtomicCommitCandidate
 };
 
 using RuntimeEventPayload = std::variant<InstructionAllocateEvent, InstructionCancelAttemptEvent, LocalStoreEvent,
                                          LoadSampleEvent, StorePublishEvent, AtomicLifecycleEvent,
-                                         InstructionRetireEvent, HartDoneEvent, TrapEvent, InstructionSquashEvent>;
+                                         InstructionRetireEvent, HartDoneEvent, TrapEvent, InstructionSquashEvent,
+                                         AtomicCommitCandidateEvent>;
 
 struct RuntimeEvent {
   uint32_t producer_id = 0;
