@@ -60,6 +60,8 @@ std::vector<uint32_t> event_harts(const RuntimeEvent &event) {
   }
   case RuntimeEventKind::AtomicLifecycle:
     return {std::get<AtomicLifecycleEvent>(event.payload).id.hart};
+  case RuntimeEventKind::AtomicCommitCandidate:
+    return {std::get<AtomicCommitCandidateEvent>(event.payload).id.hart};
   case RuntimeEventKind::HartDone:
     return {std::get<HartDoneEvent>(event.payload).hart};
   case RuntimeEventKind::Trap:
@@ -140,12 +142,16 @@ CheckResult HostSession::validate_batch(const EventBatch &batch) const {
       return invalid("host event kind differs from its typed payload");
     if (drained_producers_.count(event.producer_id))
       return invalid("event arrived after its source was declared drained");
+    const bool fabric_effect = event.kind == RuntimeEventKind::StorePublish ||
+                               event.kind == RuntimeEventKind::AtomicCommitCandidate;
     if (event.kind == RuntimeEventKind::StorePublish && event.producer_id < kMemoryFabricProducerBase)
       return invalid("store publication is not on a registered fabric source channel");
+    if (event.kind == RuntimeEventKind::AtomicCommitCandidate && event.producer_id < kMemoryFabricProducerBase)
+      return invalid("atomic candidate is not on a registered fabric source channel");
     for (const uint32_t hart : event_harts(event)) {
       if (!registered_hart(hart))
         return invalid("host event names a hart outside the fixed reference roster");
-      if (event.kind != RuntimeEventKind::StorePublish && event.producer_id != hart_producer_id(hart))
+      if (!fabric_effect && event.producer_id != hart_producer_id(hart))
         return invalid("hart event is not on its registered private source channel");
       const auto done = completed_harts_.find(hart);
       const bool architectural = event.kind == RuntimeEventKind::InstructionAllocate ||

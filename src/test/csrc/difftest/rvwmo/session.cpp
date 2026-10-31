@@ -20,8 +20,13 @@ bool is_memory_event_kind(const RuntimeEvent &event) {
     return true;
   case RuntimeEventKind::AtomicLifecycle: {
     const auto phase = std::get<AtomicLifecycleEvent>(event.payload).phase;
-    return phase == AtomicObservationPhase::ReadEffect || phase == AtomicObservationPhase::WriteEffect;
+    const auto &atomic = std::get<AtomicLifecycleEvent>(event.payload);
+    const bool lr = atomic.fuop == 2 || atomic.fuop == 3;
+    return phase == AtomicObservationPhase::WriteEffect ||
+           (phase == AtomicObservationPhase::ReadEffect && lr);
   }
+  case RuntimeEventKind::AtomicCommitCandidate:
+    return true;
   default:
     return false;
   }
@@ -40,14 +45,21 @@ bool ordinary_scalar_load(const RuntimeEvent &event) {
 struct ScalarEffect {
   OperationId id;
   uint64_t address = 0;
-  const std::vector<uint8_t> *mask = nullptr;
+  std::vector<uint8_t> mask;
   bool write = false;
 };
 
 std::optional<ScalarEffect> scalar_effect(const RuntimeEvent &event) {
   if (ordinary_scalar_load(event)) {
     const auto &operation = std::get<LoadSampleEvent>(event.payload).operation;
-    return ScalarEffect{operation.id, operation.address, &operation.byte_mask, false};
+    return ScalarEffect{operation.id, operation.address, operation.byte_mask, false};
+  }
+  if (event.kind == RuntimeEventKind::AtomicCommitCandidate) {
+    const auto &candidate = std::get<AtomicCommitCandidateEvent>(event.payload);
+    std::vector<uint8_t> mask(8);
+    for (unsigned byte = 0; byte < 8; ++byte)
+      mask[byte] = (candidate.byte_mask >> byte) & 1;
+    return ScalarEffect{candidate.id, candidate.address, std::move(mask), true};
   }
   if (event.kind != RuntimeEventKind::StorePublish)
     return std::nullopt;
@@ -62,7 +74,7 @@ std::optional<ScalarEffect> scalar_effect(const RuntimeEvent &event) {
   for (size_t byte = 0; byte < width; ++byte)
     if (publish.byte_mask[byte] && publish.byte_writers[byte] != publish.members.front().id)
       return std::nullopt;
-  return ScalarEffect{publish.members.front().id, publish.address, &publish.byte_mask, true};
+  return ScalarEffect{publish.members.front().id, publish.address, publish.byte_mask, true};
 }
 
 CheckResult certify_independent_effects(const std::vector<RuntimeEvent> &events, const std::vector<size_t> &indices) {
@@ -74,13 +86,13 @@ CheckResult certify_independent_effects(const std::vector<RuntimeEvent> &events,
     const auto &event = events[index];
     const auto effect = scalar_effect(event);
     if (!effect)
-      return incomplete("unordered independent group requires ordinary scalar loads or single-store publications");
+      return incomplete("unordered independent group requires scalar loads, single-store publications or one-point AMOs");
     if (!harts.insert(effect->id.hart).second || !producers.insert(event.producer_id).second)
       return incomplete("unordered independent group requires one effect per hart and producer");
-    if (effect->mask->size() - 1 > std::numeric_limits<uint64_t>::max() - effect->address)
+    if (effect->mask.size() - 1 > std::numeric_limits<uint64_t>::max() - effect->address)
       return invalid("independent memory effect has an overflowing byte range");
-    for (size_t byte = 0; byte < effect->mask->size(); ++byte) {
-      if (!(*effect->mask)[byte])
+    for (size_t byte = 0; byte < effect->mask.size(); ++byte) {
+      if (!effect->mask[byte])
         continue;
       auto &prior = bytes[effect->address + byte];
       if (prior.write || (effect->write && prior.read))

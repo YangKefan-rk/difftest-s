@@ -117,6 +117,11 @@ std::string Memory::commit_global(uint64_t address, const std::vector<uint8_t> &
       const auto &sample = sample_entry.second;
       if (!sample.source_prefix_closed || entry.second > sample.time)
         continue;
+      // One AMO reads the old bytes and installs its own new bytes at the
+      // same point. All other late writes still violate the closed prefix.
+      if (entry.second == sample.time && sample.atomic_writer &&
+          *sample.atomic_writer == entry.first && members.size() == 1)
+        continue;
       for (size_t byte = 0; byte < store.mask.size(); ++byte) {
         const uint64_t at = store.address + byte;
         if (store.mask[byte] && at >= sample.address && at - sample.address < sample.mask.size() &&
@@ -223,7 +228,8 @@ std::string Memory::commit_global(uint64_t address, const std::vector<uint8_t> &
 
 std::string Memory::sample(uint32_t hart, uint64_t po, uint64_t time, uint64_t address,
                            const std::vector<uint8_t> &mask, const std::vector<std::optional<MemoryWriter>> &forwarded,
-                           MemorySnapshot &snapshot, bool source_prefix_closed) {
+                           MemorySnapshot &snapshot, bool source_prefix_closed,
+                           std::optional<MemoryWriter> atomic_writer) {
   auto error = check_range(address, mask.size());
   if (!error.empty())
     return error;
@@ -233,6 +239,8 @@ std::string Memory::sample(uint32_t hart, uint64_t po, uint64_t time, uint64_t a
     if (writer && (writer->hart != hart || writer->uid == 0))
       return "invalid local forwarding identity";
   }
+  if (atomic_writer && (atomic_writer->hart != hart || !atomic_writer->uid))
+    return "atomic snapshot has an invalid own-writer identity";
   if (next_snapshot_ == 0)
     return "snapshot identity exhausted";
   snapshot = MemorySnapshot{next_snapshot_++, hart, po, time, address, mask, {}};
@@ -243,6 +251,7 @@ std::string Memory::sample(uint32_t hart, uint64_t po, uint64_t time, uint64_t a
   record.address = address;
   record.time = time;
   record.source_prefix_closed = source_prefix_closed;
+  record.atomic_writer = atomic_writer;
   record.latest_local_po.resize(mask.size());
   record.mask = mask;
   record.global_bytes.resize(mask.size());

@@ -11,6 +11,34 @@ CheckResult incomplete(const std::string &message) { return {CheckStatus::Incomp
 CheckResult invalid(const std::string &message) { return {CheckStatus::Invalid, 0, message}; }
 CheckResult violation(const std::string &message) { return {CheckStatus::Violation, 0, message}; }
 CheckResult unsupported(const std::string &message) { return {CheckStatus::Unsupported, 0, message}; }
+
+CheckResult operand_range(const MemoryOperation &operation, size_t &offset, size_t &width) {
+  offset = 0;
+  width = operation.byte_mask.size();
+  if (operation.lr || operation.sc)
+    return unsupported("Spike generic stepper requires a separate LR/SC reference contract");
+  if (!operation.atomic) {
+    if (width == 0 || width > sizeof(uint64_t) ||
+        std::any_of(operation.byte_mask.begin(), operation.byte_mask.end(), [](uint8_t byte) { return byte != 1; }))
+      return unsupported("Spike stepper requires a contiguous scalar operand");
+    return {};
+  }
+  if (!operation.load || !operation.store || (operation.address & 7) || width != 8)
+    return unsupported("Spike AMO reference requires one aligned W/D read-modify-write");
+  uint8_t mask = 0;
+  for (size_t byte = 0; byte < width; ++byte) {
+    if (operation.byte_mask[byte] > 1)
+      return invalid("AMO byte mask contains a value other than zero or one");
+    mask |= operation.byte_mask[byte] << byte;
+  }
+  if (mask == 0xff)
+    return {};
+  if (mask != 0x0f && mask != 0xf0)
+    return unsupported("Spike AMO reference requires low/high word or doubleword mask");
+  offset = mask == 0xf0 ? 4 : 0;
+  width = 4;
+  return {};
+}
 } // namespace
 
 SpikeReferenceStepper::SpikeReferenceStepper(std::vector<void *> hart_handles, uint32_t expected_profile_id)
@@ -134,18 +162,20 @@ CheckResult SpikeReferenceStepper::collect_loads(const InstructionRetireEvent &r
   for (const auto &operation : retirement.instruction.memory) {
     if (!operation.load)
       continue;
-    if (operation.store || operation.atomic || operation.lr || operation.sc)
-      return unsupported("Spike stepper only accepts ordinary scalar loads in the generic session");
+    if (operation.store && !operation.atomic)
+      return unsupported("Spike stepper requires an ordinary load or an AMO read");
     auto modeled = std::find_if(modeled_loads.begin(), modeled_loads.end(), [&](const auto &load) {
       return load.id == operation.id && load.attempt == operation.attempt;
     });
     if (modeled == modeled_loads.end() || modeled->expected_bytes.size() != operation.byte_mask.size())
       return incomplete("retired load has no exact modeled byte value");
-    if (std::any_of(operation.byte_mask.begin(), operation.byte_mask.end(), [](uint8_t byte) { return byte > 1; }))
-      return invalid("load byte mask contains a value other than zero or one");
-    if (std::find(operation.byte_mask.begin(), operation.byte_mask.end(), uint8_t{0}) != operation.byte_mask.end())
-      return unsupported("Spike stepper does not accept split or sparse scalar load masks");
-    requests.push_back({operation.id, operation.attempt, operation.address, modeled->expected_bytes});
+    size_t offset = 0, width = 0;
+    auto checked = operand_range(operation, offset, width);
+    if (!checked)
+      return checked;
+    const auto first = modeled->expected_bytes.begin() + offset;
+    requests.push_back({operation.id, operation.attempt, operation.address + offset,
+                       std::vector<uint8_t>(first, first + width)});
   }
   if (requests.size() != modeled_loads.size())
     return invalid("modeled load list contains an operation absent from the retirement");
@@ -154,14 +184,19 @@ CheckResult SpikeReferenceStepper::collect_loads(const InstructionRetireEvent &r
 
 CheckResult SpikeReferenceStepper::collect_store(void *handle, const MemoryOperation &operation,
                                                  ReferenceStoreValue &store) {
-  if (!operation.store || operation.atomic || operation.lr || operation.sc || operation.byte_mask.empty() ||
-      operation.byte_mask.size() > sizeof(uint64_t))
-    return unsupported("Spike stepper only accepts one ordinary scalar store of at most eight bytes");
+  if (!operation.store)
+    return unsupported("Spike stepper requires a store effect");
+  size_t operand_offset = 0, operand_width = 0;
+  auto operand = operand_range(operation, operand_offset, operand_width);
+  if (!operand)
+    return operand;
 
   uint64_t trace_address = 0;
   uint64_t trace_data = 0;
   uint8_t trace_mask = 0;
-  if (difftest_ref_take_store_trace(handle, &trace_address, &trace_data, &trace_mask) != 0)
+  const auto take_trace = operation.atomic ? difftest_ref_take_atomic_store_trace_v1
+                                           : difftest_ref_take_store_trace;
+  if (take_trace(handle, &trace_address, &trace_data, &trace_mask) != 0)
     return incomplete("Spike produced no reference store trace for the retired store");
   if (operation.address < trace_address || operation.address - trace_address >= sizeof(uint64_t))
     return violation("Spike store trace address does not cover the retired store");
@@ -185,7 +220,7 @@ CheckResult SpikeReferenceStepper::collect_store(void *handle, const MemoryOpera
   for (size_t byte = 0; byte < operation.byte_mask.size(); ++byte)
     store.bytes[byte] = static_cast<uint8_t>(trace_data >> ((offset + byte) * 8));
 
-  if (difftest_ref_take_store_trace(handle, &trace_address, &trace_data, &trace_mask) == 0)
+  if (take_trace(handle, &trace_address, &trace_data, &trace_mask) == 0)
     return unsupported("Spike store instruction generated more than one store trace");
   return {};
 }
@@ -219,10 +254,16 @@ ReferenceStepResult SpikeReferenceStepper::step(const InstructionRetireEvent &re
     return result;
   }
   for (const auto &operation : retirement.instruction.memory) {
-    if (operation.atomic || operation.lr || operation.sc) {
-      result.check = unsupported("Spike reference stepper does not yet map atomic lifecycle events");
+    if (!operation.atomic && !operation.lr && !operation.sc)
+      continue;
+    if (operation.atomic && !(state.profile.capabilities & DIFFTEST_REF_CAP_ATOMIC_STORE_TRACE_V1)) {
+      result.check = unsupported("Spike profile lacks independent atomic store trace support");
       return result;
     }
+    size_t offset = 0, width = 0;
+    result.check = operand_range(operation, offset, width);
+    if (!result.check)
+      return result;
   }
 
   FloatingPointInstruction floating;
@@ -265,12 +306,16 @@ ReferenceStepResult SpikeReferenceStepper::step(const InstructionRetireEvent &re
     return result;
   }
 
-  size_t stores = 0;
+  size_t stores = 0, atomic_stores = 0;
   for (const auto &operation : retirement.instruction.memory) {
-    if (operation.store)
+    if (!operation.store)
+      continue;
+    if (operation.atomic)
+      ++atomic_stores;
+    else
       ++stores;
   }
-  if (stores > 1) {
+  if (stores + atomic_stores > 1) {
     result.check = unsupported("generic Spike reference step supports at most one store per instruction");
     return result;
   }
@@ -280,7 +325,14 @@ ReferenceStepResult SpikeReferenceStepper::step(const InstructionRetireEvent &re
     result.check = incomplete("Spike could not report pending reference store traces");
     return result;
   }
-  if (pending_stores != 0) {
+  uint64_t pending_atomics = 0;
+  const bool atomic_trace_capability = state.profile.capabilities & DIFFTEST_REF_CAP_ATOMIC_STORE_TRACE_V1;
+  if (atomic_trace_capability &&
+      difftest_ref_pending_atomic_store_traces_v1(state.handle, &pending_atomics) != DIFFTEST_REF_API_OK) {
+    result.check = incomplete("Spike could not report pending atomic store traces");
+    return result;
+  }
+  if (pending_stores != 0 || pending_atomics != 0) {
     state.poisoned = true;
     state.failure = incomplete("Spike reference has an unassociated store trace before this retirement");
     result.check = state.failure;
@@ -342,8 +394,11 @@ ReferenceStepResult SpikeReferenceStepper::step(const InstructionRetireEvent &re
   if (difftest_ref_pending_store_traces_v1(state.handle, &pending_stores) != DIFFTEST_REF_API_OK) {
     return fail_after_step(incomplete("Spike could not report post-step reference store traces"));
   }
-  if (pending_stores != stores) {
-    return fail_after_step(violation("Spike store trace count differs from the retired instruction memory effects"));
+  if (atomic_trace_capability &&
+      difftest_ref_pending_atomic_store_traces_v1(state.handle, &pending_atomics) != DIFFTEST_REF_API_OK)
+    return fail_after_step(incomplete("Spike could not report post-step atomic store traces"));
+  if (pending_stores != stores || pending_atomics != atomic_stores) {
+    return fail_after_step(violation("Spike ordinary/atomic store trace counts differ from retired memory effects"));
   }
   for (const auto &operation : retirement.instruction.memory) {
     if (!operation.store)

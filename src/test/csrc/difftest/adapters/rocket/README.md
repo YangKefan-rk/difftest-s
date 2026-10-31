@@ -43,7 +43,11 @@ The matching Rocket branch enables its optional outputs using the default-false
 Only blocking DCache currently provides native observations. Other cache
 implementations expose `available=false`; scratchpad observation is rejected.
 The ordinary cached scalar profile must not silently accept unavailable probes,
-uncached/MMIO/implicit accesses, merged stores, AMO/LRSC, vector, or split accesses.
+uncached/MMIO/implicit accesses, vector, or split accesses. AMO/LR/SC are
+accepted only through the native `NativeAdapter::atomic` ingress and the shared
+`CheckerEventConsumer`; the matching Rocket RTL branch must expose the actual
+read/write/cancel lifecycle points, and the default branch still rejects them
+until those observations are enabled.
 
 Collect observations on the modules' actual clock edges. A clock-gated module's
 held valid signal is not a new event on every ungated host clock. The shared

@@ -66,7 +66,8 @@ public:
                             const std::vector<uint64_t> &completion_times = {});
   std::string sample(uint32_t hart, uint64_t po, uint64_t time, uint64_t address, const std::vector<uint8_t> &mask,
                      const std::vector<std::optional<MemoryWriter>> &forwarded, MemorySnapshot &snapshot,
-                     bool source_prefix_closed = false);
+                     bool source_prefix_closed = false,
+                     std::optional<MemoryWriter> atomic_writer = std::nullopt);
   std::string resolve(MemorySnapshot &snapshot) const;
   // Derives a specification witness independently of observed forwarding tags.
   // A complete ordered source prefix may certify a pending local writer after
@@ -116,6 +117,8 @@ private:
     // Only a consumer which has delivered every preceding memory effect may
     // certify this. An absent publication is then an ordering lower bound.
     bool source_prefix_closed = false;
+    // This operation alone may write at the old-value snapshot's same rank.
+    std::optional<MemoryWriter> atomic_writer;
     std::set<MemoryWriter> unpublished_after_sample;
   };
   ReadGlobal read_;

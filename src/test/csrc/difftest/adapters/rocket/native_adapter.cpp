@@ -143,6 +143,48 @@ CaptureResult NativeAdapter::sample_load(const CacheLoadResult &load) {
   return finish_input(std::move(result));
 }
 
+CaptureResult NativeAdapter::atomic(const rvwmo::AtomicLifecycleEvent &record,
+                                        const rvwmo::SourcePosition &source) {
+  if (!failure_)
+    return {failure_, false};
+  auto token = tokens_by_uid_.find(record.id.uid);
+  if (token == tokens_by_uid_.end())
+    return {remember(invalid("Rocket atomic lifecycle has no live instruction")), false};
+  auto instruction = instructions_.find(token->second);
+  if (instruction == instructions_.end() || instruction->second.semantic_retire_done)
+    return {remember(invalid("Rocket atomic lifecycle has no live instruction")), false};
+  auto result = emitter_.atomic(token->second, record, source);
+  if (!result)
+    return finish_input(std::move(result));
+  if (record.phase == AtomicObservationPhase::WriteEffect &&
+      record.fuop != 2 && record.fuop != 3 && record.fuop != 6 && record.fuop != 7)
+    instruction->second.publication_done = true;
+  return finish_input({});
+}
+
+CaptureResult NativeAdapter::atomic_candidate(uint64_t token, const AtomicCommitCandidateEvent &candidate,
+                                                const SourcePosition &source) {
+  if (!failure_)
+    return {failure_, false};
+  auto instruction = instructions_.find(token);
+  if (instruction == instructions_.end() || !instruction->second.request ||
+      instruction->second.semantic_retire_done || instruction->second.publication_done ||
+      instruction->second.id != candidate.id || *instruction->second.request != candidate.request_id ||
+      instruction->second.next_attempt != candidate.attempt)
+    return {remember(invalid("Rocket AMO candidate has no matching live final cache attempt")), false};
+  auto request = requests_.find(candidate.request_id);
+  if (request == requests_.end() || request->second.core.token != token ||
+      request->second.core.attempt != candidate.attempt || request->second.publication ||
+      request->second.publication_group)
+    return {remember(invalid("Rocket AMO candidate changed its final request identity")), false};
+  auto result = emitter_.atomic_candidate(token, candidate, source);
+  if (!result)
+    return finish_input(std::move(result));
+  request->second.store_accepted = true;
+  instruction->second.publication_done = true;
+  return finish_input({});
+}
+
 CaptureResult NativeAdapter::accept_store(const CacheStoreValue &store) {
   if (!failure_)
     return {failure_, false};
@@ -276,6 +318,10 @@ CheckResult NativeAdapter::flush_retirements() {
     const auto token = *pending_retirements_.begin();
     auto &instruction = instructions_.at(token);
     const auto &fact = *instruction.retirement;
+    const uint32_t raw = instruction.allocation.instruction;
+    const bool rmw = (raw & 0x7f) == 0x2f && (raw >> 27) != 2 && (raw >> 27) != 3;
+    if (rmw && !instruction.publication_done)
+      return pending("Rocket AMO retirement awaits its final physical-drain candidate");
     if (ordinary_store(instruction.allocation) && !instruction.local_store_done) {
       if (!instruction.request)
         return pending("Rocket native store retirement awaits its request and data");

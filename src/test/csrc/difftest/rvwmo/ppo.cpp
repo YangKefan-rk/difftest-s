@@ -297,6 +297,8 @@ CheckResult PpoChecker::retire_instruction(const RetiredInstruction &instruction
       hart.pending_uid = instruction.uid;
       return {CheckStatus::Pending, 0, "retired operation awaits its observation timestamp"};
     }
+    if (op.atomic && op.load && op.store && op.read_time.rank != op.write_time.rank)
+      return {CheckStatus::Invalid, 0, "AMO read and write occupy different global ranks"};
     if (op.store && !op.write_time.valid)
       ++deferred;
     if (op.byte_mask.empty() ||
