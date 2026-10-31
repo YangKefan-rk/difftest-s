@@ -35,6 +35,8 @@ private:
 // Output origins refer to register values at the start of the first segment.
 bool compose_dependencies(const DependencyMetadata &first, const DependencyMetadata &second,
                           DependencyMetadata &composed);
+// FENCE.TSO ignores reserved rd/rs1 fields; its FM/pred/succ are fixed.
+bool is_fence_tso_instruction(uint32_t instruction);
 CheckResult decode_dependencies(uint32_t instruction, DependencyMetadata &metadata);
 } // namespace rvwmo
 #endif

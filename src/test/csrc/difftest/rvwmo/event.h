@@ -77,6 +77,8 @@ struct DependencyMetadata {
   bool carries_to_destination = true;
   bool control_transfer = false;
   bool fence = false;
+  // FENCE.TSO omits the ordinary data-fence Store -> Load ordering edge.
+  bool fence_tso = false;
   uint8_t fence_predecessor = 0;
   uint8_t fence_successor = 0;
 };

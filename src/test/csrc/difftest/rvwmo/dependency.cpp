@@ -211,6 +211,10 @@ std::optional<FloatingTransfer> decode_floating_transfer(uint32_t instruction) {
   }
 }
 
+bool is_fence_tso_instruction(uint32_t instruction) {
+  return (instruction & 0xfff0707fU) == 0x8330000fU;
+}
+
 CheckResult decode_dependencies(uint32_t inst, DependencyMetadata &m) {
   m = {};
   m.provided = true;
@@ -340,8 +344,11 @@ CheckResult decode_dependencies(uint32_t inst, DependencyMetadata &m) {
         break;
       if (((inst >> 12) & 7) != 0)
         return {CheckStatus::Unsupported, 0, "non-data fence requires adapter metadata"};
-      if ((inst >> 28) != 0)
+      if (is_fence_tso_instruction(inst)) {
+        m.fence_tso = true;
+      } else if ((inst >> 28) != 0) {
         return {CheckStatus::Unsupported, 0, "non-base fence requires adapter metadata"};
+      }
       m.fence = true;
       m.fence_predecessor = (inst >> 24) & 15;
       m.fence_successor = (inst >> 20) & 15;
