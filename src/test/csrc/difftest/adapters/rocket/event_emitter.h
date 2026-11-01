@@ -66,6 +66,15 @@ public:
   explicit EventEmitter(EmitterConfiguration configuration);
   rvwmo::CheckResult begin(const InstructionObservation &instruction, rvwmo::OperationId &id);
   rvwmo::CheckResult sample_load(const LoadObservation &load);
+  // Canonical AMO/LR/SC lifecycle observation for an Atomic instruction. The
+  // stale read/write points are supplied by the Rocket RTL probes; the emitter
+  // only validates source order and stages the event.
+  rvwmo::CheckResult atomic(uint64_t token, const rvwmo::AtomicLifecycleEvent &record,
+                            const rvwmo::SourcePosition &source);
+  // Retain one physical-drain AMO witness until architectural retirement joins.
+  // This path emits no legacy separately ranked read/write lifecycle phases.
+  rvwmo::CheckResult atomic_candidate(uint64_t token, const rvwmo::AtomicCommitCandidateEvent &candidate,
+                                      const rvwmo::SourcePosition &source);
   rvwmo::CheckResult cancel_load(uint64_t token, uint32_t attempt);
   rvwmo::CheckResult commit_store(const StoreObservation &store);
   rvwmo::CheckResult publish_store(const StoreObservation &store, uint64_t transaction);
@@ -79,7 +88,7 @@ public:
   size_t live_instructions() const { return instructions_.size(); }
 
 private:
-  enum class MemoryKind { None, Load, Store, Unsupported };
+  enum class MemoryKind { None, Load, Store, Atomic, Unsupported };
   struct Instruction {
     rvwmo::OperationId id;
     InstructionObservation allocation;
@@ -87,6 +96,23 @@ private:
     uint32_t next_attempt = 0;
     std::optional<LoadObservation> load;
     std::optional<StoreObservation> store;
+    struct AtomicState {
+      bool begun = false;
+      bool request = false;
+      bool read = false;
+      bool write = false;
+      bool response = false;
+      bool success = false;
+      bool lr = false;
+      bool sc = false;
+      bool rmw = false;
+      bool has_old = false;
+      uint64_t address = 0;
+      uint8_t mask = 0;
+      uint32_t attempt = 0;
+      uint64_t old_data = 0;
+    } atomic;
+    std::optional<rvwmo::AtomicCommitCandidateEvent> atomic_candidate;
     bool retired = false;
   };
 

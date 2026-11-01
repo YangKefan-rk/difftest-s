@@ -1,4 +1,5 @@
 #include "session.h"
+#include "dependency.h"
 #include <algorithm>
 #include <limits>
 #include <map>
@@ -19,8 +20,13 @@ bool is_memory_event_kind(const RuntimeEvent &event) {
     return true;
   case RuntimeEventKind::AtomicLifecycle: {
     const auto phase = std::get<AtomicLifecycleEvent>(event.payload).phase;
-    return phase == AtomicObservationPhase::ReadEffect || phase == AtomicObservationPhase::WriteEffect;
+    const auto &atomic = std::get<AtomicLifecycleEvent>(event.payload);
+    const bool lr = atomic.fuop == 2 || atomic.fuop == 3;
+    return phase == AtomicObservationPhase::WriteEffect ||
+           (phase == AtomicObservationPhase::ReadEffect && lr);
   }
+  case RuntimeEventKind::AtomicCommitCandidate:
+    return true;
   default:
     return false;
   }
@@ -39,14 +45,21 @@ bool ordinary_scalar_load(const RuntimeEvent &event) {
 struct ScalarEffect {
   OperationId id;
   uint64_t address = 0;
-  const std::vector<uint8_t> *mask = nullptr;
+  std::vector<uint8_t> mask;
   bool write = false;
 };
 
 std::optional<ScalarEffect> scalar_effect(const RuntimeEvent &event) {
   if (ordinary_scalar_load(event)) {
     const auto &operation = std::get<LoadSampleEvent>(event.payload).operation;
-    return ScalarEffect{operation.id, operation.address, &operation.byte_mask, false};
+    return ScalarEffect{operation.id, operation.address, operation.byte_mask, false};
+  }
+  if (event.kind == RuntimeEventKind::AtomicCommitCandidate) {
+    const auto &candidate = std::get<AtomicCommitCandidateEvent>(event.payload);
+    std::vector<uint8_t> mask(8);
+    for (unsigned byte = 0; byte < 8; ++byte)
+      mask[byte] = (candidate.byte_mask >> byte) & 1;
+    return ScalarEffect{candidate.id, candidate.address, std::move(mask), true};
   }
   if (event.kind != RuntimeEventKind::StorePublish)
     return std::nullopt;
@@ -61,7 +74,7 @@ std::optional<ScalarEffect> scalar_effect(const RuntimeEvent &event) {
   for (size_t byte = 0; byte < width; ++byte)
     if (publish.byte_mask[byte] && publish.byte_writers[byte] != publish.members.front().id)
       return std::nullopt;
-  return ScalarEffect{publish.members.front().id, publish.address, &publish.byte_mask, true};
+  return ScalarEffect{publish.members.front().id, publish.address, publish.byte_mask, true};
 }
 
 CheckResult certify_independent_effects(const std::vector<RuntimeEvent> &events, const std::vector<size_t> &indices) {
@@ -73,13 +86,13 @@ CheckResult certify_independent_effects(const std::vector<RuntimeEvent> &events,
     const auto &event = events[index];
     const auto effect = scalar_effect(event);
     if (!effect)
-      return incomplete("unordered independent group requires ordinary scalar loads or single-store publications");
+      return incomplete("unordered independent group requires scalar loads, single-store publications or one-point AMOs");
     if (!harts.insert(effect->id.hart).second || !producers.insert(event.producer_id).second)
       return incomplete("unordered independent group requires one effect per hart and producer");
-    if (effect->mask->size() - 1 > std::numeric_limits<uint64_t>::max() - effect->address)
+    if (effect->mask.size() - 1 > std::numeric_limits<uint64_t>::max() - effect->address)
       return invalid("independent memory effect has an overflowing byte range");
-    for (size_t byte = 0; byte < effect->mask->size(); ++byte) {
-      if (!(*effect->mask)[byte])
+    for (size_t byte = 0; byte < effect->mask.size(); ++byte) {
+      if (!effect->mask[byte])
         continue;
       auto &prior = bytes[effect->address + byte];
       if (prior.write || (effect->write && prior.read))
@@ -318,7 +331,22 @@ CheckResult ObservationSession::step_reference(const InstructionRetireEvent &ret
   if (!reference_stepper_)
     return {CheckStatus::Unsupported, 0, "retirement has no independent reference-step callback"};
   if (snapshot.destination == ArchitecturalDestination::Unsupported)
-    return {CheckStatus::Unsupported, 0, "architectural destination type is outside the scalar integer session"};
+    return {CheckStatus::Unsupported, 0, "architectural destination type is outside the scalar session"};
+  if (snapshot.destination != ArchitecturalDestination::None &&
+      snapshot.destination != ArchitecturalDestination::Integer &&
+      snapshot.destination != ArchitecturalDestination::FloatingPoint)
+    return invalid("architectural retirement has an unknown destination type");
+  FloatingPointInstruction floating;
+  auto decoded_fp = decode_floating_point_instruction(snapshot.instruction, floating);
+  if (!decoded_fp)
+    return decoded_fp;
+  if (floating.recognized) {
+    const auto expected = floating.writes_floating_point ? ArchitecturalDestination::FloatingPoint
+        : floating.writes_integer ? ArchitecturalDestination::Integer : ArchitecturalDestination::None;
+    if (snapshot.destination != expected ||
+        (expected != ArchitecturalDestination::None && snapshot.destination_register != floating.destination))
+      return {CheckStatus::Violation, 0, "floating-point instruction destination differs from architectural snapshot"};
+  }
 
   std::vector<ReferenceLoadValue> loads;
   for (const auto &operation : retirement.instruction.memory) {
@@ -358,12 +386,19 @@ CheckResult ObservationSession::step_reference(const InstructionRetireEvent &ret
     return {CheckStatus::Unsupported, 0, "reference instruction trapped outside generic trap semantics"};
   if (snapshot.destination == ArchitecturalDestination::Integer) {
     if (!snapshot.destination_register || snapshot.destination_register >= 32 || !result.integer_write ||
-        result.integer_write->destination_register != snapshot.destination_register ||
+        result.floating_point_write || result.integer_write->destination_register != snapshot.destination_register ||
         result.integer_write->value != snapshot.destination_value)
       return {CheckStatus::Violation, 0, "reference integer write differs from the DUT retirement snapshot"};
-  } else if (snapshot.destination_register != 0 || result.integer_write) {
-    return {CheckStatus::Violation, 0, "unexpected integer write for a non-writing retirement"};
+  } else if (snapshot.destination == ArchitecturalDestination::FloatingPoint) {
+    if (snapshot.destination_register >= 32 || !result.floating_point_write || result.integer_write ||
+        result.floating_point_write->destination_register != snapshot.destination_register ||
+        result.floating_point_write->value != snapshot.destination_value)
+      return {CheckStatus::Violation, 0, "reference floating-point write differs from the DUT retirement snapshot"};
+  } else if (snapshot.destination_register != 0 || result.integer_write || result.floating_point_write) {
+    return {CheckStatus::Violation, 0, "unexpected register write for a non-writing retirement"};
   }
+  if (snapshot.fcsr && (!result.fcsr || *snapshot.fcsr != *result.fcsr))
+    return {CheckStatus::Violation, 0, "reference FCSR differs from the exact DUT retirement snapshot"};
 
   ++statistics.architecture_compared;
 
@@ -470,12 +505,15 @@ SessionSubmitResult ObservationSession::submit(const EventBatch &batch,
   for (const auto &snapshot : retirements) {
     const bool supported_destination = snapshot.destination == ArchitecturalDestination::None ||
                                        snapshot.destination == ArchitecturalDestination::Integer ||
-                                       snapshot.destination == ArchitecturalDestination::Unsupported;
+                                       snapshot.destination == ArchitecturalDestination::Unsupported ||
+                                       snapshot.destination == ArchitecturalDestination::FloatingPoint;
     if (!snapshot.id.uid || snapshot.id.subaccess != 0 || snapshot.pc % 2 ||
         !supported_destination ||
         (snapshot.destination == ArchitecturalDestination::Integer &&
          (snapshot.destination_register == 0 || snapshot.destination_register >= 32)) ||
-        (snapshot.destination != ArchitecturalDestination::Integer && snapshot.destination_register != 0) ||
+        (snapshot.destination == ArchitecturalDestination::FloatingPoint && snapshot.destination_register >= 32) ||
+        ((snapshot.destination == ArchitecturalDestination::None ||
+          snapshot.destination == ArchitecturalDestination::Unsupported) && snapshot.destination_register != 0) ||
         architectural_retirements_.count(snapshot.id) || !new_retirement_ids.insert(snapshot.id).second) {
       result.transport = {EventValidationStatus::Invalid, "invalid or duplicate architectural retirement snapshot"};
       result.check = remember_failure(invalid("invalid or duplicate architectural retirement snapshot"));

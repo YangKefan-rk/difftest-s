@@ -14,13 +14,14 @@ CheckResult invalid(const char *message) { return {CheckStatus::Invalid, 0, mess
 
 bool scalar_width_matches(const InstructionObservation &instruction, uint8_t size) {
   const auto raw = instruction.instruction;
-  if (instruction.length == 4 && ((raw & 0x7f) == 0x03 || (raw & 0x7f) == 0x23))
+  if (instruction.length == 4 && ((raw & 0x7f) == 0x03 || (raw & 0x7f) == 0x23 ||
+      (raw & 0x7f) == 0x07 || (raw & 0x7f) == 0x27))
     return size == ((raw >> 12) & 3);
   if (instruction.length == 2 && ((raw & 3) == 0 || (raw & 3) == 2)) {
     const auto function = (raw >> 13) & 7;
     if (function == 2 || function == 6)
       return size == 2;
-    if (function == 3 || function == 7)
+    if (function == 1 || function == 3 || function == 5 || function == 7)
       return size == 3;
   }
   return true; // Opaque speculative extensions are rejected at retirement.
@@ -109,6 +110,9 @@ CaptureResult NativeAdapter::cancel_request(uint64_t request_id) {
     auto result = emitter_.cancel_load(request->second.core.token, request->second.core.attempt);
     if (!result)
       return finish_input(std::move(result));
+    result = capture_.cancel_load_attempt(request->second.core.token);
+    if (!result)
+      return finish_input(std::move(result));
   }
   auto result = cache_.release(request_id);
   if (!result)
@@ -137,6 +141,48 @@ CaptureResult NativeAdapter::sample_load(const CacheLoadResult &load) {
   // Opaque wrong-path data stays private; its eventual retirement is rejected.
   request->second.sampled = true;
   return finish_input(std::move(result));
+}
+
+CaptureResult NativeAdapter::atomic(const rvwmo::AtomicLifecycleEvent &record,
+                                        const rvwmo::SourcePosition &source) {
+  if (!failure_)
+    return {failure_, false};
+  auto token = tokens_by_uid_.find(record.id.uid);
+  if (token == tokens_by_uid_.end())
+    return {remember(invalid("Rocket atomic lifecycle has no live instruction")), false};
+  auto instruction = instructions_.find(token->second);
+  if (instruction == instructions_.end() || instruction->second.semantic_retire_done)
+    return {remember(invalid("Rocket atomic lifecycle has no live instruction")), false};
+  auto result = emitter_.atomic(token->second, record, source);
+  if (!result)
+    return finish_input(std::move(result));
+  if (record.phase == AtomicObservationPhase::WriteEffect &&
+      record.fuop != 2 && record.fuop != 3 && record.fuop != 6 && record.fuop != 7)
+    instruction->second.publication_done = true;
+  return finish_input({});
+}
+
+CaptureResult NativeAdapter::atomic_candidate(uint64_t token, const AtomicCommitCandidateEvent &candidate,
+                                                const SourcePosition &source) {
+  if (!failure_)
+    return {failure_, false};
+  auto instruction = instructions_.find(token);
+  if (instruction == instructions_.end() || !instruction->second.request ||
+      instruction->second.semantic_retire_done || instruction->second.publication_done ||
+      instruction->second.id != candidate.id || *instruction->second.request != candidate.request_id ||
+      instruction->second.next_attempt != candidate.attempt)
+    return {remember(invalid("Rocket AMO candidate has no matching live final cache attempt")), false};
+  auto request = requests_.find(candidate.request_id);
+  if (request == requests_.end() || request->second.core.token != token ||
+      request->second.core.attempt != candidate.attempt || request->second.publication ||
+      request->second.publication_group)
+    return {remember(invalid("Rocket AMO candidate changed its final request identity")), false};
+  auto result = emitter_.atomic_candidate(token, candidate, source);
+  if (!result)
+    return finish_input(std::move(result));
+  request->second.store_accepted = true;
+  instruction->second.publication_done = true;
+  return finish_input({});
 }
 
 CaptureResult NativeAdapter::accept_store(const CacheStoreValue &store) {
@@ -215,6 +261,16 @@ CaptureResult NativeAdapter::late_write(const NativeLateWrite &write) {
   return finish_input(capture_.late_write(write));
 }
 
+CaptureResult NativeAdapter::floating_write(const NativeFpWrite &write) {
+  if (!failure_)
+    return {failure_, false};
+  const auto instruction = instructions_.find(write.token);
+  if (!write.identity_known || instruction == instructions_.end() || instruction->second.snapshot_done)
+    return {remember({CheckStatus::Incomplete, 0,
+        "Rocket native floating-point writeback lacks a live instruction identity"}), false};
+  return finish_input(capture_.floating_write(write));
+}
+
 CaptureResult NativeAdapter::squash(uint64_t token) {
   if (!failure_)
     return {failure_, false};
@@ -262,6 +318,10 @@ CheckResult NativeAdapter::flush_retirements() {
     const auto token = *pending_retirements_.begin();
     auto &instruction = instructions_.at(token);
     const auto &fact = *instruction.retirement;
+    const uint32_t raw = instruction.allocation.instruction;
+    const bool rmw = (raw & 0x7f) == 0x2f && (raw >> 27) != 2 && (raw >> 27) != 3;
+    if (rmw && !instruction.publication_done)
+      return pending("Rocket AMO retirement awaits its final physical-drain candidate");
     if (ordinary_store(instruction.allocation) && !instruction.local_store_done) {
       if (!instruction.request)
         return pending("Rocket native store retirement awaits its request and data");
@@ -420,9 +480,13 @@ void NativeAdapter::collect_output() {
   output_.serial = next_output_serial_++;
   output_.batch = std::move(batch);
   for (const auto &snapshot : captured) {
+    auto destination = ArchitecturalDestination::None;
+    if (snapshot.floating_write)
+      destination = ArchitecturalDestination::FloatingPoint;
+    else if (snapshot.integer_write)
+      destination = ArchitecturalDestination::Integer;
     output_.retirements.push_back({snapshot.id, snapshot.pc, snapshot.instruction,
-      snapshot.integer_write ? ArchitecturalDestination::Integer : ArchitecturalDestination::None,
-      snapshot.destination, snapshot.value});
+      destination, snapshot.destination, snapshot.value, snapshot.fcsr});
     const auto token = tokens_by_uid_.find(snapshot.id.uid);
     if (token == tokens_by_uid_.end()) {
       remember(invalid("Rocket native snapshot has no logical-to-native identity mapping"));

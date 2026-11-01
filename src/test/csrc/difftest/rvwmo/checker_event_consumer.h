@@ -57,6 +57,28 @@ private:
     MemoryOperation operation;
     std::vector<uint8_t> actual_bytes;
   };
+  // One in-flight architectural atomic (AMO, LR or SC) per hart. The adapter
+  // supplies the actual read/write observation points through
+  // AtomicLifecycleEvent; this record only holds the semantic lifecycle.
+  struct AtomicRecord {
+    OperationId id;
+    uint32_t attempt = 0;
+    bool lr = false;
+    bool sc = false;
+    bool rmw = false;
+    uint64_t address = 0;
+    uint8_t mask = 0;
+    bool request_seen = false;
+    bool read_seen = false;
+    bool write_seen = false;
+    bool response_seen = false;
+    bool finish_seen = false;
+    bool awaiting_retry = false;
+    bool success = false;
+    bool error = false;
+    uint64_t old_data = 0;
+    uint64_t new_data = 0;
+  };
 
   Memory memory_;
   Checker checker_;
@@ -69,6 +91,8 @@ private:
   std::map<OperationId, StoreRecord> stores_;
   std::map<LoadKey, LoadRecord> loads_;
   std::set<LoadKey> cancelled_loads_;
+  std::map<uint32_t, AtomicRecord> atomic_inflight_;
+  std::map<OperationId, AtomicRecord> atomics_;
   std::optional<uint64_t> last_memory_rank_;
   enum class RankCertificate { None, ReadOnly, IndependentEffects };
   struct GroupReceipt {
@@ -97,6 +121,15 @@ private:
   CheckResult consume_load_sample(const RuntimeEvent &event, const LoadSampleEvent &sample,
                                   RankCertificate certificate = RankCertificate::None,
                                   bool source_prefix_closed = false);
+  CheckResult consume_atomic(const RuntimeEvent &event, const AtomicLifecycleEvent &atomic,
+                             bool source_prefix_closed);
+  CheckResult consume_atomic_candidate(const RuntimeEvent &event, const AtomicCommitCandidateEvent &candidate,
+                                      bool source_prefix_closed,
+                                      RankCertificate certificate = RankCertificate::None);
+  CheckResult consume_amo_point(const RuntimeEvent &event, const OperationId &id, uint32_t attempt,
+                               uint64_t address, uint8_t mask, uint64_t old_data, uint64_t new_data,
+                               bool source_prefix_closed,
+                               RankCertificate certificate = RankCertificate::None);
   CheckResult consume_store_publish(const RuntimeEvent &event, const StorePublishEvent &publish,
                                     RankCertificate certificate = RankCertificate::None);
   CheckResult consume_coalesced_store_publish(const RuntimeEvent &event, const StorePublishEvent &publish);

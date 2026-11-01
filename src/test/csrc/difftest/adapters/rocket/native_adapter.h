@@ -45,11 +45,17 @@ public:
   CaptureResult bind_request(const CoreRequest &core, const CacheRequest &cache);
   CaptureResult cancel_request(uint64_t request_id);
   CaptureResult sample_load(const CacheLoadResult &load);
+  // Rocket native AMO/LR/SC lifecycle. The matching Rocket branch must expose
+  // the read/write/cancel phases; this adapter routes them to the emitter.
+  CaptureResult atomic(const rvwmo::AtomicLifecycleEvent &record, const rvwmo::SourcePosition &source);
+  CaptureResult atomic_candidate(uint64_t token, const rvwmo::AtomicCommitCandidateEvent &candidate,
+                                  const rvwmo::SourcePosition &source);
   CaptureResult accept_store(const CacheStoreValue &store);
   rvwmo::CheckResult store_member(uint64_t request_id, CacheStoreMember &member) const;
   CaptureResult publish_group(const StoreGroupObservation &group, uint64_t transaction);
   CaptureResult retire(const NativeRetireFact &fact);
   CaptureResult late_write(const NativeLateWrite &write);
+  CaptureResult floating_write(const NativeFpWrite &write);
   CaptureResult squash(uint64_t token);
   // The caller proves publication; a raw SRAM drain alone is insufficient.
   CaptureResult publish(const QualifiedStorePublication &publication);

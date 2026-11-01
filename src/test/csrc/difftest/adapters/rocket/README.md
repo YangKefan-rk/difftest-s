@@ -43,11 +43,56 @@ The matching Rocket branch enables its optional outputs using the default-false
 Only blocking DCache currently provides native observations. Other cache
 implementations expose `available=false`; scratchpad observation is rejected.
 The ordinary cached scalar profile must not silently accept unavailable probes,
-uncached/MMIO/implicit accesses, merged stores, AMO/LRSC, vector, or split accesses.
+uncached/MMIO/implicit accesses, vector, or split accesses. Aligned cached-RAM
+AMO.W/D uses `NativeAdapter::atomic_candidate` with qualified old SRAM data,
+AMOALU final bytes and the matching physical drain. LR/SC retains a separate
+reservation/success lifecycle; its C++ ingress does not establish native RTL
+support.
+
+## AMO reference and ordering checks
+
+The nine RV64 AMO operations support low/high word lanes, doubleword, `rd=x0`
+and aq/rl annotations. The private adapter joins a candidate with the original
+ROB retirement and final writeback before emitting allocation, candidate and
+retirement. Retire-before-drain and drain-before-retire are both retained;
+unresolved attempts and publications prevent producer closure.
+
+The common consumer freezes an independent pre-write memory snapshot at the
+observed physical drain rank, then installs the provisional new bytes at that
+same rank. DUT old data is an actual value, never the expected REF input. Final
+acceptance requires modeled read-value comparison, a separate Spike-generated
+atomic-store trace audit, and PPO with equal AMO read/write ranks. The reference
+profile must advertise `DIFFTEST_REF_CAP_ATOMIC_STORE_TRACE_V1`; ordinary and
+atomic trace queues are counted independently. Word masks select the original
+aligned SRAM lanes; sign-extended architectural return values are compared
+separately.
+
+Cross-hart same-cycle effects on disjoint bytes may share an independent-effect
+group. Unqualified overlapping effects, split operations, MMIO and a physical
+group coalescing an AMO with another store remain outside this supported path.
+A successful ISA/PPO check under the observed order is not a formal proof of
+cache coherence, or proof that an arbitrary ELF has a complete terminal protocol.
 
 Collect observations on the modules' actual clock edges. A clock-gated module's
 held valid signal is not a new event on every ungated host clock. The shared
 profile must establish a common synchronous source-time domain.
+
+## Optional floating-point architecture scope
+
+The Rocket private collector joins exact committed FP destinations with the
+FPU's two actual final register-file write ports, retaining token identity across
+late writes. IEEE-754 canonical 64-bit FPR data (including writable f0) and an
+eligible FCSR snapshot are passed as DUT **actuals** to the generic session;
+Spike provides the independent REF expected results. A missing identity,
+unsupported FP encoding or unfinished FP write remains `Incomplete` or
+`Unsupported`, never a fabricated integer compare. The terminal additionally
+requires no pending FPU writes. The four-hart arch-only workload checks FP
+arithmetic, conversions, f0, flags and integer shared-memory effects.
+
+This arch-only cohort deliberately expresses memory bit transfers through
+ordinary integer loads/stores plus FMV instructions. Native FLW/FLD/FSW/FSD,
+AMO/LRSC, FP memory PPO, and HartBreaker's native exit still require separate
+memory-event and reference support and do not inherit this Pass.
 
 ## Producer and source-time ownership
 

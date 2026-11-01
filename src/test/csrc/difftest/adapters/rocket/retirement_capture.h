@@ -25,6 +25,17 @@ struct NativeRetirement {
   uint8_t destination = 0;
   uint64_t value = 0;
   bool floating_point = false;
+  bool floating_write = false;
+  // Present only for an exact, independently qualified post-instruction CSR sample.
+  std::optional<uint8_t> fcsr;
+};
+
+struct NativeFpWrite {
+  uint64_t token = 0;
+  bool identity_known = false;
+  uint8_t destination = 0;
+  uint64_t value = 0;
+  rvwmo::SourcePosition source;
 };
 
 struct NativeLateWrite {
@@ -43,6 +54,8 @@ struct CapturedRetirement {
   bool integer_write = false;
   uint8_t destination = 0;
   uint64_t value = 0;
+  bool floating_write = false;
+  std::optional<uint8_t> fcsr;
 };
 
 // Joins independent WB/late-WB data with the emitter's logical instruction ID.
@@ -53,6 +66,8 @@ public:
   rvwmo::CheckResult allocate(const InstructionObservation &instruction, const rvwmo::OperationId &id);
   rvwmo::CheckResult retire(const NativeRetirement &retirement);
   rvwmo::CheckResult late_write(const NativeLateWrite &write);
+  rvwmo::CheckResult floating_write(const NativeFpWrite &write);
+  rvwmo::CheckResult cancel_load_attempt(uint64_t token);
   rvwmo::CheckResult squash(uint64_t token);
   std::vector<CapturedRetirement> take_ready();
   rvwmo::CheckResult finalize() const;
@@ -64,12 +79,14 @@ private:
     rvwmo::OperationId id;
     std::optional<CapturedRetirement> retirement;
     bool waiting_for_write = false;
+    std::optional<NativeFpWrite> floating_write;
   };
 
   RetirementConfiguration configuration_;
   std::map<uint64_t, Instruction> instructions_;
   std::set<uint64_t> unretired_tokens_;
   std::array<uint64_t, 32> pending_destinations_{};
+  std::array<uint64_t, 32> pending_floating_destinations_{};
   std::optional<uint64_t> last_token_;
   std::optional<uint64_t> last_uid_;
   std::optional<rvwmo::SourcePosition> last_allocation_source_;

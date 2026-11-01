@@ -1,5 +1,6 @@
 #include "retirement_capture.h"
 #include "../../rvwmo/producer_ids.h"
+#include "../../rvwmo/dependency.h"
 #include "../../rvwmo/stream.h"
 #include <algorithm>
 #include <utility>
@@ -49,7 +50,7 @@ CheckResult RetirementCapture::allocate(const InstructionObservation &allocation
   }
   if (instructions_.size() >= configuration_.capacity)
     return {CheckStatus::Pending, 0, "Rocket retirement capture capacity reached"};
-  instructions_.emplace(allocation.token, Instruction{allocation, id, std::nullopt, false});
+  instructions_.emplace(allocation.token, Instruction{allocation, id, std::nullopt, false, std::nullopt});
   unretired_tokens_.insert(allocation.token);
   last_token_ = allocation.token;
   last_uid_ = id.uid;
@@ -81,21 +82,50 @@ CheckResult RetirementCapture::retire(const NativeRetirement &retirement) {
     return reject(CheckStatus::Invalid, "Rocket retirement raw instruction disagrees with its byte length");
   if (retirement.destination > 31 || (retirement.integer_write && retirement.deferred_integer_write))
     return reject(CheckStatus::Invalid, "Rocket architectural retirement has conflicting integer-write flags");
-  if (retirement.floating_point || (allocation.length != 2 && allocation.length != 4))
+  if (allocation.length != 2 && allocation.length != 4)
     return reject(CheckStatus::Unsupported, "Rocket retirement requires a supported scalar instruction comparator");
+  FloatingPointInstruction floating;
+  result = decode_floating_point_instruction(raw_instruction(allocation.instruction, allocation.length), floating);
+  if (!result)
+    return reject(result.status, result.message.c_str());
+  if (floating.recognized != retirement.floating_point)
+    return reject(CheckStatus::Invalid, "Rocket floating-point retirement qualifier disagrees with its encoding");
+  const bool integer_write = retirement.integer_write || retirement.deferred_integer_write;
+  if (retirement.floating_write && integer_write)
+    return reject(CheckStatus::Invalid, "Rocket retirement cannot write both integer and floating-point registers");
+  if (floating.recognized &&
+      (retirement.floating_write != floating.writes_floating_point ||
+       integer_write != (floating.writes_integer && floating.destination != 0) ||
+       ((retirement.floating_write || integer_write) && retirement.destination != floating.destination)))
+    return reject(CheckStatus::Invalid, "Rocket floating-point destination disagrees with its encoded write class");
+  if (!floating.recognized && retirement.floating_write)
+    return reject(CheckStatus::Invalid, "Rocket non-floating instruction claims a floating-point destination");
+  if (instruction.floating_write && !retirement.floating_write)
+    return reject(CheckStatus::Invalid, "Rocket non-FPR retirement has a floating-point writeback");
   if (unretired_tokens_.empty() || *unretired_tokens_.begin() != retirement.token)
     return reject(CheckStatus::Invalid, "Rocket architectural retirement overtook a live older instruction");
   if (retirement.destination && (retirement.integer_write || retirement.deferred_integer_write) &&
       pending_destinations_[retirement.destination])
     return reject(CheckStatus::Invalid, "Rocket writeback reused a pending scoreboard destination");
   const bool writes = retirement.destination && (retirement.integer_write || retirement.deferred_integer_write);
+  if (retirement.floating_write && pending_floating_destinations_[retirement.destination])
+    return reject(CheckStatus::Invalid, "Rocket floating-point retirement reused a pending destination");
+  const bool floating_ready = retirement.floating_write && instruction.floating_write.has_value();
+  if (floating_ready && instruction.floating_write->destination != retirement.destination)
+    return reject(CheckStatus::Invalid, "Rocket floating-point writeback changed its retirement destination");
+  uint64_t value = writes && !retirement.deferred_integer_write ? retirement.value : 0;
+  if (floating_ready)
+    value = instruction.floating_write->value;
   instruction.retirement = CapturedRetirement{instruction.id, retirement.pc,
     raw_instruction(retirement.instruction, allocation.length), retirement.source, writes,
-    static_cast<uint8_t>(writes ? retirement.destination : 0),
-    writes && !retirement.deferred_integer_write ? retirement.value : 0};
-  instruction.waiting_for_write = writes && retirement.deferred_integer_write;
-  if (instruction.waiting_for_write)
+    static_cast<uint8_t>(writes || retirement.floating_write ? retirement.destination : 0), value,
+    retirement.floating_write, retirement.fcsr};
+  instruction.waiting_for_write = (writes && retirement.deferred_integer_write) ||
+                                (retirement.floating_write && !floating_ready);
+  if (writes && instruction.waiting_for_write)
     pending_destinations_[retirement.destination] = retirement.token;
+  if (retirement.floating_write && instruction.waiting_for_write)
+    pending_floating_destinations_[retirement.destination] = retirement.token;
   unretired_tokens_.erase(retirement.token);
   last_retirement_source_ = retirement.source;
   return {};
@@ -110,7 +140,8 @@ CheckResult RetirementCapture::late_write(const NativeLateWrite &write) {
   if (found == instructions_.end() || !found->second.retirement || !found->second.waiting_for_write)
     return reject(CheckStatus::Invalid, "Rocket late writeback has no pending architectural destination");
   auto &instruction = found->second;
-  if (!write.destination || write.destination != instruction.retirement->destination)
+  if (instruction.retirement->floating_write || !write.destination ||
+      write.destination != instruction.retirement->destination)
     return reject(CheckStatus::Invalid, "Rocket late writeback changed its scoreboard destination");
   auto result = follows(instruction.retirement->source, write.source);
   if (!result)
@@ -118,6 +149,53 @@ CheckResult RetirementCapture::late_write(const NativeLateWrite &write) {
   instruction.retirement->value = write.value;
   instruction.waiting_for_write = false;
   pending_destinations_[write.destination] = 0;
+  return {};
+}
+
+CheckResult RetirementCapture::floating_write(const NativeFpWrite &write) {
+  if (!failure_)
+    return failure_;
+  if (!write.identity_known)
+    return reject(CheckStatus::Incomplete, "Rocket floating-point writeback has no observed instruction identity");
+  auto found = instructions_.find(write.token);
+  if (found == instructions_.end())
+    return reject(CheckStatus::Incomplete, "Rocket floating-point writeback has no live instruction identity");
+  auto &instruction = found->second;
+  if (instruction.floating_write)
+    return reject(CheckStatus::Invalid, "Rocket floating-point writeback was observed twice");
+  FloatingPointInstruction decoded;
+  auto result = decode_floating_point_instruction(
+      raw_instruction(instruction.allocation.instruction, instruction.allocation.length), decoded);
+  if (!result)
+    return reject(result.status, result.message.c_str());
+  if (!decoded.recognized || !decoded.writes_floating_point || write.destination > 31 ||
+      write.destination != decoded.destination)
+    return reject(CheckStatus::Invalid, "Rocket floating-point writeback disagrees with the encoded destination");
+  result = follows(instruction.allocation.source, write.source);
+  if (!result)
+    return result;
+  if (instruction.retirement &&
+      (!instruction.retirement->floating_write || !instruction.waiting_for_write ||
+       pending_floating_destinations_[write.destination] != write.token))
+    return reject(CheckStatus::Invalid, "Rocket floating-point writeback has no pending architectural destination");
+  instruction.floating_write = write;
+  if (instruction.retirement) {
+    instruction.retirement->value = write.value;
+    instruction.waiting_for_write = false;
+    pending_floating_destinations_[write.destination] = 0;
+  }
+  return {};
+}
+
+CheckResult RetirementCapture::cancel_load_attempt(uint64_t token) {
+  if (!failure_)
+    return failure_;
+  const auto found = instructions_.find(token);
+  if (found == instructions_.end() || found->second.retirement)
+    return reject(CheckStatus::Invalid, "Rocket load-attempt cancellation has no unretired instruction");
+  // A failed request's early result cannot be reused by the retried load.
+  // Actual post-retirement writes retain their exact token and cannot cancel.
+  found->second.floating_write.reset();
   return {};
 }
 
