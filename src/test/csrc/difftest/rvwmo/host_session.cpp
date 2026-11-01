@@ -71,7 +71,8 @@ std::vector<uint32_t> event_harts(const RuntimeEvent &event) {
 
 HostSession::HostSession(GlobalMem &memory, HostSessionConfiguration configuration)
     : memory_(memory), configuration_(std::move(configuration)),
-      references_(memory_, configuration_.reference_profile, configuration_.initial_harts) {
+      references_(memory_, configuration_.reference_profile, configuration_.initial_harts,
+                  configuration_.check_boom_entry_csr) {
   if (!references_.configuration()) {
     failure_ = references_.configuration();
     return;
@@ -79,6 +80,10 @@ HostSession::HostSession(GlobalMem &memory, HostSessionConfiguration configurati
   if (configuration_.check_boom_traps &&
       (configuration_.platform != "boom" || configuration_.reference_profile != DIFFTEST_REF_PROFILE_ID_BOOM)) {
     failure_ = invalid("precise trap verification requires the BOOM reference profile");
+    return;
+  }
+  if (configuration_.check_boom_entry_csr && !configuration_.check_boom_traps) {
+    failure_ = invalid("BOOM entry CSR verification requires precise trap verification");
     return;
   }
   if (configuration_.platform.empty() || configuration_.verification_scope.empty() ||
@@ -129,6 +134,49 @@ HostSession::HostSession(GlobalMem &memory, HostSessionConfiguration configurati
     session_->set_trap_stepper(references_.trap_callback());
 }
 
+CheckResult HostSession::initialize_boom_entry_csr(const BoomEntryCsrSnapshot &snapshot) {
+  if (!failure_)
+    return failure_;
+  if (!configuration_.check_boom_entry_csr)
+    return reject(invalid("BOOM entry CSR initialization requires the opt-in host profile"));
+  const uint32_t hart = snapshot.identity.hart;
+  if (!registered_hart(hart) || snapshot.identity.subaccess || !snapshot.identity.uid ||
+      !snapshot.identity.epoch || !snapshot.source_cycle || !snapshot.pc || !snapshot.privilege ||
+      !snapshot.mstatus || !snapshot.mepc || !snapshot.mcause || !snapshot.mtval ||
+      !snapshot.sepc || !snapshot.scause || !snapshot.stval || *snapshot.pc % 2 ||
+      (*snapshot.privilege != 0 && *snapshot.privilege != 1 && *snapshot.privilege != 3))
+    return reject(incomplete("BOOM entry CSR snapshot lacks an exact physical identity, PC or privilege"));
+  if (entry_csrs_.count(hart))
+    return reject(invalid("BOOM entry CSR snapshot was already installed for this hart"));
+  if (!snapshot.older_drained)
+    return reject(incomplete("BOOM entry CSR snapshot has older in-flight bootstrap effects"));
+  if (*snapshot.pc != configuration_.initial_harts[hart].pc || entry_allocations_seen_.count(hart) ||
+      last_architectural_cycles_.count(hart))
+    return reject(incomplete("BOOM entry CSR snapshot does not precede the first checked instruction"));
+  const auto previous = last_source_cycles_.find(hart_producer_id(hart));
+  if (previous != last_source_cycles_.end() && previous->second >= *snapshot.source_cycle)
+    return reject(incomplete("BOOM entry CSR snapshot arrived after its physical source cycle"));
+
+  // Preserve independently initialized registers and trap vector configuration.
+  // Only these physical CSRFile observations overwrite the bootstrap state.
+  auto initial = configuration_.initial_harts[hart];
+  initial.privilege = *snapshot.privilege;
+  initial.mstatus = *snapshot.mstatus;
+  // Spike writes the SSTATUS alias after MSTATUS during set_state_v1.
+  initial.sstatus = *snapshot.mstatus;
+  initial.mepc = *snapshot.mepc;
+  initial.mcause = *snapshot.mcause;
+  initial.mtval = *snapshot.mtval;
+  initial.sepc = *snapshot.sepc;
+  initial.scause = *snapshot.scause;
+  initial.stval = *snapshot.stval;
+  auto initialized = references_.initialize_boom_entry_csr(hart, initial, snapshot.identity);
+  if (!initialized)
+    return reject(initialized);
+  entry_csrs_.emplace(hart, snapshot);
+  return {};
+}
+
 bool HostSession::registered_hart(uint32_t hart) const {
   return hart < configuration_.initial_harts.size();
 }
@@ -142,6 +190,7 @@ CheckResult HostSession::reject(CheckResult result) {
 }
 
 CheckResult HostSession::validate_batch(const EventBatch &batch) const {
+  auto entry_allocations_seen = entry_allocations_seen_;
   for (const auto &event : batch.events) {
     if (event.payload.index() != static_cast<size_t>(event.kind))
       return invalid("host event kind differs from its typed payload");
@@ -182,6 +231,27 @@ CheckResult HostSession::validate_batch(const EventBatch &batch) const {
     for (const uint32_t hart : event_harts(event)) {
       if (!registered_hart(hart))
         return invalid("host event names a hart outside the fixed reference roster");
+      if (configuration_.check_boom_entry_csr &&
+          (event.kind == RuntimeEventKind::InstructionAllocate ||
+           event.kind == RuntimeEventKind::InstructionRetire || event.kind == RuntimeEventKind::Trap)) {
+        const auto entry = entry_csrs_.find(hart);
+        if (entry == entry_csrs_.end())
+          return incomplete("checked BOOM event arrived before its physical entry CSR snapshot");
+        if (!entry_allocations_seen[hart]) {
+          if (event.kind != RuntimeEventKind::InstructionAllocate)
+            return incomplete("first checked BOOM instruction lacks its physical entry allocation");
+          const auto &allocation = std::get<InstructionAllocateEvent>(event.payload);
+          if (allocation.id != entry->second.identity || allocation.pc != entry->second.pc ||
+              event.source.cycle != entry->second.source_cycle)
+            return incomplete("first checked BOOM UID, PC or cycle differs from entry CSR sampling");
+          entry_allocations_seen[hart] = true;
+        } else if (event.kind == RuntimeEventKind::InstructionAllocate) {
+          const auto &allocation = std::get<InstructionAllocateEvent>(event.payload);
+          if (allocation.id != entry->second.identity && allocation.pc == entry->second.pc &&
+              event.source.cycle == entry->second.source_cycle)
+            return incomplete("BOOM entry CSR snapshot matches multiple same-cycle physical allocations");
+        }
+      }
       if (physical_atomic && event.producer_id != memory_fabric_producer_id(hart))
         return invalid("atomic RMW effect is not on its matching physical fabric channel");
       if (!physical_atomic && event.kind != RuntimeEventKind::StorePublish &&
@@ -233,6 +303,8 @@ SessionSubmitResult HostSession::submit(const EventBatch &batch,
       for (const auto &watermark : batch.watermarks)
         source_watermarks_[watermark.producer_id] = watermark.closed_through;
       for (const auto &event : batch.events) {
+        if (configuration_.check_boom_entry_csr && event.kind == RuntimeEventKind::InstructionAllocate)
+          entry_allocations_seen_.emplace(std::get<InstructionAllocateEvent>(event.payload).id.hart, true);
         auto &last_cycle = last_source_cycles_[event.producer_id];
         last_cycle = std::max(last_cycle, event.source.cycle);
         if (event.kind == RuntimeEventKind::InstructionRetire || event.kind == RuntimeEventKind::InstructionAllocate ||
@@ -311,6 +383,10 @@ CheckResult HostSession::finalize(uint64_t completed_cycle) {
       return reject(invalid("final source boundary differs from the already finalized run"));
     return {};
   }
+  if (configuration_.check_boom_entry_csr &&
+      (entry_csrs_.size() != configuration_.initial_harts.size() ||
+       entry_allocations_seen_.size() != configuration_.initial_harts.size()))
+    return reject(incomplete("BOOM run lacks a certified entry CSR snapshot and allocation for every hart"));
   if (completed_harts_.size() != configuration_.initial_harts.size())
     return reject(incomplete("host session finalized before every required hart completed"));
   for (const auto &hart : completed_harts_)

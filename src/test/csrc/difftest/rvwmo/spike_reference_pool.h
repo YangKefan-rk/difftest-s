@@ -15,12 +15,14 @@ namespace rvwmo {
 class SpikeReferencePool {
 public:
   SpikeReferencePool(GlobalMem &memory, uint32_t profile_id,
-                     const std::vector<difftest_ref_state_v1> &initial_states);
+                     const std::vector<difftest_ref_state_v1> &initial_states, bool require_boom_entry_csr = false);
   ~SpikeReferencePool();
   SpikeReferencePool(const SpikeReferencePool &) = delete;
   SpikeReferencePool &operator=(const SpikeReferencePool &) = delete;
 
   const CheckResult &configuration() const { return configuration_; }
+  CheckResult initialize_boom_entry_csr(uint32_t hart, const difftest_ref_state_v1 &initial_state,
+                                        const OperationId &identity);
   ObservationSession::ReferenceStepper callback();
   ObservationSession::TrapStepper trap_callback();
   const difftest_ref_profile_v1 *profile(uint32_t hart) const;

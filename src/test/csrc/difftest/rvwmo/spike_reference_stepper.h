@@ -5,6 +5,7 @@
 #include "difftest/ref_api.h"
 
 #include <functional>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -14,13 +15,15 @@ class SpikeReferenceStepper {
 public:
   // Handles are borrowed and must remain alive until after this stepper is destroyed.
   SpikeReferenceStepper(std::vector<void *> hart_handles, uint32_t expected_profile_id,
-                        std::function<bool(uint64_t, uint8_t *, size_t)> read_independent_instruction);
+                        std::function<bool(uint64_t, uint8_t *, size_t)> read_independent_instruction,
+                        bool require_boom_entry_csr = false);
   ~SpikeReferenceStepper();
 
   SpikeReferenceStepper(const SpikeReferenceStepper &) = delete;
   SpikeReferenceStepper &operator=(const SpikeReferenceStepper &) = delete;
 
-  CheckResult initialize_hart(uint32_t hart, const difftest_ref_state_v1 &initial_state);
+  CheckResult initialize_hart(uint32_t hart, const difftest_ref_state_v1 &initial_state,
+                              std::optional<OperationId> entry_identity = std::nullopt);
   const difftest_ref_profile_v1 *profile(uint32_t hart) const;
   ObservationSession::ReferenceStepper callback();
   ObservationSession::TrapStepper trap_callback();
@@ -38,6 +41,9 @@ private:
     difftest_ref_profile_v1 profile{};
     difftest_ref_profile_id_v1 profile_id{};
     bool initialized = false;
+    bool require_boom_entry_csr = false;
+    std::optional<OperationId> entry_identity;
+    bool first_step_seen = false;
     bool callbacks_installed = false;
     bool trap_observer_installed = false;
     bool active = false;
