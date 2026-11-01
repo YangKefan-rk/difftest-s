@@ -220,8 +220,10 @@ CheckResult SpikeReferenceStepper::collect_atomic_store(void *handle, const Memo
   const int taken = difftest_ref_take_atomic_store_trace_v1(handle, &address, &data, &mask);
   if (taken == DIFFTEST_REF_API_UNSUPPORTED)
     return unsupported("Spike profile has no independent atomic store trace");
-  if (taken != 1)
-    return incomplete("Spike executed AMO without exactly one reference atomic store trace");
+  if (taken == 1)
+    return incomplete("Spike executed AMO without a reference atomic store trace");
+  if (taken != DIFFTEST_REF_API_OK)
+    return incomplete("Spike failed to provide the reference atomic store trace");
   uint8_t expected_mask = 0;
   for (unsigned byte = 0; byte < 8; ++byte) {
     if (operation.byte_mask[byte] > 1)
@@ -347,7 +349,7 @@ ReferenceStepResult SpikeReferenceStepper::step(const InstructionRetireEvent &re
     result.check = incomplete("AMO retirement lacks its indivisible memory effect");
     return result;
   }
-  const bool atomic_traces = (state.profile.capabilities & DIFFTEST_REF_CAP_ATOMIC_TRACE_V1) != 0;
+  const bool atomic_traces = (state.profile.capabilities & DIFFTEST_REF_CAP_ATOMIC_STORE_TRACE_V1) != 0;
   if (atomic_count && !atomic_traces) {
     result.check = unsupported("Spike reference profile has no independent atomic trace capability");
     return result;
