@@ -102,6 +102,8 @@ struct NativeCollectorConfiguration {
   bool skip_device_stores = false;
   bool check_csr_post = false;
   bool check_fp_post = false;
+  // Independently parsed ELF terminal delimiters; only this BOOM profile opts in.
+  std::vector<uint64_t> terminal_wfi_pcs;
 };
 struct CollectedObservations {
   EventBatch batch;
@@ -121,6 +123,7 @@ public:
   CaptureResult capture(const NativeFrame &frame);
   CheckResult take_ready(CollectedObservations &output);
   CheckResult audit_reference_store(const ReferenceStoreAudit &reference);
+  CheckResult certify_parked_wfi_terminal(const ProbeIdentity &owner, uint64_t pc, uint64_t source_cycle);
   CheckResult completion() const;
 
 private:
@@ -128,6 +131,11 @@ private:
   NativeCollectorConfiguration configuration_;
   BoomEventAdapter adapter_;
   std::map<OperationId, InstructionAllocation> allocations_;
+  // WFI still occupies its physical ROB slot, but is outside the retired prefix.
+  struct HeldTerminalWfi { InstructionAllocation allocation; ProbeIdentity identity; };
+  std::map<OperationId, HeldTerminalWfi> terminal_wfis_;
+  struct CertifiedTerminalWfi { ProbeIdentity owner; uint64_t pc = 0; };
+  std::optional<CertifiedTerminalWfi> certified_terminal_wfi_;
   std::set<OperationId> skipped_device_stores_;
   struct PendingCsr {
     uint64_t pc = 0, retirement_cycle = 0;
@@ -151,6 +159,7 @@ private:
   std::optional<uint64_t> closed_cycle_;
   uint64_t capture_sequence_ = 0;
   uint64_t emitted_sequence_ = 0;
+  uint64_t last_allocated_uid_ = 0;
   bool queues_empty_ = false;
   bool cache_idle_ = false;
   CheckResult failure_;

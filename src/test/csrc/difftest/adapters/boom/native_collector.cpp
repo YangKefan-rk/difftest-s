@@ -15,6 +15,10 @@ CheckResult pending(const char *message) { return {CheckStatus::Pending, 0, mess
 bool same_instruction(const ProbeIdentity &lhs, const ProbeIdentity &rhs) {
   return lhs.epoch == rhs.epoch && lhs.uid == rhs.uid && lhs.rob_generation == rhs.rob_generation;
 }
+bool same_terminal_owner(const ProbeIdentity &lhs, const ProbeIdentity &rhs) {
+  return same_instruction(lhs, rhs) && lhs.memory_generation == rhs.memory_generation &&
+         lhs.attempt == rhs.attempt;
+}
 } // namespace
 
 NativeCollector::NativeCollector(NativeCollectorConfiguration configuration)
@@ -24,6 +28,12 @@ NativeCollector::NativeCollector(NativeCollectorConfiguration configuration)
   if ((configuration.checked_ram_size == 0 && configuration.checked_ram_base != 0) ||
       configuration.checked_ram_size > std::numeric_limits<uint64_t>::max() - configuration.checked_ram_base)
     throw std::invalid_argument("BOOM collector requires a representable checked RAM interval");
+  for (size_t i = 0; i < configuration.terminal_wfi_pcs.size(); ++i) {
+    const auto pc = configuration.terminal_wfi_pcs[i];
+    if (!pc || (pc & 1) || std::find(configuration.terminal_wfi_pcs.begin(),
+          configuration.terminal_wfi_pcs.begin() + i, pc) != configuration.terminal_wfi_pcs.begin() + i)
+      throw std::invalid_argument("BOOM terminal WFI PC must be nonzero, aligned and unique");
+  }
 }
 
 OperationId NativeCollector::id(const ProbeIdentity &identity) const {
@@ -229,9 +239,28 @@ CheckResult NativeCollector::capture_allocations(const NativeFrame &frame) {
     InstructionAllocation allocation;
     auto result = merge_allocation(configuration_.hart, core, queue, configuration_.limits.ldq_slots,
                                    configuration_.limits.stq_slots, capture_source(frame.cycle), allocation);
-    if (!result || !(result = adapter_.allocate(allocation)))
+    if (!result)
       return result;
+    const bool delimiter = std::find(configuration_.terminal_wfi_pcs.begin(),
+        configuration_.terminal_wfi_pcs.end(), allocation.pc) != configuration_.terminal_wfi_pcs.end();
+    if (!configuration_.terminal_wfi_pcs.empty() && allocation.id.uid <= last_allocated_uid_)
+      return invalid("BOOM terminal profile dispatch UID is not strictly increasing");
+    if (certified_terminal_wfi_)
+      return incomplete("BOOM instruction allocated after its terminal WFI was certified");
+    if (allocations_.count(allocation.id) || std::any_of(allocations_.begin(), allocations_.end(),
+          [&](const auto &existing) { return existing.second.rob.index == allocation.rob.index; }))
+      return invalid("BOOM terminal profile reuses a live instruction identity or ROB slot");
+    if (delimiter) {
+      if (allocation.instruction != 0x10500073 || allocation.length != 4 || allocation.ldq || allocation.stq)
+        return invalid("BOOM ELF terminal WFI PC dispatched a different instruction or memory operation");
+      if (!terminal_wfis_.emplace(allocation.id, HeldTerminalWfi{allocation, core.identity}).second)
+        return invalid("BOOM terminal WFI repeats a live owner");
+    } else if (!(result = adapter_.allocate(allocation))) {
+      return result;
+    }
     allocations_.emplace(allocation.id, allocation);
+    if (!configuration_.terminal_wfi_pcs.empty())
+      last_allocated_uid_ = allocation.id.uid;
   }
   if (used_queues.size() != frame.queue_allocations.size())
     return invalid("BOOM queue allocation has no matching core dispatch");
@@ -339,10 +368,15 @@ CheckResult NativeCollector::capture_retirements(const NativeFrame &frame) {
         core.instruction != allocation->second.instruction ||
         core.uses_ldq != allocation->second.ldq.has_value() || core.uses_stq != allocation->second.stq.has_value())
       return invalid("BOOM physical retirement differs from its retained core/ROB allocation");
+    const bool terminal_wfi = terminal_wfis_.count(instruction_id) != 0;
+    if (terminal_wfi && core.architectural)
+      return incomplete("BOOM terminal WFI retired instead of remaining physically parked");
     if (!core.architectural) {
-      auto result = adapter_.squash(instruction_id, allocation->second.rob, capture_source(frame.cycle));
-      if (!result)
-        return result;
+      if (!terminal_wfi) {
+        auto result = adapter_.squash(instruction_id, allocation->second.rob, capture_source(frame.cycle));
+        if (!result)
+          return result;
+      }
     } else {
       std::optional<ProbeLoadRetirement> load;
       for (size_t index = 0; index < frame.retired_loads.size(); ++index) {
@@ -407,6 +441,7 @@ CheckResult NativeCollector::capture_retirements(const NativeFrame &frame) {
       pending_counter_writes_.erase(instruction_id);
       pending_fp_.erase(instruction_id);
     }
+    terminal_wfis_.erase(instruction_id);
     allocations_.erase(allocation);
     for (auto attempt = unresolved_samples_.begin(); attempt != unresolved_samples_.end();)
       if (attempt->first.first == instruction_id)
@@ -431,9 +466,12 @@ CheckResult NativeCollector::capture_terminations(const NativeFrame &frame) {
     if (allocation == allocations_.end() || allocation->second.rob.index != squash.rob_index ||
         allocation->second.rob.generation != squash.identity.rob_generation)
       return invalid("BOOM squash has no matching live ROB generation");
-    auto result = adapter_.squash(instruction_id, allocation->second.rob, capture_source(frame.cycle));
-    if (!result)
-      return result;
+    if (!terminal_wfis_.count(instruction_id)) {
+      auto result = adapter_.squash(instruction_id, allocation->second.rob, capture_source(frame.cycle));
+      if (!result)
+        return result;
+    }
+    terminal_wfis_.erase(instruction_id);
     pending_counter_writes_.erase(instruction_id);
     pending_fp_.erase(instruction_id);
     allocations_.erase(allocation);
@@ -569,6 +607,41 @@ CheckResult NativeCollector::audit_reference_store(const ReferenceStoreAudit &re
   if (result.status == CheckStatus::Pending)
     return result;
   return remember_failure(result);
+}
+
+CheckResult NativeCollector::certify_parked_wfi_terminal(const ProbeIdentity &owner, uint64_t pc,
+                                                         uint64_t source_cycle) {
+  if (!failure_)
+    return failure_;
+  if (!captured_cycle_ || !closed_cycle_ || *captured_cycle_ != *closed_cycle_ ||
+      source_cycle != *captured_cycle_ || !queues_empty_ || !cache_idle_ ||
+      !staged_events_.empty() || !staged_retirements_.empty() || !unresolved_samples_.empty() ||
+      !pending_csr_.empty() || !pending_counter_writes_.empty() || !pending_fp_.empty() ||
+      !skipped_device_stores_.empty() || adapter_.live_instructions())
+    return incomplete("BOOM terminal WFI cannot close while source, cache or older instructions remain live");
+  if (!owner.uid || owner.epoch != configuration_.epoch ||
+      std::find(configuration_.terminal_wfi_pcs.begin(), configuration_.terminal_wfi_pcs.end(), pc) ==
+          configuration_.terminal_wfi_pcs.end())
+    return invalid("BOOM terminal WFI certificate is not an expected ELF owner and PC");
+  if (certified_terminal_wfi_) {
+    if (!same_terminal_owner(certified_terminal_wfi_->owner, owner) || certified_terminal_wfi_->pc != pc ||
+        !terminal_wfis_.empty() || !allocations_.empty())
+      return invalid("BOOM certified terminal WFI changed identity or regained a live instruction");
+    return {};
+  }
+  const auto it = terminal_wfis_.find(id(owner));
+  if (terminal_wfis_.size() != 1 || allocations_.size() != 1 || it == terminal_wfis_.end())
+    return incomplete("BOOM physically parked WFI is not the only live instruction");
+  const auto &held = it->second;
+  const auto &allocation = held.allocation;
+  if (!same_terminal_owner(held.identity, owner) || allocation.rob.generation != owner.rob_generation ||
+      allocation.pc != pc ||
+      allocation.instruction != 0x10500073 || allocation.ldq || allocation.stq)
+    return invalid("BOOM parked WFI does not match its held ELF/ROB identity");
+  allocations_.erase(it->first);
+  terminal_wfis_.erase(it);
+  certified_terminal_wfi_ = CertifiedTerminalWfi{owner, pc};
+  return {};
 }
 
 CheckResult NativeCollector::completion() const {
