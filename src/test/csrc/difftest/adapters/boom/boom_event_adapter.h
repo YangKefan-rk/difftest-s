@@ -220,6 +220,10 @@ public:
   CheckResult publish_store(const StorePublication &record);
   CheckResult publish_merged_stores(const MergedStorePublication &record);
   CheckResult retire(const Retirement &record);
+  // An exception consumes its ROB owner, but is not an invented regular
+  // instruction retirement and cannot carry a coherent memory operation.
+  CheckResult trap(const OperationId &id, const SlotGeneration &rob, uint64_t pc,
+                   uint64_t cause, const EventSource &source);
   CheckResult audit_reference_store(CheckerEventConsumer &consumer, const ReferenceStoreAudit &record);
   // Checks an independent REF store without requiring access to a session's
   // private consumer. The common session must still perform its own audit.

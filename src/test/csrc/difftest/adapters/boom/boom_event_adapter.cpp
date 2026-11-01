@@ -849,6 +849,35 @@ CheckResult BoomEventAdapter::publish_merged_stores(const MergedStorePublication
   return {};
 }
 
+CheckResult BoomEventAdapter::trap(const OperationId &id, const SlotGeneration &rob, uint64_t pc,
+                                  uint64_t cause, const EventSource &source) {
+  auto result = validate_id(id);
+  if (!result) return result;
+  result = owned_slot(rob_, rob, id);
+  if (!result) return result;
+  const auto it = instructions_.find(id);
+  if (it == instructions_.end() || it->second.retired || id.uid <= last_retired_uid_ ||
+      it->second.allocation.pc != pc)
+    return invalid("BOOM trap has no unique live ROB owner in architectural order");
+  const auto &record = it->second;
+  if (record.allocation.ldq || record.allocation.stq || record.store || record.atomic_applied ||
+      record.skipped_device_store || !record.attempts.empty())
+    return unsupported("BOOM faulting memory instruction needs a separate precise-effect certificate");
+  for (const auto &older : instructions_)
+    if (older.first.hart == id.hart && older.first.epoch == id.epoch &&
+        older.first.uid < id.uid && !older.second.retired)
+      return pending("BOOM trap awaits an older live instruction to retire or squash");
+  const bool interrupt = (cause >> 63) != 0;
+  if (interrupt || (cause != 2 && cause != 3 && cause != 8 && cause != 9 && cause != 11))
+    return unsupported("BOOM trap cause lacks a checked synchronous scalar exception profile");
+  result = append(source, RuntimeEventKind::Trap, TrapEvent{id.hart, id, pc, cause, interrupt});
+  if (!result) return result;
+  last_retired_uid_ = id.uid;
+  release_slot(rob_, rob);
+  instructions_.erase(it);
+  return {};
+}
+
 CheckResult BoomEventAdapter::retire(const Retirement &record) {
   auto result = validate_id(record.id);
   if (!result)

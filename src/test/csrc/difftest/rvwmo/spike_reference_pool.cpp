@@ -53,6 +53,14 @@ ObservationSession::ReferenceStepper SpikeReferencePool::callback() {
   return stepper_->callback();
 }
 
+ObservationSession::TrapStepper SpikeReferencePool::trap_callback() {
+  if (!configuration_ || !stepper_) {
+    const auto failure = configuration_;
+    return [failure](const TrapEvent &, const ArchitecturalTrap &) { return failure; };
+  }
+  return stepper_->trap_callback();
+}
+
 const difftest_ref_profile_v1 *SpikeReferencePool::profile(uint32_t hart) const {
   return configuration_ && stepper_ ? stepper_->profile(hart) : nullptr;
 }

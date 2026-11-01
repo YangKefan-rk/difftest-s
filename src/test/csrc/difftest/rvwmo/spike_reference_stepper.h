@@ -23,6 +23,7 @@ public:
   CheckResult initialize_hart(uint32_t hart, const difftest_ref_state_v1 &initial_state);
   const difftest_ref_profile_v1 *profile(uint32_t hart) const;
   ObservationSession::ReferenceStepper callback();
+  ObservationSession::TrapStepper trap_callback();
 
 private:
   struct LoadRequest {
@@ -38,6 +39,7 @@ private:
     difftest_ref_profile_id_v1 profile_id{};
     bool initialized = false;
     bool callbacks_installed = false;
+    bool trap_observer_installed = false;
     bool active = false;
     bool poisoned = false;
     CheckResult failure;
@@ -46,6 +48,8 @@ private:
     CheckStatus callback_status = CheckStatus::Invalid;
     std::string callback_error;
     bool observed_instruction = false;
+    bool observed_trap = false;
+    uint64_t trap_pc = 0, trap_cause = 0, trap_tval = 0;
     uint64_t observed_pc = 0;
     uint32_t observed_raw = 0;
     bool wrote_integer = false;
@@ -59,9 +63,11 @@ private:
   ReferenceStepResult skip_device_store(const InstructionRetireEvent &retirement,
                                         const ArchitecturalRetirement &snapshot);
 
+  CheckResult step_trap(const TrapEvent &trap, const ArchitecturalTrap &snapshot);
   ReferenceStepResult step(const InstructionRetireEvent &retirement, const ArchitecturalRetirement &snapshot,
                            const std::vector<ReferenceLoadValue> &modeled_loads);
   static bool read_modeled_load(void *context, uint64_t address, size_t size, uint8_t *bytes);
+  static void observe_trap(void *context, uint64_t pc, uint64_t cause, uint64_t tval);
   static void observe_retirement(void *context, uint64_t pc, uint32_t instruction, uint8_t wrote_integer,
                                  uint8_t destination, uint64_t value);
   static CheckResult collect_loads(const InstructionRetireEvent &retirement,

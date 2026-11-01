@@ -76,6 +76,11 @@ HostSession::HostSession(GlobalMem &memory, HostSessionConfiguration configurati
     failure_ = references_.configuration();
     return;
   }
+  if (configuration_.check_boom_traps &&
+      (configuration_.platform != "boom" || configuration_.reference_profile != DIFFTEST_REF_PROFILE_ID_BOOM)) {
+    failure_ = invalid("precise trap verification requires the BOOM reference profile");
+    return;
+  }
   if (configuration_.platform.empty() || configuration_.verification_scope.empty() ||
       configuration_.stream.required_producers.empty()) {
     failure_ = invalid("host session needs a platform name and explicit required producer roster");
@@ -120,6 +125,8 @@ HostSession::HostSession(GlobalMem &memory, HostSessionConfiguration configurati
         }
         return result;
       });
+  if (configuration_.check_boom_traps)
+    session_->set_trap_stepper(references_.trap_callback());
 }
 
 bool HostSession::registered_hart(uint32_t hart) const {
@@ -140,6 +147,8 @@ CheckResult HostSession::validate_batch(const EventBatch &batch) const {
       return invalid("host event kind differs from its typed payload");
     if (drained_producers_.count(event.producer_id))
       return invalid("event arrived after its source was declared drained");
+    if (event.kind == RuntimeEventKind::Trap && !configuration_.check_boom_traps)
+      return {CheckStatus::Unsupported, 0, "trap event requires an opt-in precise BOOM reference profile"};
     if (event.kind == RuntimeEventKind::StorePublish && event.producer_id < kMemoryFabricProducerBase)
       return invalid("store publication is not on a registered fabric source channel");
     // This session models initialized RAM only. Device writes require a
@@ -190,7 +199,8 @@ CheckResult HostSession::validate_batch(const EventBatch &batch) const {
 }
 
 SessionSubmitResult HostSession::submit(const EventBatch &batch,
-                                        const std::vector<ArchitecturalRetirement> &retirements) {
+                                        const std::vector<ArchitecturalRetirement> &retirements,
+                                        const std::vector<ArchitecturalTrap> &traps) {
   SessionSubmitResult output;
   if (!failure_) {
     output.check = failure_;
@@ -207,12 +217,18 @@ SessionSubmitResult HostSession::submit(const EventBatch &batch,
         checked = invalid("architectural snapshot names an unregistered hart");
         break;
       }
+  if (checked)
+    for (const auto &trap : traps)
+      if (!registered_hart(trap.id.hart)) {
+        checked = invalid("physical trap snapshot names an unregistered hart");
+        break;
+      }
   if (!checked) {
     output.check = reject(checked);
     return output;
   }
   try {
-    output = session_->submit(batch, retirements);
+    output = session_->submit(batch, retirements, traps);
     if (output.accepted) {
       for (const auto &watermark : batch.watermarks)
         source_watermarks_[watermark.producer_id] = watermark.closed_through;
@@ -320,7 +336,8 @@ CheckResult HostSession::finalize(uint64_t completed_cycle) {
     if (executed == statistics.end() || executed->second.retired_instructions == 0 ||
         executed->second.skipped_device_stores > executed->second.retired_instructions ||
         executed->second.reference_steps !=
-            executed->second.retired_instructions - executed->second.skipped_device_stores ||
+            executed->second.retired_instructions - executed->second.skipped_device_stores +
+            executed->second.checked_traps ||
         executed->second.architecture_compared !=
             executed->second.retired_instructions - executed->second.skipped_device_stores)
       return reject(incomplete("required hart lacks a checked retirement or explicitly counted device exclusion"));
@@ -353,8 +370,10 @@ std::string HostSession::final_report() const {
       if (found != session_->memory_statistics().end()) memory_statistics = found->second;
     }
     output << "{\"hart\":" << hart << ",\"dut_retired\":" << statistics.retired_instructions
-           << ",\"ref_steps\":" << statistics.reference_steps
-           << ",\"arch_compares\":" << statistics.architecture_compared
+           << ",\"ref_steps\":" << statistics.reference_steps;
+    if (configuration_.check_boom_traps)
+      output << ",\"checked_traps\":" << statistics.checked_traps;
+    output << ",\"arch_compares\":" << statistics.architecture_compared
            << ",\"excluded_device_store_skips\":" << statistics.skipped_device_stores
            << ",\"accepted_load_operations\":" << statistics.retired_load_operations
            << ",\"accepted_store_operations\":" << statistics.retired_store_operations

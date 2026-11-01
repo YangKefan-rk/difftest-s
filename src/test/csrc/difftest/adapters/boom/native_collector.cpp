@@ -69,13 +69,12 @@ CaptureResult NativeCollector::capture(const NativeFrame &frame) {
       frame.completions.size() + frame.local_stores.size() + frame.retirements.size() +
       2 * atomic_retirements + frame.store_releases.size() + frame.squashes.size() +
       frame.publications.size() + frame.merged_publications.size() + frame.atomic_applied.size() +
-      frame.csr_post.has_value() + frame.csr_write_post.has_value() + frame.fp_posts.size();
+      frame.csr_post.has_value() + frame.csr_write_post.has_value() + frame.fp_posts.size() +
+      frame.trap.has_value() + frame.trap_post.has_value();
   if (facts > configuration_.staged_events - std::min(configuration_.staged_events, staged_events_.size()))
     return {pending("BOOM source staging is full; retain the complete frame and drain before retrying"), false};
   if (facts > std::numeric_limits<uint64_t>::max() - capture_sequence_)
     return {remember_failure(invalid("BOOM capture sequence exhausted")), false};
-  if (frame.trap)
-    return {remember_failure({CheckStatus::Unsupported, 0, "BOOM trap requires the common trap-state consumer"}), false};
   auto result = capture_frame(frame);
   if (!result) {
     // A frame may already have applied earlier native facts. It cannot be
@@ -102,6 +101,8 @@ CheckResult NativeCollector::require_checked_ram(uint64_t address, size_t bytes)
 }
 
 CheckResult NativeCollector::capture_frame(const NativeFrame &frame) {
+  auto trap_result = capture_trap_post(frame);
+  if (!trap_result) return trap_result;
   if (configuration_.check_csr_post && frame.csr_post) {
     const auto &post = *frame.csr_post;
     const OperationId id{configuration_.hart, post.identity.epoch, post.identity.uid, 0};
@@ -195,7 +196,7 @@ CheckResult NativeCollector::capture_frame(const NativeFrame &frame) {
       return result;
   }
   result = capture_retirements(frame);
-  if (!result || !(result = capture_terminations(frame)))
+  if (!result || !(result = capture_trap_begin(frame)) || !(result = capture_terminations(frame)))
     return result;
   for (const auto &publication : frame.publications) {
     if (publication.source.position.cycle > frame.cycle)
@@ -368,6 +369,18 @@ CheckResult NativeCollector::capture_retirements(const NativeFrame &frame) {
         core.instruction != allocation->second.instruction ||
         core.uses_ldq != allocation->second.ldq.has_value() || core.uses_stq != allocation->second.stq.has_value())
       return invalid("BOOM physical retirement differs from its retained core/ROB allocation");
+    // ECALL/EBREAK may retire physically before the precise exception edge.
+    // Do not step REF or free the ROB owner until its matching trap post-state.
+    const bool system_trap = core.architectural &&
+        (core.instruction == 0x00000073 || core.instruction == 0x00100073);
+    if (system_trap) {
+      if (pending_system_ || pending_trap_ || core.uses_ldq || core.uses_stq || core.atomic)
+        return invalid("BOOM ECALL/EBREAK retired without an isolated physical ROB owner");
+      pending_system_ = PendingSystem{core, frame.cycle};
+      continue;
+    }
+    if (pending_system_)
+      return invalid("BOOM newer instruction retired before held ECALL/EBREAK trap boundary");
     const bool terminal_wfi = terminal_wfis_.count(instruction_id) != 0;
     if (terminal_wfi && core.architectural)
       return incomplete("BOOM terminal WFI retired instead of remaining physically parked");
@@ -454,6 +467,76 @@ CheckResult NativeCollector::capture_retirements(const NativeFrame &frame) {
   return {};
 }
 
+CheckResult NativeCollector::capture_trap_begin(const NativeFrame &frame) {
+  if (!frame.trap) {
+    if (pending_system_ && frame.cycle > pending_system_->retirement_cycle &&
+        frame.cycle - pending_system_->retirement_cycle > 3)
+      return incomplete("BOOM retired ECALL/EBREAK never produced its precise physical trap");
+    return {};
+  }
+  if (!frame.trap_post_probe_available)
+    return {CheckStatus::Unsupported, 0, "BOOM physical trap lacks a UID-linked CSR post-state probe"};
+  const auto &trap = *frame.trap;
+  const auto instruction_id = id(trap.identity);
+  const auto owner = allocations_.find(instruction_id);
+  if (pending_trap_ || pending_fault_rollback_ || owner == allocations_.end() || trap.source_cycle != frame.cycle ||
+      trap.pc != owner->second.pc || trap.identity.rob_generation != owner->second.rob.generation)
+    return invalid("BOOM physical trap has no unique live instruction/ROB owner");
+  if (pending_system_) {
+    if (!same_instruction(pending_system_->core.identity, trap.identity) ||
+        pending_system_->core.pc != trap.pc ||
+        (pending_system_->core.instruction == 0x00100073 && trap.cause != 3) ||
+        (pending_system_->core.instruction == 0x00000073 &&
+         trap.cause != 8 && trap.cause != 9 && trap.cause != 11))
+      return invalid("BOOM ECALL/EBREAK trap UID, PC or cause differs from its retired owner");
+  } else if (trap.cause != 2) {
+    return {CheckStatus::Unsupported, 0, "BOOM trap without a paired system retire is not a checked illegal instruction"};
+  }
+  pending_trap_ = trap;
+  return {};
+}
+
+CheckResult NativeCollector::capture_trap_post(const NativeFrame &frame) {
+  if (!pending_trap_)
+    return frame.trap_post ? invalid("BOOM trap post-state has no preceding physical trap") : CheckResult{};
+  const auto &trap = *pending_trap_;
+  if (trap.source_cycle == UINT64_MAX || frame.cycle <= trap.source_cycle)
+    return invalid("BOOM trap post-state arrived before its physical exception edge");
+  if (frame.cycle == trap.source_cycle + 1)
+    return frame.trap_post ? invalid("BOOM trap post-state arrived one cycle too early") : CheckResult{};
+  if (frame.cycle != trap.source_cycle + 2 || !frame.trap_post)
+    return incomplete("BOOM precise trap lacks the immediate two-cycle CSR/redirect post-state");
+  const auto &post = *frame.trap_post;
+  const auto instruction_id = id(trap.identity);
+  const auto allocation = allocations_.find(instruction_id);
+  if (allocation == allocations_.end() || !same_instruction(post.identity, trap.identity) ||
+      post.source_cycle != trap.source_cycle || post.pc != trap.pc || post.cause != trap.cause ||
+      post.target_pc % 2 || (post.privilege != 1 && post.privilege != 3))
+    return invalid("BOOM trap post-state UID, timing, PC, cause, target or privilege is inconsistent");
+  if (post.privilege == 3 ? (post.mepc != trap.pc || post.mcause != trap.cause)
+                          : (post.sepc != trap.pc || post.scause != trap.cause))
+    return {CheckStatus::Violation, 0, "BOOM trap CSR EPC/cause differs from its physical fault"};
+  const bool physically_retired = pending_system_.has_value();
+  if (!physically_retired && (allocation->second.instruction != 0 ||
+                              trap.source_cycle > UINT64_MAX - 3))
+    return {CheckStatus::Unsupported, 0, "BOOM illegal trap lacks a bounded precise rollback owner"};
+  auto recorded = adapter_.trap(instruction_id, allocation->second.rob, trap.pc, trap.cause,
+                                capture_source(trap.source_cycle));
+  if (!recorded) return recorded;
+  ArchitecturalTrap snapshot{instruction_id, allocation->second.instruction, post.pc, post.cause, post.target_pc, post.privilege,
+      post.mstatus, post.mepc, post.mcause, post.mtval, post.sepc, post.scause, post.stval,
+      physically_retired};
+  if (!staged_traps_.emplace(instruction_id, snapshot).second)
+    return invalid("BOOM physical trap post-state repeats its architectural UID");
+  if (!physically_retired)
+    pending_fault_rollback_ = PendingFaultRollback{trap.identity, allocation->second.rob.index,
+                                                    trap.source_cycle + 3};
+  allocations_.erase(allocation);
+  pending_trap_.reset();
+  pending_system_.reset();
+  return {};
+}
+
 CheckResult NativeCollector::capture_terminations(const NativeFrame &frame) {
   for (const auto &release : frame.store_releases) {
     auto result = adapter_.release_store_slot(id(release.identity), {release.queue_index, release.identity.memory_generation});
@@ -461,8 +544,26 @@ CheckResult NativeCollector::capture_terminations(const NativeFrame &frame) {
       return result;
   }
   for (const auto &squash : frame.squashes) {
+    if (pending_fault_rollback_ &&
+        same_instruction(squash.identity, pending_fault_rollback_->identity)) {
+      if (!squash.rollback || squash.rob_index != pending_fault_rollback_->rob_index ||
+          frame.cycle != pending_fault_rollback_->cycle ||
+          allocations_.count(id(squash.identity)))
+        return invalid("BOOM fault owner rollback has wrong ROB, cycle or identity");
+      pending_fault_rollback_.reset();
+      continue;
+    }
     const auto instruction_id = id(squash.identity);
     auto allocation = allocations_.find(instruction_id);
+    if (pending_trap_ && same_instruction(squash.identity, pending_trap_->identity)) {
+      if (!squash.rollback || allocation == allocations_.end() ||
+          allocation->second.rob.index != squash.rob_index ||
+          allocation->second.rob.generation != squash.identity.rob_generation)
+        return invalid("BOOM fault owner squash differs from its physical ROB trap");
+      continue;
+    }
+    if (pending_system_ && same_instruction(squash.identity, pending_system_->core.identity))
+      return invalid("BOOM held ECALL/EBREAK was squashed before its matching trap");
     if (allocation == allocations_.end() || allocation->second.rob.index != squash.rob_index ||
         allocation->second.rob.generation != squash.identity.rob_generation)
       return invalid("BOOM squash has no matching live ROB generation");
@@ -481,6 +582,8 @@ CheckResult NativeCollector::capture_terminations(const NativeFrame &frame) {
       else
         ++attempt;
   }
+  if (pending_fault_rollback_ && frame.cycle >= pending_fault_rollback_->cycle)
+    return incomplete("BOOM precise illegal trap lacks its immediate physical ROB rollback");
   return {};
 }
 
@@ -510,6 +613,21 @@ CheckResult NativeCollector::take_ready(CollectedObservations &output) {
   if (!captured_cycle_)
     return pending("BOOM collector has not captured a complete source edge");
   uint64_t through = *captured_cycle_;
+  if (pending_system_) {
+    if (!pending_system_->retirement_cycle)
+      return incomplete("BOOM system trap retirement at cycle zero cannot close a prefix");
+    through = std::min(through, pending_system_->retirement_cycle - 1);
+  }
+  if (pending_fault_rollback_) {
+    if (pending_fault_rollback_->cycle < 4)
+      return incomplete("BOOM fault owner rollback cannot close a cycle-zero prefix");
+    through = std::min(through, pending_fault_rollback_->cycle - 4);
+  }
+  if (pending_trap_) {
+    if (!pending_trap_->source_cycle)
+      return incomplete("BOOM trap at cycle zero cannot close a prefix");
+    through = std::min(through, pending_trap_->source_cycle - 1);
+  }
   for (const auto &csr : pending_csr_) {
     if (!csr.second.after) {
       if (!csr.second.retirement_cycle)
@@ -551,6 +669,13 @@ CheckResult NativeCollector::take_ready(CollectedObservations &output) {
       if (next_sequence == std::numeric_limits<uint64_t>::max())
         return remember_failure(invalid("BOOM public source sequence exhausted"));
       converted.source.producer_sequence = ++next_sequence;
+    }
+    if (event.kind == RuntimeEventKind::Trap) {
+      const auto &trapped = std::get<TrapEvent>(event.payload);
+      const auto snapshot = staged_traps_.find(trapped.instruction);
+      if (snapshot == staged_traps_.end())
+        return remember_failure(incomplete("BOOM trap lacks its matched physical post-state snapshot"));
+      ready.traps.push_back(snapshot->second);
     }
     if (event.kind == RuntimeEventKind::InstructionRetire) {
       const auto &retired = std::get<InstructionRetireEvent>(event.payload).instruction;
@@ -594,6 +719,8 @@ CheckResult NativeCollector::take_ready(CollectedObservations &output) {
     pending_csr_.erase(id);
   for (const auto &id : converted_fp)
     pending_fp_.erase(id);
+  for (const auto &trap : ready.traps)
+    staged_traps_.erase(trap.id);
   emitted_sequence_ = next_sequence;
   closed_cycle_ = through;
   output = std::move(ready);
@@ -616,7 +743,7 @@ CheckResult NativeCollector::certify_parked_wfi_terminal(const ProbeIdentity &ow
   if (!captured_cycle_ || !closed_cycle_ || *captured_cycle_ != *closed_cycle_ ||
       source_cycle != *captured_cycle_ || !queues_empty_ || !cache_idle_ ||
       !staged_events_.empty() || !staged_retirements_.empty() || !unresolved_samples_.empty() ||
-      !pending_csr_.empty() || !pending_counter_writes_.empty() || !pending_fp_.empty() ||
+      !pending_csr_.empty() || !pending_counter_writes_.empty() || !pending_fp_.empty() || pending_system_ || pending_trap_ || pending_fault_rollback_ || !staged_traps_.empty() ||
       !skipped_device_stores_.empty() || adapter_.live_instructions())
     return incomplete("BOOM terminal WFI cannot close while source, cache or older instructions remain live");
   if (!owner.uid || owner.epoch != configuration_.epoch ||
@@ -650,7 +777,7 @@ CheckResult NativeCollector::completion() const {
   if (!captured_cycle_ || !closed_cycle_ || *closed_cycle_ != *captured_cycle_ ||
       !staged_events_.empty() || !staged_retirements_.empty() || !unresolved_samples_.empty() ||
       !allocations_.empty() || !pending_csr_.empty() || !pending_counter_writes_.empty() ||
-      !pending_fp_.empty() || !queues_empty_ || !cache_idle_)
+      !pending_fp_.empty() || pending_system_ || pending_trap_ || pending_fault_rollback_ || !staged_traps_.empty() || !queues_empty_ || !cache_idle_)
     return incomplete("BOOM source, instruction or cache observations have not drained");
   return adapter_.completion();
 }

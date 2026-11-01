@@ -21,6 +21,8 @@ struct HostSessionConfiguration {
   std::vector<difftest_ref_state_v1> initial_harts;
   // Opt-in device writes are excluded from RAM/PPO and counted, not compared.
   bool skip_device_stores = false;
+  // Require an exact physical trap snapshot and Spike post-trap comparison.
+  bool check_boom_traps = false;
   // Optional private-adapter bookkeeping over independently computed REF stores.
   // It must finish synchronously; it cannot change the REF result or memory.
   std::function<CheckResult(const ReferenceStoreValue &)> reference_store_observer;
@@ -49,7 +51,8 @@ public:
   HostSession(GlobalMem &memory, HostSessionConfiguration configuration);
   const CheckResult &configuration() const { return failure_; }
   SessionSubmitResult submit(const EventBatch &batch,
-                             const std::vector<ArchitecturalRetirement> &retirements = {});
+                             const std::vector<ArchitecturalRetirement> &retirements = {},
+                             const std::vector<ArchitecturalTrap> &traps = {});
   CheckResult complete_hart(const HartCompletion &completion);
   CheckResult drain_producer(const ProducerDrain &drain);
   CheckResult poll();

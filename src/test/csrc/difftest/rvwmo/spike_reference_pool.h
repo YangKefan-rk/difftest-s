@@ -22,6 +22,7 @@ public:
 
   const CheckResult &configuration() const { return configuration_; }
   ObservationSession::ReferenceStepper callback();
+  ObservationSession::TrapStepper trap_callback();
   const difftest_ref_profile_v1 *profile(uint32_t hart) const;
   size_t hart_count() const { return references_.size(); }
 

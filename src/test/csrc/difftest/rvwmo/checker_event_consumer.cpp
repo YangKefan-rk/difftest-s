@@ -697,6 +697,38 @@ CheckResult CheckerEventConsumer::consume_squash(const InstructionSquashEvent &e
   return {};
 }
 
+CheckResult CheckerEventConsumer::prepare_trap(const TrapEvent &event) const {
+  if (event.instruction.hart != event.hart || event.instruction.subaccess || event.interrupt)
+    return unsupported("trap boundary needs a supported synchronous scalar exception");
+  const auto found = allocations_.find(event.instruction);
+  if (found == allocations_.end() || found->second.pc != event.pc)
+    return invalid("trap boundary lacks matching live allocation and physical PC");
+  for (const auto &older : allocations_)
+    if (older.first.hart == event.hart && older.first.epoch == event.instruction.epoch &&
+        older.first.uid < event.instruction.uid)
+      return {CheckStatus::Pending, 0, "trap awaits an older live architectural owner"};
+  if (std::any_of(stores_.begin(), stores_.end(), [&](const auto &store) {
+        return same_parent(store.first, event.instruction);
+      }) || std::any_of(loads_.begin(), loads_.end(), [&](const auto &load) {
+        return same_parent(load.first.first, event.instruction);
+      }))
+    return unsupported("faulting instruction has a memory effect without precise rollback proof");
+  const auto last = last_retired_.find(event.hart);
+  if (last != last_retired_.end() &&
+      (last->second.first != event.instruction.epoch || last->second.second >= event.instruction.uid))
+    return invalid("trap boundary repeats or precedes an architectural predecessor");
+  return {};
+}
+
+CheckResult CheckerEventConsumer::consume_trap(const TrapEvent &event) {
+  auto prepared = prepare_trap(event);
+  if (!prepared) return remember_failure(prepared);
+  auto discarded = consume_squash({event.instruction});
+  if (!discarded) return discarded;
+  last_retired_[event.hart] = {event.instruction.epoch, event.instruction.uid};
+  return {};
+}
+
 CheckResult CheckerEventConsumer::consume_retire(const InstructionRetireEvent &event) {
   auto instruction = event.instruction;
   const OperationId id{instruction.hart, instruction.epoch, instruction.uid, 0};
@@ -931,9 +963,10 @@ CheckResult CheckerEventConsumer::consume_closed(const RuntimeEvent &event, bool
     return consume_retire(std::get<InstructionRetireEvent>(event.payload));
   case RuntimeEventKind::AtomicLifecycle:
     return consume_atomic(event, std::get<AtomicLifecycleEvent>(event.payload));
-  case RuntimeEventKind::HartDone:
   case RuntimeEventKind::Trap:
-    return remember_failure(unsupported("hart completion and trap events are not semantic memory events"));
+    return consume_trap(std::get<TrapEvent>(event.payload));
+  case RuntimeEventKind::HartDone:
+    return remember_failure(unsupported("hart completion is not a semantic memory event"));
   }
   return remember_failure(invalid("unknown event kind"));
 }

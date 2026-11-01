@@ -8,6 +8,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <utility>
 #include <vector>
 
@@ -34,6 +35,17 @@ struct FloatingPostState {
   bool operator==(const FloatingPostState &other) const {
     return fcsr == other.fcsr && mstatus == other.mstatus;
   }
+};
+
+// Physical BOOM exception boundary: no invented architectural retirement.
+// The reference hart must independently trap and match every observed field.
+struct ArchitecturalTrap {
+  OperationId id;
+  uint32_t instruction = 0;
+  uint64_t pc = 0, cause = 0, target_pc = 0, privilege = 0;
+  uint64_t mstatus = 0, mepc = 0, mcause = 0, mtval = 0;
+  uint64_t sepc = 0, scause = 0, stval = 0;
+  bool physically_retired = false;
 };
 
 struct ArchitecturalRetirement {
@@ -81,6 +93,7 @@ struct SessionHartStatistics {
   uint64_t reference_steps = 0;
   uint64_t architecture_compared = 0;
   uint64_t skipped_device_stores = 0;
+  uint64_t checked_traps = 0;
   // Retirement accepted by the consumer; final Pass certifies any deferred PPO
   // work. These are not counters for already completed PPO checks.
   uint64_t retired_instructions = 0;
@@ -97,13 +110,17 @@ public:
       std::function<ReferenceStepResult(const InstructionRetireEvent &, const ArchitecturalRetirement &,
                                         const std::vector<ReferenceLoadValue> &)>;
 
+  using TrapStepper = std::function<CheckResult(const TrapEvent &, const ArchitecturalTrap &)>;
+
   ObservationSession(StreamContract contract, std::vector<ProducerCapability> producers,
                     Memory::ReadGlobal read_global, Memory::WriteGlobal write_global, ReferenceStepper reference_stepper,
                     size_t max_live_instructions = 65536, size_t max_pending_retirements = 65536,
                     size_t max_harts = 4096);
 
   SessionSubmitResult submit(const EventBatch &batch,
-                             const std::vector<ArchitecturalRetirement> &retirements = {});
+                             const std::vector<ArchitecturalRetirement> &retirements = {},
+                             const std::vector<ArchitecturalTrap> &traps = {});
+  void set_trap_stepper(TrapStepper stepper) { trap_stepper_ = std::move(stepper); }
   CheckResult poll();
   CheckResult finalize(uint64_t completed_cycle);
   size_t pending_events() const { return pending_events_.size(); }
@@ -133,6 +150,9 @@ private:
   ObservationStream stream_;
   CheckerEventConsumer consumer_;
   ReferenceStepper reference_stepper_;
+  TrapStepper trap_stepper_;
+  std::map<OperationId, ArchitecturalTrap> architectural_traps_;
+  std::set<OperationId> completed_traps_;
   std::deque<PendingEvent> pending_events_;
   std::map<OperationId, ArchitecturalRetirement> architectural_retirements_;
   std::map<OperationId, ReferenceRecord> reference_records_;
@@ -151,6 +171,7 @@ private:
   CheckResult ensure_statistics_hart(uint32_t hart);
   CheckResult consume_pending_events();
   CheckResult consume_retirement(const RuntimeEvent &event, const InstructionRetireEvent &retirement);
+  CheckResult consume_trap(const RuntimeEvent &event, const TrapEvent &trap);
   CheckResult step_reference(const InstructionRetireEvent &retirement, const ArchitecturalRetirement &snapshot);
   CheckResult remember_failure(CheckResult result);
 };
