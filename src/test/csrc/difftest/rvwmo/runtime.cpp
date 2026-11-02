@@ -1207,6 +1207,16 @@ CheckResult Runtime::finish() {
   return final_check;
 }
 
+size_t Runtime::pending_atomics() const {
+  size_t pending = 0;
+  for (const auto &hart : harts_) {
+    pending += hart.atomic_inflight != nullptr;
+    for (const auto &entry : hart.atomics)
+      pending += !entry.second->verified;
+  }
+  return pending;
+}
+
 bool Runtime::print_final_statistics() {
   if (!finalized_ || !failure_ || !covered() || statistics_emitted_)
     return false;
@@ -1231,12 +1241,6 @@ bool Runtime::print_final_statistics() {
                 static_cast<unsigned long long>(memory_stats.store_audits),
                 static_cast<unsigned long long>(memory_stats.cross_hart_reads));
   }
-  size_t pending_atomics = 0;
-  for (const auto &hart : harts_) {
-    pending_atomics += hart.atomic_inflight != nullptr;
-    for (const auto &entry : hart.atomics)
-      pending_atomics += !entry.second->verified;
-  }
   const auto source = source_boundary().snapshot();
   const bool closed = source.status && source.catalog_complete && source.closed_through && !source.pending_prefixes &&
                       *source.closed_through >= last_effect_cycle_;
@@ -1249,9 +1253,55 @@ bool Runtime::print_final_statistics() {
               static_cast<unsigned long long>(checker_.pending_retirements()),
               static_cast<unsigned long long>(checker_.pending_loads()),
               static_cast<unsigned long long>(memory_.pending_stores()),
-              static_cast<unsigned long long>(pending_atomics), static_cast<unsigned>(all_done()));
+              static_cast<unsigned long long>(pending_atomics()), static_cast<unsigned>(all_done()));
   std::fflush(stdout);
   return true;
 }
+
+
+#if NUM_CORES > 1 && defined(CONFIG_DIFFTEST_SOURCEPREFIXEVENT)
+bool Runtime::print_observed_prefix_final() {
+  if (observed_prefix_emitted_ || !statistics_emitted_ || !finalized_ || !failure_ || !covered() ||
+      harts_.size() != 4 || !all_done())
+    return false;
+  for (const auto &hart : harts_)
+    if (!hart.arch_compares || !hart.ref_instructions)
+      return false;
+
+  const auto source = source_boundary().snapshot();
+  if (!source.status || !source.catalog_complete || !source.closed_through ||
+      *source.closed_through < last_effect_cycle_)
+    return false;
+  const size_t pending_events = events_.size() + source.pending_prefixes;
+  const size_t pending_retirements = checker_.pending_retirements();
+  const size_t pending_loads = checker_.pending_loads();
+  const size_t pending_stores = memory_.pending_stores();
+  const size_t atomics = pending_atomics();
+  if (pending_events || pending_retirements || pending_loads || pending_stores || atomics)
+    return false;
+
+  std::ostringstream marker;
+  marker << "RVWMO_PREFIX_FINAL_V1 {\"verdict\":\"PassObserved\","
+            "\"scope\":\"observed_prefix_only\",\"harts\":[";
+  for (unsigned hart = 0; hart < harts_.size(); ++hart) {
+    if (hart)
+      marker << ',';
+    marker << "{\"hart\":" << hart << ",\"arch_compares\":" << harts_[hart].arch_compares
+           << ",\"ref_instructions\":" << harts_[hart].ref_instructions << '}';
+  }
+  marker << "],\"watermarked\":1,\"closed_through\":" << *source.closed_through
+         << ",\"last_effect_cycle\":" << last_effect_cycle_
+         << ",\"pending_events\":" << pending_events
+         << ",\"pending_retirements\":" << pending_retirements
+         << ",\"pending_loads\":" << pending_loads
+         << ",\"pending_stores\":" << pending_stores
+         << ",\"pending_atomics\":" << atomics
+         << ",\"all_harts_done\":1,\"physical_drain_certified\":false}";
+  observed_prefix_emitted_ = true;
+  std::puts(marker.str().c_str());
+  std::fflush(stdout);
+  return true;
+}
+#endif
 
 } // namespace rvwmo

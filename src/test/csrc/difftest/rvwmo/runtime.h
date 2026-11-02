@@ -24,6 +24,9 @@ public:
   CheckResult note_reference_step(unsigned hart);
   CheckResult note_arch_compare(unsigned hart, uint64_t retired_instructions);
   bool print_final_statistics();
+#if NUM_CORES > 1 && defined(CONFIG_DIFFTEST_SOURCEPREFIXEVENT)
+  bool print_observed_prefix_final();
+#endif
   CheckResult verify_store(unsigned hart, uint64_t store_uid, uint64_t address, uint64_t data, uint8_t mask);
   CheckResult note_done(unsigned hart, int code);
   CheckResult finish();
@@ -156,6 +159,7 @@ private:
   CheckResult failure_;
   bool finalized_ = false;
   bool statistics_emitted_ = false;
+  bool observed_prefix_emitted_ = false;
   std::string ordering_pending_;
   CheckResult unsupported(const std::string &reason);
   CheckResult advance(uint64_t watermark);
@@ -166,6 +170,7 @@ private:
   void observe_write(uint64_t cycle, unsigned hart, uint64_t address, const std::vector<uint8_t> &mask);
   CheckResult allocate(unsigned hart, uint16_t rob);
   void collect_released_stores();
+  size_t pending_atomics() const;
   void timestamp(uint64_t cycle);
   static void observe_reference_instruction(void *context, uint64_t pc, uint32_t instruction);
 };
