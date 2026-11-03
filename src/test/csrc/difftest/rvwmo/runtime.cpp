@@ -1575,7 +1575,7 @@ bool Runtime::export_semantic_observed_prefix() const {
     wrote_event = true;
     json << "{\"hart\":" << hart << ",\"epoch\":" << epoch
          << ",\"source_clock\":\"difftest-source-cycle\",\"source_cycle\":" << cycle
-         << ",\"producer_id\":";
+         << ",\"source_id\":" << id << ",\"producer_id\":";
     json_string(json, source_producer_name(hart, id).c_str());
     json << ",\"producer_sequence\":" << sequence << ",\"physical_address\":"
          << address << ",\"address_is_physical\":true,\"byte_mask\":" << mask
