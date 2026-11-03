@@ -66,6 +66,9 @@ private:
     bool recorded = false;
     bool verified = false;
     bool excluded_io = false;
+    uint64_t excluded_io_address = 0;
+    uint64_t excluded_io_cycle = 0;
+    uint64_t excluded_io_mask = 0;
   };
   struct Group {
     unsigned hart = 0;
@@ -160,6 +163,15 @@ private:
     uint64_t byte_mask;
     std::vector<OperationId> members;
   };
+  struct ExcludedDeviceStore {
+    OperationId id;
+    uint64_t store_uid;
+    uint64_t pc;
+    uint32_t instruction;
+    uint64_t address;
+    uint64_t source_cycle;
+    uint64_t byte_mask;
+  };
   struct SemanticAtomicEffect {
     unsigned hart;
     uint64_t source_cycle;
@@ -196,6 +208,7 @@ private:
   bool semantic_export_enabled_ = false;
   bool semantic_export_overflow_ = false;
   bool semantic_excluded_device_store_ = false;
+  std::vector<ExcludedDeviceStore> semantic_excluded_device_stores_;
   uint64_t excluded_atomic_effect_count_ = 0;
   std::vector<SemanticAtomicEffect> semantic_atomic_effects_;
   std::vector<SemanticLoad> semantic_loads_;

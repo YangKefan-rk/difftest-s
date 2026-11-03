@@ -710,6 +710,9 @@ CheckResult Runtime::capture(const std::vector<DiffTestState *> &states) {
         // Uncached device stores have no GlobalMem/SbufferCommit. Accept only
         // a matching skipped retirement, outside coherent RAM coverage.
         store.excluded_io = true;
+        store.excluded_io_address = event.addr;
+        store.excluded_io_cycle = event.timestamp;
+        store.excluded_io_mask = event.mask;
         continue;
       }
       if (transport_watermark_ && event.timestamp <= *transport_watermark_)
@@ -1200,8 +1203,18 @@ CheckResult Runtime::after_commit(unsigned hart, RefProxy &reference) {
       for (auto uid: members->second) {
         auto store = h.stores.find(uid);
         if (store != h.stores.end() && store->second.excluded_io) {
-          if (semantic_export_enabled_)
+          if (semantic_export_enabled_) {
             semantic_excluded_device_store_ = true;
+            if (semantic_excluded_device_stores_.size() >= max_semantic_events) {
+              semantic_export_overflow_ = true;
+            } else {
+              semantic_excluded_device_stores_.push_back({store->second.id, uid, active.instruction.pc,
+                                                         active.instruction.instruction,
+                                                         store->second.excluded_io_address,
+                                                         store->second.excluded_io_cycle,
+                                                         store->second.excluded_io_mask});
+            }
+          }
           store_uids_.erase(store->second.id);
           h.stores.erase(store);
         }
@@ -1575,7 +1588,9 @@ bool Runtime::export_semantic_observed_prefix() const {
   std::ostringstream json;
   json << "{\"schema_version\":1,\"kind\":\"difftest-s-observed-prefix.v1\",\"scope\":\"observed_prefix_only\","
           "\"operation_scope\":\"scalar_load_store_only\",\"excluded_atomic_effect_count\":"
-       << excluded_atomic_effect_count_ << ",\"certification_status\":\"" << (complete ? "Complete" : "Incomplete")
+       << excluded_atomic_effect_count_ << ",\"excluded_device_store_count\":"
+       << semantic_excluded_device_stores_.size() << ",\"certification_status\":\""
+       << (complete ? "Complete" : "Incomplete")
        << "\",\"complete\":" << (complete ? "true" : "false")
        << ",\"physical_drain_certified\":false,\"source_clock\":\"difftest-source-cycle\",\"epoch\":" << epoch;
   json << ",\"case_id\":";
@@ -1650,6 +1665,18 @@ bool Runtime::export_semantic_observed_prefix() const {
     }
     json << "]}";
   }
+  json << "],\"excluded_device_stores\":[";
+  for (size_t index = 0; index < semantic_excluded_device_stores_.size(); ++index) {
+    if (index)
+      json << ',';
+    const auto &store = semantic_excluded_device_stores_[index];
+    json << "{\"hart\":" << store.id.hart << ",\"uid\":" << store.id.uid
+         << ",\"store_uid\":" << store.store_uid << ",\"pc\":" << store.pc
+         << ",\"instruction\":" << store.instruction
+         << ",\"physical_address\":" << store.address
+         << ",\"source_cycle\":" << store.source_cycle
+         << ",\"byte_mask\":" << store.byte_mask << '}';
+  }
   json << "],\"incomplete_reasons\":[";
   bool has_reason = false;
   const auto add_reason = [&](const char *reason) {
@@ -1688,6 +1715,7 @@ bool Runtime::export_semantic_observed_prefix() const {
   marker << "RVWMO_SEMANTIC_EXPORT_V1 {\"kind\":\"difftest-s-observed-prefix.v1\","
             "\"scope\":\"observed_prefix_only\",\"operation_scope\":\"scalar_load_store_only\","
             "\"excluded_atomic_effect_count\":" << excluded_atomic_effect_count_
+         << ",\"excluded_device_store_count\":" << semantic_excluded_device_stores_.size()
          << ",\"case_id\":";
   json_string(marker, case_id);
   marker << ",\"run_id\":";
