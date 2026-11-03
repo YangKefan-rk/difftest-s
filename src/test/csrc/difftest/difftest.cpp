@@ -240,8 +240,9 @@ int difftest_state() {
       Info("RVWMO scalar PPO/read-value checks passed for all participating harts\n");
 #ifdef CONFIG_DIFFTEST_SOURCEPREFIXEVENT
     const char *observed_prefix = std::getenv("DIFFTEST_S_OBSERVED_PREFIX");
-    if (observed_prefix && std::strcmp(observed_prefix, "1") == 0)
-      multicore_runtime().print_observed_prefix_final();
+    if (observed_prefix && std::strcmp(observed_prefix, "1") == 0 &&
+        multicore_runtime().print_observed_prefix_final())
+      multicore_runtime().export_semantic_observed_prefix();
 #endif
     return STATE_GOODTRAP;
   }

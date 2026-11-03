@@ -104,6 +104,35 @@ from `HostSession::final_report()`. For a whole-run verdict, adapters still
 need independent physical-idle and fully-delivered evidence for every required
 producer before calling `HostSession::drain_producer` and `finalize`.
 
+## Optional LinkNan observed-prefix semantic sidecar
+
+The legacy `Runtime` owns an independent, read-only export after
+`DIFFTEST_S_OBSERVED_PREFIX=1` produces `RVWMO_PREFIX_FINAL_V1`. Set
+`DIFFTEST_S_SEMANTIC_OUTPUT` to an absolute per-case file path; the writer
+exclusively creates it without replacing any existing case artifact. Set
+`DIFFTEST_S_SEMANTIC_CASE_ID`, `_RUN_ID`, `_ELF_SHA256`, `_BACKEND_SHA256`, and
+`_LAYOUT_SHA256` for case identity. Missing or invalid identity skips export
+without changing REF, Checker, or the observed-prefix verdict.
+
+The `difftest-s-observed-prefix.v1` JSON carries original producer
+`sourceId`/`sourceSequence`, sampled source cycles, post-TLB physical byte
+masks, and every required hart/source producer's actual closure watermark.
+Only the final retired scalar load attempt and fully retired, REF-audited
+coalesced store publication group enter `events`. Source positions are never
+replaced with checker ranks or host callback order. The source reset observer
+must see assert then deassert on all four harts before labeling epoch 1.
+Any omitted or unverifiable effect yields `complete:false` and diagnostic
+`incomplete_reasons`; no inferred load source, skipped atomic effect, invented
+qualified RTL phase, within-cycle order, or physical-drain certificate is
+included. The separate static layout must pin the shared NoC observation
+cycle and its coarse, **unordered** same-cycle interpretation.
+
+After writing, fsyncing, and reading the exact bytes back, the runtime emits
+one `RVWMO_SEMANTIC_EXPORT_V1` marker with the sidecar's SHA-256, layout hash,
+run ID, completeness, and closed-through cycle. Consumers must match this
+checker-issued attestation to the real file and pinned build/layout provenance;
+a self-declared `complete:true` sidecar alone is not trusted.
+
 ## Optional SFUZZ semantic interaction tap
 
 `ObservationSession::set_semantic_event_observer` installs an optional

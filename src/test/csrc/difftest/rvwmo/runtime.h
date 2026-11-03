@@ -26,6 +26,7 @@ public:
   bool print_final_statistics();
 #if NUM_CORES > 1 && defined(CONFIG_DIFFTEST_SOURCEPREFIXEVENT)
   bool print_observed_prefix_final();
+  bool export_semantic_observed_prefix() const;
 #endif
   CheckResult verify_store(unsigned hart, uint64_t store_uid, uint64_t address, uint64_t data, uint8_t mask);
   CheckResult note_done(unsigned hart, int code);
@@ -52,6 +53,9 @@ private:
     bool observed = false;
     bool cancelled = false;
     bool retired = false;
+    unsigned source_id = 0;
+    uint64_t source_sequence = 0;
+    uint64_t source_cycle = 0;
     std::string coverage_reason;
   };
   struct Store {
@@ -67,6 +71,8 @@ private:
     unsigned hart = 0;
     uint64_t id = 0;
     uint64_t cycle = 0;
+    unsigned source_id = 0;
+    uint64_t source_sequence = 0;
     uint64_t address = 0;
     std::vector<uint8_t> bytes;
     std::vector<uint8_t> mask;
@@ -133,6 +139,25 @@ private:
     uint64_t end_uid = 0;
     int exit_code = 0;
   };
+  struct SemanticLoad {
+    OperationId id;
+    uint32_t attempt;
+    uint64_t source_cycle;
+    unsigned source_id;
+    uint64_t source_sequence;
+    uint64_t address;
+    uint64_t byte_mask;
+  };
+  struct SemanticGroup {
+    unsigned hart;
+    uint64_t transaction_id;
+    uint64_t source_cycle;
+    unsigned source_id;
+    uint64_t source_sequence;
+    uint64_t address;
+    uint64_t byte_mask;
+    std::vector<OperationId> members;
+  };
   // Queue phases are separate from AtomicMemoryEvent lifecycle phases:
   // 1 data-read sample, 2 Sbuffer write, 3 indivisible AMO write point.
   // Overlapping cross-hart writes still require qualified hardware arbitration.
@@ -160,6 +185,13 @@ private:
   bool finalized_ = false;
   bool statistics_emitted_ = false;
   bool observed_prefix_emitted_ = false;
+  bool semantic_export_enabled_ = false;
+  bool semantic_export_overflow_ = false;
+  bool semantic_unexported_atomic_effect_ = false;
+  std::vector<SemanticLoad> semantic_loads_;
+  std::vector<SemanticGroup> semantic_groups_;
+  std::set<OperationId> retired_semantic_stores_;
+  std::set<OperationId> audited_semantic_stores_;
   std::string ordering_pending_;
   CheckResult unsupported(const std::string &reason);
   CheckResult advance(uint64_t watermark);

@@ -128,6 +128,10 @@ void SourceBoundary::receive(const SourceResetDelivery &reset) {
   }
   state.sequence = reset.sequence;
   state.source_cycle = reset.source_cycle;
+  if (reset.asserted)
+    state.saw_asserted = true;
+  else if (state.saw_asserted)
+    state.saw_deasserted_after_assertion = true;
   // A real asserted functional reset excludes source events before activation.
   // Deassertion freezes this bootstrap boundary until each producer delivers
   // its own active-clock prefix. Missing heartbeats never imply reset.
@@ -159,9 +163,25 @@ SourceBoundaryState SourceBoundary::snapshot() const {
         through = std::min(through, *closed);
     }
   result.catalog_complete = catalog_complete;
+  result.reset_epoch_verified = !resets_.empty() && std::all_of(
+      resets_.begin(), resets_.end(), [](const ResetState &reset) { return reset.saw_deasserted_after_assertion; });
   if (can_advance)
     result.closed_through = through;
   return result;
+}
+
+std::vector<SourceProducerWatermark> SourceBoundary::producer_watermarks() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  std::vector<SourceProducerWatermark> watermarks;
+  for (unsigned hart = 0; hart < harts_; ++hart)
+    for (unsigned id = 0; id < producers_per_hart_; ++id) {
+      const auto found = producers_.find({hart, id});
+      if (found == producers_.end())
+        continue;
+      const auto &source = found->second;
+      watermarks.push_back({hart, id, source.kind, source.lane, source.event_sequence, source.closed_through});
+    }
+  return watermarks;
 }
 
 SourceBoundary &source_boundary() {

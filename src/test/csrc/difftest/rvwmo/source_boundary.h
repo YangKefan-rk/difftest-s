@@ -44,6 +44,16 @@ struct SourceBoundaryState {
   size_t observed_producers = 0;
   size_t expected_producers = 0;
   bool catalog_complete = false;
+  bool reset_epoch_verified = false;
+};
+
+struct SourceProducerWatermark {
+  unsigned hart;
+  unsigned source_id;
+  unsigned kind;
+  unsigned lane;
+  uint64_t event_sequence;
+  std::optional<uint64_t> closed_through;
 };
 
 // A producer's heartbeat closes a source-time prefix only after all events
@@ -56,6 +66,7 @@ public:
   void receive(const SourcePrefixDelivery &prefix);
   void receive(const SourceResetDelivery &reset);
   SourceBoundaryState snapshot() const;
+  std::vector<SourceProducerWatermark> producer_watermarks() const;
 
 private:
   struct Prefix {
@@ -77,6 +88,8 @@ private:
     uint64_t sequence = 0;
     uint64_t source_cycle = 0;
     bool ever_active = false;
+    bool saw_asserted = false;
+    bool saw_deasserted_after_assertion = false;
     std::optional<uint64_t> startup_closed;
   };
   mutable std::mutex mutex_;

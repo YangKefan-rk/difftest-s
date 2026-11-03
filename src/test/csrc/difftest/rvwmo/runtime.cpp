@@ -2,10 +2,17 @@
 #include "dependency.h"
 #include "globalmem.h"
 #include "source_boundary.h"
+#include "sha256.h"
 #include <algorithm>
+#include <cerrno>
+#include <cctype>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fcntl.h>
 #include <limits>
 #include <sstream>
+#include <unistd.h>
 #include <utility>
 
 namespace rvwmo {
@@ -82,11 +89,87 @@ std::vector<uint8_t> mask_bytes(uint64_t mask, size_t count) {
     bytes[i] = i < 64 ? (mask >> i) & 1 : 0;
   return bytes;
 }
+constexpr size_t max_semantic_events = 100000;
+uint64_t enabled_byte_mask(const std::vector<uint8_t> &bytes) {
+  uint64_t mask = 0;
+  for (size_t byte = 0; byte < bytes.size() && byte < 64; ++byte)
+    if (bytes[byte])
+      mask |= uint64_t(1) << byte;
+  return mask;
+}
 bool overlap(uint64_t a, const std::vector<uint8_t> &am, uint64_t b, const std::vector<uint8_t> &bm) {
   for (size_t i = 0; i < am.size(); ++i)
     if (am[i] && a + i >= b && a + i - b < bm.size() && bm[a + i - b])
       return true;
   return false;
+}
+bool is_sha256(const char *value) {
+  if (!value || std::strlen(value) != 64)
+    return false;
+  for (const unsigned char *digit = reinterpret_cast<const unsigned char *>(value); *digit; ++digit)
+    if (!std::isxdigit(*digit))
+      return false;
+  return true;
+}
+void json_string(std::ostream &output, const char *value) {
+  static constexpr char hex[] = "0123456789abcdef";
+  output << '"';
+  for (const unsigned char *cursor = reinterpret_cast<const unsigned char *>(value); *cursor; ++cursor) {
+    const unsigned char character = *cursor;
+    if (character == '"' || character == '\\')
+      output << '\\' << character;
+    else if (character < 0x20)
+      output << "\\u00" << hex[character >> 4] << hex[character & 15];
+    else
+      output << character;
+  }
+  output << '"';
+}
+std::string source_producer_name(unsigned hart, unsigned source_id) {
+  return std::to_string(hart) + ':' + std::to_string(source_id);
+}
+bool create_semantic_sidecar(const char *path, const std::string &json, std::string &artifact_hash) {
+  if (!path || *path != '/')
+    return false;
+  const int descriptor = open(path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+  if (descriptor < 0)
+    return false;
+  size_t written = 0;
+  while (written < json.size()) {
+    const ssize_t count = write(descriptor, json.data() + written, json.size() - written);
+    if (count < 0 && errno == EINTR)
+      continue;
+    if (count <= 0)
+      break;
+    written += static_cast<size_t>(count);
+  }
+  bool good = written == json.size() && fsync(descriptor) == 0 && lseek(descriptor, 0, SEEK_SET) == 0;
+  if (good) {
+    Sha256 hash;
+    std::array<uint8_t, 4096> bytes{};
+    size_t read_bytes = 0;
+    while (good) {
+      const ssize_t count = read(descriptor, bytes.data(), bytes.size());
+      if (count < 0 && errno == EINTR)
+        continue;
+      if (count < 0) {
+        good = false;
+        break;
+      }
+      if (count == 0)
+        break;
+      read_bytes += static_cast<size_t>(count);
+      hash.update(bytes.data(), static_cast<size_t>(count));
+    }
+    good = good && read_bytes == json.size();
+    if (good)
+      artifact_hash = hash.finish();
+  }
+  if (close(descriptor) != 0)
+    good = false;
+  if (!good)
+    unlink(path);
+  return good;
 }
 } // namespace
 
@@ -98,7 +181,11 @@ Runtime::Runtime(unsigned harts)
             return byte;
           },
           [](uint64_t address, uint8_t byte) { update_globalmem(address, &byte, 1, 1); }),
-      checker_(memory_) {}
+      checker_(memory_) {
+  const char *output = std::getenv("DIFFTEST_S_SEMANTIC_OUTPUT");
+  const char *observed_prefix = std::getenv("DIFFTEST_S_OBSERVED_PREFIX");
+  semantic_export_enabled_ = output && *output && observed_prefix && std::strcmp(observed_prefix, "1") == 0;
+}
 
 bool Runtime::read_reference_memory(unsigned hart, uint64_t address, size_t size, uint8_t *bytes) const {
   if (hart >= harts_.size() || !bytes || !global_memory().contains(address, size))
@@ -236,6 +323,17 @@ CheckResult Runtime::complete_group(Group &group, ObservationTime time) {
   auto result =
       checker_.observe_global(group.address, group.bytes, architectural_mask, writers, completed, completion_times);
   if (accepted(result)) {
+    if (semantic_export_enabled_) {
+      if (semantic_loads_.size() + semantic_groups_.size() == max_semantic_events) {
+        semantic_export_overflow_ = true;
+      } else if (!semantic_export_overflow_) {
+        SemanticGroup record{group.hart, group.id, group.cycle, group.source_id, group.source_sequence,
+                             group.address, enabled_byte_mask(architectural_mask), {}};
+        for (const auto &member : ordered_members)
+          record.members.push_back(member.first);
+        semantic_groups_.push_back(std::move(record));
+      }
+    }
     ranks_consumed_ = completed.size();
     return {};
   }
@@ -305,6 +403,8 @@ CheckResult Runtime::observe_atomic(unsigned hart, const std::shared_ptr<Atomic>
     if (!result)
       return result;
   }
+  if (semantic_export_enabled_ && (!sc || atomic->success))
+    semantic_unexported_atomic_effect_ = true;
   atomic->observed = true;
   return {};
 }
@@ -666,6 +766,11 @@ CheckResult Runtime::capture(const std::vector<DiffTestState *> &states) {
       load->operation.load = true;
       load->operation.source_kind = ReadSourceKind::ModeledWitness;
       load->actual.assign(event.data, event.data + 16);
+#ifdef CONFIG_DIFFTEST_SOURCEPREFIXEVENT
+      load->source_id = event.sourceId;
+      load->source_sequence = event.sourceSequence;
+      load->source_cycle = event.timestamp;
+#endif
       h.loads[allocation->second] = load;
       loads_by_cycle_[event.timestamp].push_back(load);
       events_.emplace(sample_key, [this, load](ObservationTime time) { return observe(load, time); });
@@ -688,6 +793,10 @@ CheckResult Runtime::capture(const std::vector<DiffTestState *> &states) {
       group.hart = hart;
       group.id = event.groupId;
       group.cycle = event.timestamp;
+#ifdef CONFIG_DIFFTEST_SOURCEPREFIXEVENT
+      group.source_id = event.sourceId;
+      group.source_sequence = event.sourceSequence;
+#endif
       group.address = event.addr;
       group.bytes.assign(event.data, event.data + 64);
       group.mask = mask_bytes(event.mask, 64);
@@ -1092,6 +1201,25 @@ CheckResult Runtime::after_commit(unsigned hart, RefProxy &reference) {
     }
     h.last_retired_uid = instruction.uid;
   }
+  if (semantic_export_enabled_) {
+    if (active.load && !active.atomic && active.load->observed && !active.load->cancelled) {
+      if (semantic_loads_.size() + semantic_groups_.size() == max_semantic_events) {
+        semantic_export_overflow_ = true;
+      } else if (!semantic_export_overflow_) {
+        const auto &load = *active.load;
+        semantic_loads_.push_back({load.operation.id, load.operation.attempt, load.source_cycle, load.source_id,
+                                   load.source_sequence, load.operation.address,
+                                   enabled_byte_mask(load.operation.byte_mask)});
+      }
+    }
+    for (const auto &operation : active.instruction.memory)
+      if (operation.store && !operation.atomic && !operation.sc && !semantic_export_overflow_) {
+        if (retired_semantic_stores_.size() == max_semantic_events)
+          semantic_export_overflow_ = true;
+        else
+          retired_semantic_stores_.insert(operation.id);
+      }
+  }
   if (active.load) {
     h.loads.erase(active.load->operation.id);
     h.attempts.erase(active.load->operation.id);
@@ -1132,6 +1260,12 @@ CheckResult Runtime::verify_store(unsigned hart, uint64_t uid, uint64_t address,
   auto result = checker_.verify_store(store.id, reference);
   if (!result)
     return result;
+  if (semantic_export_enabled_ && !semantic_export_overflow_) {
+    if (audited_semantic_stores_.size() == max_semantic_events)
+      semantic_export_overflow_ = true;
+    else
+      audited_semantic_stores_.insert(store.id);
+  }
   store.verified = true;
   collect_released_stores();
   return {};
@@ -1298,6 +1432,225 @@ bool Runtime::print_observed_prefix_final() {
          << ",\"pending_atomics\":" << atomics
          << ",\"all_harts_done\":1,\"physical_drain_certified\":false}";
   observed_prefix_emitted_ = true;
+  std::puts(marker.str().c_str());
+  std::fflush(stdout);
+  return true;
+}
+
+bool Runtime::export_semantic_observed_prefix() const {
+  if (!semantic_export_enabled_ || !observed_prefix_emitted_ || !finalized_ || !all_done() || !failure_ || !covered())
+    return false;
+  const char *output_path = std::getenv("DIFFTEST_S_SEMANTIC_OUTPUT");
+  const char *case_id = std::getenv("DIFFTEST_S_SEMANTIC_CASE_ID");
+  const char *run_id = std::getenv("DIFFTEST_S_SEMANTIC_RUN_ID");
+  const char *elf_hash = std::getenv("DIFFTEST_S_SEMANTIC_ELF_SHA256");
+  const char *backend_hash = std::getenv("DIFFTEST_S_SEMANTIC_BACKEND_SHA256");
+  const char *layout_hash = std::getenv("DIFFTEST_S_SEMANTIC_LAYOUT_SHA256");
+  if (!output_path || *output_path != '/' || !case_id || !*case_id || !run_id || !*run_id ||
+      !is_sha256(elf_hash) || !is_sha256(backend_hash) || !is_sha256(layout_hash)) {
+    std::fprintf(stderr, "RVWMO semantic export skipped: invalid output path or case identity\n");
+    return false;
+  }
+
+  const auto source = source_boundary().snapshot();
+  if (!source.status || !source.catalog_complete || !source.closed_through || source.pending_prefixes ||
+      *source.closed_through < last_effect_cycle_)
+    return false;
+  const auto producers = source_boundary().producer_watermarks();
+  const bool complete_roster = producers.size() == source.expected_producers &&
+      std::all_of(producers.begin(), producers.end(), [&](const SourceProducerWatermark &producer) {
+        return producer.closed_through && *producer.closed_through >= last_effect_cycle_;
+      });
+  const unsigned epoch = source.reset_epoch_verified ? 1 : 0;
+  bool invalid_event_source = false;
+  bool invalid_physical_address = false;
+  bool duplicate_logical_identity = false;
+  bool missing_checked_store = false;
+  std::set<std::tuple<unsigned, unsigned, uint64_t>> used_source_positions;
+  std::set<std::tuple<unsigned, uint64_t, uint32_t, uint32_t>> used_load_ids;
+  std::set<std::pair<unsigned, uint64_t>> used_group_ids;
+  std::vector<const SemanticLoad *> checked_loads;
+  std::vector<const SemanticGroup *> checked_groups;
+  const auto source_is_recorded = [&](unsigned hart, unsigned id, uint64_t sequence, uint64_t cycle) {
+    const auto found = std::find_if(producers.begin(), producers.end(), [&](const SourceProducerWatermark &producer) {
+      return producer.hart == hart && producer.source_id == id;
+    });
+    return found != producers.end() && sequence && sequence <= found->event_sequence &&
+           found->closed_through && cycle <= *found->closed_through &&
+           used_source_positions.emplace(hart, id, sequence).second;
+  };
+  const auto physical_span_is_valid = [](uint64_t address, uint64_t mask) {
+    if (!mask || address > std::numeric_limits<uint64_t>::max() - 63)
+      return false;
+    for (unsigned byte = 0; byte < 64; ++byte)
+      if ((mask >> byte & 1) && (address % 64 + byte >= 64 || !in_pmem(address + byte)))
+        return false;
+    return true;
+  };
+  for (const auto &load : semantic_loads_) {
+    if (!source_is_recorded(load.id.hart, load.source_id, load.source_sequence, load.source_cycle)) {
+      invalid_event_source = true;
+      continue;
+    }
+    if (!load.id.uid || !physical_span_is_valid(load.address, load.byte_mask)) {
+      invalid_physical_address = true;
+      continue;
+    }
+    if (!used_load_ids.emplace(load.id.hart, load.id.uid, load.attempt, load.id.subaccess).second) {
+      duplicate_logical_identity = true;
+      continue;
+    }
+    checked_loads.push_back(&load);
+  }
+  for (const auto &group : semantic_groups_) {
+    if (!source_is_recorded(group.hart, group.source_id, group.source_sequence, group.source_cycle)) {
+      invalid_event_source = true;
+      continue;
+    }
+    if (!group.transaction_id || !physical_span_is_valid(group.address, group.byte_mask)) {
+      invalid_physical_address = true;
+      continue;
+    }
+    const bool checked = std::all_of(group.members.begin(), group.members.end(), [&](const OperationId &member) {
+      return retired_semantic_stores_.count(member) && audited_semantic_stores_.count(member);
+    });
+    if (!checked || group.members.empty()) {
+      missing_checked_store = true;
+      continue;
+    }
+    if (!used_group_ids.emplace(group.hart, group.transaction_id).second) {
+      duplicate_logical_identity = true;
+      continue;
+    }
+    checked_groups.push_back(&group);
+  }
+  const bool complete = source.reset_epoch_verified && complete_roster && !semantic_export_overflow_ &&
+                        !semantic_unexported_atomic_effect_ && !invalid_event_source &&
+                        !invalid_physical_address && !duplicate_logical_identity && !missing_checked_store;
+  std::ostringstream json;
+  json << "{\"schema_version\":1,\"kind\":\"difftest-s-observed-prefix.v1\",\"scope\":\"observed_prefix_only\","
+          "\"certification_status\":\"" << (complete ? "Complete" : "Incomplete")
+       << "\",\"complete\":" << (complete ? "true" : "false")
+       << ",\"physical_drain_certified\":false,\"source_clock\":\"difftest-source-cycle\",\"epoch\":" << epoch;
+  json << ",\"case_id\":";
+  json_string(json, case_id);
+  json << ",\"run_id\":";
+  json_string(json, run_id);
+  json << ",\"elf_sha256\":";
+  json_string(json, elf_hash);
+  json << ",\"backend_sha256\":";
+  json_string(json, backend_hash);
+  json << ",\"layout_sha256\":";
+  json_string(json, layout_hash);
+  json << ",\"closed_through\":" << *source.closed_through
+       << ",\"closed_through_cycle\":" << *source.closed_through
+       << ",\"last_effect_cycle\":" << last_effect_cycle_ << ",\"required_producers\":[";
+  for (size_t index = 0; index < producers.size(); ++index) {
+    if (index)
+      json << ',';
+    json_string(json, source_producer_name(producers[index].hart, producers[index].source_id).c_str());
+  }
+  json << "],\"producer_watermarks\":{";
+  for (size_t index = 0; index < producers.size(); ++index) {
+    if (index)
+      json << ',';
+    const auto &producer = producers[index];
+    json_string(json, source_producer_name(producer.hart, producer.source_id).c_str());
+    json << ":{\"epoch\":" << epoch << ",\"source_clock\":\"difftest-source-cycle\",\"event_sequence\":"
+         << producer.event_sequence << ",\"producer_kind\":" << producer.kind
+         << ",\"producer_lane\":" << producer.lane << ",\"closed_through_cycle\":";
+    if (producer.closed_through)
+      json << *producer.closed_through;
+    else
+      json << "null";
+    json << ",\"complete\":" << (producer.closed_through ? "true" : "false")
+         << ",\"lossless\":" << (producer.closed_through ? "true" : "false") << '}';
+  }
+  json << "},\"events\":[";
+  bool wrote_event = false;
+  const auto write_source = [&](unsigned hart, unsigned id, uint64_t sequence, uint64_t cycle, uint64_t address,
+                                uint64_t mask) {
+    if (wrote_event)
+      json << ',';
+    wrote_event = true;
+    json << "{\"hart\":" << hart << ",\"epoch\":" << epoch
+         << ",\"source_clock\":\"difftest-source-cycle\",\"source_cycle\":" << cycle
+         << ",\"producer_id\":";
+    json_string(json, source_producer_name(hart, id).c_str());
+    json << ",\"producer_sequence\":" << sequence << ",\"physical_address\":"
+         << address << ",\"address_is_physical\":true,\"byte_mask\":" << mask
+         << ",\"final_attempt\":true";
+  };
+  for (const auto *observed : checked_loads) {
+    const auto &load = *observed;
+    write_source(load.id.hart, load.source_id, load.source_sequence, load.source_cycle,
+                 load.address, load.byte_mask);
+    json << ",\"kind\":\"retired_load_sample\",\"uid\":" << load.id.uid
+         << ",\"attempt\":" << load.attempt << ",\"subaccess\":" << load.id.subaccess
+         << ",\"retired\":true}";
+  }
+  for (const auto *observed : checked_groups) {
+    const auto &group = *observed;
+    write_source(group.hart, group.source_id, group.source_sequence, group.source_cycle,
+                 group.address, group.byte_mask);
+    json << ",\"kind\":\"store_publish_group\",\"transaction_id\":" << group.transaction_id
+         << ",\"allocation_generation\":" << epoch << ",\"retired_members\":[";
+    for (size_t index = 0; index < group.members.size(); ++index) {
+      if (index)
+        json << ',';
+      const auto &member = group.members[index];
+      json << "{\"hart\":" << member.hart << ",\"uid\":" << member.uid
+           << ",\"attempt\":0,\"subaccess\":" << member.subaccess << ",\"retired\":true}";
+    }
+    json << "]}";
+  }
+  json << "],\"incomplete_reasons\":[";
+  bool has_reason = false;
+  const auto add_reason = [&](const char *reason) {
+    if (has_reason)
+      json << ',';
+    has_reason = true;
+    json_string(json, reason);
+  };
+  if (!source.reset_epoch_verified)
+    add_reason("source_reset_epoch_unverified");
+  if (!complete_roster)
+    add_reason("producer_roster_incomplete");
+  if (semantic_export_overflow_)
+    add_reason("semantic_event_limit_exceeded");
+  if (semantic_unexported_atomic_effect_)
+    add_reason("unexported_atomic_effect");
+  if (duplicate_logical_identity)
+    add_reason("duplicate_retired_operation_or_group");
+  if (invalid_event_source)
+    add_reason("event_source_identity_unverified");
+  if (missing_checked_store)
+    add_reason("store_retirement_or_ref_audit_missing");
+  if (invalid_physical_address)
+    add_reason("physical_address_unverified");
+  json << "]}\n";
+  std::string artifact_hash;
+  if (!create_semantic_sidecar(output_path, json.str(), artifact_hash)) {
+    std::fprintf(stderr, "RVWMO semantic export skipped: cannot exclusively create %s\n", output_path);
+    return false;
+  }
+  std::ostringstream marker;
+  marker << "RVWMO_SEMANTIC_EXPORT_V1 {\"kind\":\"difftest-s-observed-prefix.v1\","
+            "\"scope\":\"observed_prefix_only\",\"case_id\":";
+  json_string(marker, case_id);
+  marker << ",\"run_id\":";
+  json_string(marker, run_id);
+  marker << ",\"elf_sha256\":";
+  json_string(marker, elf_hash);
+  marker << ",\"backend_sha256\":";
+  json_string(marker, backend_hash);
+  marker << ",\"layout_sha256\":";
+  json_string(marker, layout_hash);
+  marker << ",\"artifact_sha256\":";
+  json_string(marker, artifact_hash.c_str());
+  marker << ",\"complete\":" << (complete ? "true" : "false")
+         << ",\"closed_through_cycle\":" << *source.closed_through
+         << ",\"physical_drain_certified\":false}";
   std::puts(marker.str().c_str());
   std::fflush(stdout);
   return true;
