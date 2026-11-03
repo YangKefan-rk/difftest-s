@@ -403,8 +403,24 @@ CheckResult Runtime::observe_atomic(unsigned hart, const std::shared_ptr<Atomic>
     if (!result)
       return result;
   }
-  if (semantic_export_enabled_ && (!sc || atomic->success))
-    semantic_unexported_atomic_effect_ = true;
+  if (semantic_export_enabled_) {
+    // This callback occurs only for a sampled LR or an observed RMW/SC write.
+    // The SC success response can arrive later, but finish() must verify it.
+    // A successful RMW is one audited operation, but its read and write may
+    // sample distinct original source cycles. Preserve both for overlap checks.
+    const bool separate_read_cycle = atomic->kind == AtomicKind::Rmw &&
+                                     atomic->read_source_cycle != atomic->source_cycle;
+    const size_t source_points = separate_read_cycle ? 2 : 1;
+    if (excluded_atomic_effect_count_ == std::numeric_limits<uint64_t>::max() ||
+        semantic_atomic_effects_.size() > max_semantic_events - source_points) {
+      semantic_export_overflow_ = true;
+    } else {
+      ++excluded_atomic_effect_count_;
+      semantic_atomic_effects_.push_back({hart, atomic->source_cycle, atomic->address, atomic->mask});
+      if (separate_read_cycle)
+        semantic_atomic_effects_.push_back({hart, atomic->read_source_cycle, atomic->address, atomic->mask});
+    }
+  }
   atomic->observed = true;
   return {};
 }
@@ -474,10 +490,12 @@ CheckResult Runtime::capture_atomics(unsigned hart, DiffTestState &state) {
       if (atomic->kind == AtomicKind::StoreConditional || atomic->address != event.addr || atomic->mask != event.mask)
         return invalid("atomic read operand differs from its request");
       atomic->old_data = event.data;
+      atomic->read_source_cycle = event.timestamp;
       atomic->read_seen = true;
       if (atomic->kind == AtomicKind::LoadReserved) {
         if (transport_watermark_ && event.timestamp <= *transport_watermark_)
           return invalid("LR sample arrived behind the completed watermark");
+        atomic->source_cycle = event.timestamp;
         reserved_reads_by_cycle_[event.timestamp].push_back(atomic);
         const auto key = EventKey{event.timestamp, 1, atomic->id.uid, hart};
         auto inserted = events_.emplace(key, [this, hart, atomic](ObservationTime time) {
@@ -496,6 +514,7 @@ CheckResult Runtime::capture_atomics(unsigned hart, DiffTestState &state) {
         return unsupported("atomic write range or width is not supported");
       if (transport_watermark_ && event.timestamp <= *transport_watermark_)
         return invalid("atomic write arrived behind completed transport watermark");
+      atomic->source_cycle = event.timestamp;
       atomic->new_data = event.data;
       atomic->write_seen = true;
       observe_write(event.timestamp, hart, event.addr, mask_bytes(event.mask, 8));
@@ -1524,12 +1543,29 @@ bool Runtime::export_semantic_observed_prefix() const {
     }
     checked_groups.push_back(&group);
   }
+  // An excluded atomic effect cannot share enabled bytes with a scalar effect
+  // at the same source cycle: without a hardware phase, that source interaction
+  // cannot be certified even for the scalar subset.
+  const auto overlaps_excluded_atomic = [&](uint64_t cycle, uint64_t address, uint64_t mask) {
+    return std::any_of(semantic_atomic_effects_.begin(), semantic_atomic_effects_.end(),
+                       [&](const SemanticAtomicEffect &atomic) {
+      return atomic.source_cycle == cycle && (atomic.address / 64) == (address / 64) &&
+             ((atomic.byte_mask << (atomic.address % 64)) & (mask << (address % 64)));
+    });
+  };
+  const bool atomic_scalar_overlap =
+      std::any_of(checked_loads.begin(), checked_loads.end(), [&](const SemanticLoad *load) {
+        return overlaps_excluded_atomic(load->source_cycle, load->address, load->byte_mask);
+      }) || std::any_of(checked_groups.begin(), checked_groups.end(), [&](const SemanticGroup *group) {
+        return overlaps_excluded_atomic(group->source_cycle, group->address, group->byte_mask);
+      });
   const bool complete = source.reset_epoch_verified && complete_roster && !semantic_export_overflow_ &&
-                        !semantic_unexported_atomic_effect_ && !invalid_event_source &&
-                        !invalid_physical_address && !duplicate_logical_identity && !missing_checked_store;
+                        !atomic_scalar_overlap && !invalid_event_source && !invalid_physical_address &&
+                        !duplicate_logical_identity && !missing_checked_store;
   std::ostringstream json;
   json << "{\"schema_version\":1,\"kind\":\"difftest-s-observed-prefix.v1\",\"scope\":\"observed_prefix_only\","
-          "\"certification_status\":\"" << (complete ? "Complete" : "Incomplete")
+          "\"operation_scope\":\"scalar_load_store_only\",\"excluded_atomic_effect_count\":"
+       << excluded_atomic_effect_count_ << ",\"certification_status\":\"" << (complete ? "Complete" : "Incomplete")
        << "\",\"complete\":" << (complete ? "true" : "false")
        << ",\"physical_drain_certified\":false,\"source_clock\":\"difftest-source-cycle\",\"epoch\":" << epoch;
   json << ",\"case_id\":";
@@ -1618,8 +1654,8 @@ bool Runtime::export_semantic_observed_prefix() const {
     add_reason("producer_roster_incomplete");
   if (semantic_export_overflow_)
     add_reason("semantic_event_limit_exceeded");
-  if (semantic_unexported_atomic_effect_)
-    add_reason("unexported_atomic_effect");
+  if (atomic_scalar_overlap)
+    add_reason("atomic_scalar_same_cycle_overlap");
   if (duplicate_logical_identity)
     add_reason("duplicate_retired_operation_or_group");
   if (invalid_event_source)
@@ -1636,7 +1672,9 @@ bool Runtime::export_semantic_observed_prefix() const {
   }
   std::ostringstream marker;
   marker << "RVWMO_SEMANTIC_EXPORT_V1 {\"kind\":\"difftest-s-observed-prefix.v1\","
-            "\"scope\":\"observed_prefix_only\",\"case_id\":";
+            "\"scope\":\"observed_prefix_only\",\"operation_scope\":\"scalar_load_store_only\","
+            "\"excluded_atomic_effect_count\":" << excluded_atomic_effect_count_
+         << ",\"case_id\":";
   json_string(marker, case_id);
   marker << ",\"run_id\":";
   json_string(marker, run_id);

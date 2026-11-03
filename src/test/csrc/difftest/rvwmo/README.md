@@ -118,13 +118,20 @@ The `difftest-s-observed-prefix.v1` JSON carries original producer
 `sourceId`/`sourceSequence`, sampled source cycles, post-TLB physical byte
 masks, and every required hart/source producer's actual closure watermark.
 Only the final retired scalar load attempt and fully retired, REF-audited
-coalesced store publication group enter `events`. Source positions are never
+coalesced store publication group enter `events`. `operation_scope` is
+`scalar_load_store_only` in both this sidecar and the pinned immutable layout.
+Atomic, LR, and successful SC effects remain independently checked by the
+runtime but are deliberately excluded from scalar interaction scoring; each
+accepted atomic observation contributes once to `excluded_atomic_effect_count`.
+A same-source-cycle enabled-byte overlap between an excluded atomic and scalar
+effect makes scalar completeness unavailable, since its within-cycle phase is
+unverified. Source positions are never
 replaced with checker ranks or host callback order. The source reset observer
 must see assert then deassert on all four harts before labeling epoch 1.
-Any omitted or unverifiable effect yields `complete:false` and diagnostic
-`incomplete_reasons`; no inferred load source, skipped atomic effect, invented
-qualified RTL phase, within-cycle order, or physical-drain certificate is
-included. The separate static layout must pin the shared NoC observation
+Any omitted or unverifiable **scalar** effect yields `complete:false` and
+diagnostic `incomplete_reasons`; no inferred load source, within-cycle order,
+or physical-drain certificate is included. The scalar-only scope never claims
+a complete all-memory interaction stream or an atomic read-from relation. The separate static layout must pin the shared NoC observation
 cycle and its coarse, **unordered** same-cycle interpretation.
 
 After writing, fsyncing, and reading the exact bytes back, the runtime emits

@@ -86,6 +86,8 @@ private:
     OperationId id;
     uint32_t attempt = 0;
     uint64_t address = 0;
+    uint64_t source_cycle = 0;
+    uint64_t read_source_cycle = 0;
     uint64_t old_data = 0;
     uint64_t cache_response = 0;
     bool success = false;
@@ -158,6 +160,12 @@ private:
     uint64_t byte_mask;
     std::vector<OperationId> members;
   };
+  struct SemanticAtomicEffect {
+    unsigned hart;
+    uint64_t source_cycle;
+    uint64_t address;
+    uint64_t byte_mask;
+  };
   // Queue phases are separate from AtomicMemoryEvent lifecycle phases:
   // 1 data-read sample, 2 Sbuffer write, 3 indivisible AMO write point.
   // Overlapping cross-hart writes still require qualified hardware arbitration.
@@ -187,7 +195,8 @@ private:
   bool observed_prefix_emitted_ = false;
   bool semantic_export_enabled_ = false;
   bool semantic_export_overflow_ = false;
-  bool semantic_unexported_atomic_effect_ = false;
+  uint64_t excluded_atomic_effect_count_ = 0;
+  std::vector<SemanticAtomicEffect> semantic_atomic_effects_;
   std::vector<SemanticLoad> semantic_loads_;
   std::vector<SemanticGroup> semantic_groups_;
   std::set<OperationId> retired_semantic_stores_;
