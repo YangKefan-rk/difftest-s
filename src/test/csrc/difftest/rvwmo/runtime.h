@@ -195,6 +195,7 @@ private:
   bool observed_prefix_emitted_ = false;
   bool semantic_export_enabled_ = false;
   bool semantic_export_overflow_ = false;
+  bool semantic_excluded_device_store_ = false;
   uint64_t excluded_atomic_effect_count_ = 0;
   std::vector<SemanticAtomicEffect> semantic_atomic_effects_;
   std::vector<SemanticLoad> semantic_loads_;

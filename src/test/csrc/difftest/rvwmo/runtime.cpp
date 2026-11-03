@@ -1200,6 +1200,8 @@ CheckResult Runtime::after_commit(unsigned hart, RefProxy &reference) {
       for (auto uid: members->second) {
         auto store = h.stores.find(uid);
         if (store != h.stores.end() && store->second.excluded_io) {
+          if (semantic_export_enabled_)
+            semantic_excluded_device_store_ = true;
           store_uids_.erase(store->second.id);
           h.stores.erase(store);
         }
@@ -1543,15 +1545,22 @@ bool Runtime::export_semantic_observed_prefix() const {
     }
     checked_groups.push_back(&group);
   }
-  // An excluded atomic effect cannot share enabled bytes with a scalar effect
-  // at the same source cycle: without a hardware phase, that source interaction
-  // cannot be certified even for the scalar subset.
+  // Aggregate the enabled bytes by source cycle and physical line. A
+  // scalar effect then needs one logarithmic lookup, even with many atomics.
+  std::map<std::pair<uint64_t, uint64_t>, uint64_t> atomic_mask_by_cycle_line;
+  bool invalid_atomic_span = false;
+  for (const auto &atomic : semantic_atomic_effects_) {
+    const unsigned offset = atomic.address % 64;
+    if (!atomic.byte_mask || offset + (64 - __builtin_clzll(atomic.byte_mask)) > 64) {
+      invalid_atomic_span = true;
+      continue;
+    }
+    atomic_mask_by_cycle_line[{atomic.source_cycle, atomic.address / 64}] |= atomic.byte_mask << offset;
+  }
   const auto overlaps_excluded_atomic = [&](uint64_t cycle, uint64_t address, uint64_t mask) {
-    return std::any_of(semantic_atomic_effects_.begin(), semantic_atomic_effects_.end(),
-                       [&](const SemanticAtomicEffect &atomic) {
-      return atomic.source_cycle == cycle && (atomic.address / 64) == (address / 64) &&
-             ((atomic.byte_mask << (atomic.address % 64)) & (mask << (address % 64)));
-    });
+    const auto found = atomic_mask_by_cycle_line.find({cycle, address / 64});
+    return found != atomic_mask_by_cycle_line.end() &&
+           (found->second & (mask << (address % 64))) != 0;
   };
   const bool atomic_scalar_overlap =
       std::any_of(checked_loads.begin(), checked_loads.end(), [&](const SemanticLoad *load) {
@@ -1560,7 +1569,8 @@ bool Runtime::export_semantic_observed_prefix() const {
         return overlaps_excluded_atomic(group->source_cycle, group->address, group->byte_mask);
       });
   const bool complete = source.reset_epoch_verified && complete_roster && !semantic_export_overflow_ &&
-                        !atomic_scalar_overlap && !invalid_event_source && !invalid_physical_address &&
+                        !semantic_excluded_device_store_ && !atomic_scalar_overlap && !invalid_atomic_span &&
+                        !invalid_event_source && !invalid_physical_address &&
                         !duplicate_logical_identity && !missing_checked_store;
   std::ostringstream json;
   json << "{\"schema_version\":1,\"kind\":\"difftest-s-observed-prefix.v1\",\"scope\":\"observed_prefix_only\","
@@ -1656,6 +1666,10 @@ bool Runtime::export_semantic_observed_prefix() const {
     add_reason("semantic_event_limit_exceeded");
   if (atomic_scalar_overlap)
     add_reason("atomic_scalar_same_cycle_overlap");
+  if (invalid_atomic_span)
+    add_reason("atomic_effect_crosses_cache_line");
+  if (semantic_excluded_device_store_)
+    add_reason("excluded_device_store_effect");
   if (duplicate_logical_identity)
     add_reason("duplicate_retired_operation_or_group");
   if (invalid_event_source)
