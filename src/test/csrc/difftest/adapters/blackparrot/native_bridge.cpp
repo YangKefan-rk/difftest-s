@@ -10,6 +10,7 @@
 #include <map>
 #include <memory>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <tuple>
 #include <utility>
@@ -992,6 +993,76 @@ private:
     return true;
   }
 
+  // Trace only effects accepted by the actual four-hart HostSession. The
+  // source tick is the DUT observation, not a checker/callback ordering rank.
+  void trace_accepted_interactions(const rvwmo::EventBatch &batch) {
+    if (!std::getenv("BP_DIFFTEST_S_TRACE"))
+      return;
+    for (const auto &event : batch.events) {
+      if (event.kind == rvwmo::RuntimeEventKind::LoadSample) {
+        const auto &load = std::get<rvwmo::LoadSampleEvent>(event.payload);
+        const auto &id = load.operation.id;
+        const auto found = std::find_if(capture.memory_facts.begin(), capture.memory_facts.end(),
+            [&](const auto &fact) {
+              return fact.kind == 3 && fact.id == id && fact.attempt == load.operation.attempt;
+            });
+        if (found == capture.memory_facts.end() ||
+            (found->forwarded_mask && found->forwarded_mask != found->mask &&
+             found->array_time != found->forwarding_time)) {
+          trace("INTERACTION_GAP\tload_sample_source");
+          continue;
+        }
+        const uint64_t observed_tick = found->forwarded_mask ? found->forwarding_time : found->array_time;
+        if (!observed_tick) {
+          trace("INTERACTION_GAP\tload_sample_time");
+          continue;
+        }
+        std::ostringstream line;
+        line << "LOAD_SAMPLE_ACCEPT\t" << id.hart << '\t' << id.epoch << '\t' << id.uid << '\t'
+             << load.operation.attempt << '\t' << event.source.cycle << '\t' << event.producer_id << '\t'
+             << event.source.producer_sequence << '\t' << found->address << '\t' << found->mask << '\t'
+             << observed_tick << '\t' << found->forwarded_mask << '\t' << id.subaccess;
+        trace(line.str());
+      } else if (event.kind == rvwmo::RuntimeEventKind::StorePublish) {
+        const auto &publish = std::get<rvwmo::StorePublishEvent>(event.payload);
+        if (publish.members.size() != 1 || !publish.transaction_id) {
+          trace("INTERACTION_GAP\tstore_publish_group");
+          continue;
+        }
+        const auto &member = publish.members.front().id;
+        const auto retired = std::find_if(capture.retirement_facts.begin(), capture.retirement_facts.end(),
+            [&](const auto &fact) { return fact.id == member; });
+        if (retired == capture.retirement_facts.end()) {
+          trace("INTERACTION_GAP\tstore_retirement");
+          continue;
+        }
+        const auto stored = std::find_if(capture.memory_facts.begin(), capture.memory_facts.end(),
+            [&](const auto &fact) {
+              return fact.kind == 1 && fact.id == member && fact.attempt == retired->attempt;
+            });
+        if (stored == capture.memory_facts.end() || !stored->attempt) {
+          trace("INTERACTION_GAP\tstore_attempt");
+          continue;
+        }
+        const auto span = scalar_span(stored->mask);
+        if (publish.address != stored->address + span.first || publish.bytes.size() != span.size ||
+            publish.byte_mask.size() != span.size ||
+            std::any_of(publish.byte_mask.begin(), publish.byte_mask.end(), [](uint8_t byte) { return byte != 1; })) {
+          trace("INTERACTION_GAP\tstore_physical_bytes");
+          continue;
+        }
+        std::ostringstream line;
+        line << "STORE_PUBLISH_ACCEPT\t" << member.hart << '\t' << member.epoch << '\t' << member.uid
+             << '\t' << retired->attempt << '\t' << event.source.cycle << '\t' << event.producer_id
+             << '\t' << event.source.producer_sequence << '\t' << publish.transaction_id
+             << '\t' << stored->attempt << '\t' << stored->address << '\t' << stored->mask
+             << '\t' << publish.members.size() << '\t' << member.hart << '\t' << member.epoch
+             << '\t' << member.uid << '\t' << member.subaccess;
+        trace(line.str());
+      }
+    }
+  }
+
   bool submit_online_batch(uint64_t through) {
     const auto submitted = prefix_consumer(online_batch);
     if (!submitted.accepted) {
@@ -1001,6 +1072,9 @@ private:
     }
     ++capture.summary.online_prefixes;
     capture.summary.converted_events += online_batch.batch.events.size();
+    if (submitted.check.status == rvwmo::CheckStatus::Pass ||
+        submitted.check.status == rvwmo::CheckStatus::Pending)
+      trace_accepted_interactions(online_batch.batch);
     online_batch = {};
     online_closed = through;
     if (submitted.check.status != rvwmo::CheckStatus::Pass &&
