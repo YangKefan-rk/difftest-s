@@ -122,6 +122,8 @@ HostSession::HostSession(GlobalMem &memory, HostSessionConfiguration configurati
         }
         return result;
       });
+  if (configuration_.semantic_event_observer)
+    session_->set_semantic_event_observer(configuration_.semantic_event_observer);
 }
 
 bool HostSession::registered_hart(uint32_t hart) const {
