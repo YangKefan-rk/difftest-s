@@ -542,6 +542,16 @@ CheckResult NativeCollector::capture_terminations(const NativeFrame &frame) {
           frame.cycle != pending_fault_rollback_->cycle ||
           allocations_.count(id(squash.identity)))
         return invalid("BOOM fault owner rollback has wrong ROB, cycle or identity");
+      // A faulted load can have a private begin with no data sample. Keep that
+      // source prefix open until the exact physical ROB rollback proves the
+      // attempt cannot produce a late public sample.
+      const auto instruction_id = id(squash.identity);
+      for (auto attempt = unresolved_samples_.begin(); attempt != unresolved_samples_.end();) {
+        if (attempt->first.first == instruction_id)
+          attempt = unresolved_samples_.erase(attempt);
+        else
+          ++attempt;
+      }
       pending_fault_rollback_.reset();
       continue;
     }

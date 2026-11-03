@@ -123,8 +123,9 @@ verdict. Scalar integer RAM is the current generic path; unsupported architectur
 state, LR/SC, split access, vector operations, interrupts and unmodeled MMIO must
 not be dropped. A synchronous fault is checked only after its precise physical
 ROB owner, post-trap CSR/redirect snapshot and (for non-retiring faults) rollback
-are captured. The faulting owner must have no outstanding load attempt or local,
-device, atomic or public memory effect. Spike independently steps the faulting
+are captured. An unsampled private load begin is discarded only after its
+exact fault-owner rollback; sampled loads and local, device, atomic or public
+memory effects must not be silently discarded. Spike independently steps the faulting
 instruction and checks cause, EPC, tval, privilege, redirect and register/CSR
 state; a new synchronous cause needs no BOOM-specific allowlist entry. A missing
 observation remains Incomplete or Unsupported, never a successful comparison.

@@ -860,15 +860,15 @@ CheckResult BoomEventAdapter::trap(const OperationId &id, const SlotGeneration &
       it->second.allocation.pc != pc)
     return invalid("BOOM trap has no unique live ROB owner in architectural order");
   const auto &record = it->second;
-  // Queue allocation alone is not an architectural memory effect. A fault may
-  // have claimed LDQ/STQ entries, but it must have neither an uncancelled load
-  // attempt nor a committed local, device or atomic memory effect.
+  // A fault may have claimed a queue and begun a load attempt without ever
+  // sampling data. The unsampled begin is private; a sampled attempt or any
+  // local, device, atomic or published memory effect cannot be discarded.
   if (record.store || record.atomic_local_committed || record.atomic_applied ||
       record.skipped_device_store || record.stq_released || record.published || record.audited ||
       std::any_of(record.attempts.begin(), record.attempts.end(), [](const auto &attempt) {
-        return attempt.second.state != AttemptState::Cancelled;
+        return attempt.second.state == AttemptState::Sampled;
       }))
-    return unsupported("BOOM fault has an unrolled-back load attempt or possible memory effect");
+    return unsupported("BOOM fault has a sampled load or possible memory effect");
   for (const auto &older : instructions_)
     if (older.first.hart == id.hart && older.first.epoch == id.epoch &&
         older.first.uid < id.uid && !older.second.retired)
