@@ -69,6 +69,7 @@ struct StoreCommit {
   std::vector<uint8_t> byte_mask;
   bool architecturally_committed = false;
   EventSource source;
+  uint32_t attempt = 0;
 };
 
 // These cases require a DUT-specific cache/coherence argument. A request, STQ
@@ -89,11 +90,13 @@ struct StorePublication {
   std::vector<OperationId> byte_writers;
   StorePublicationEvidence evidence = StorePublicationEvidence::Unavailable;
   EventSource source;
+  uint32_t attempt = 0;
 };
 
 struct StorePublicationMember {
   OperationId id;
   SlotGeneration stq;
+  uint32_t attempt = 0;
 };
 
 // A complete group first becomes externally visible at one indivisible cache
@@ -149,6 +152,7 @@ struct Retirement {
   IntegerDestinationType destination_type = IntegerDestinationType::None;
   uint8_t logical_destination = 0;
   uint64_t writeback_value = 0;
+  std::optional<uint32_t> store_attempt = std::nullopt;
 };
 
 struct ReferenceStoreAudit {
@@ -212,6 +216,7 @@ private:
     std::map<uint32_t, Attempt> attempts;
     std::optional<uint32_t> latest_attempt;
     std::optional<MemoryOperation> store;
+    std::optional<uint32_t> store_attempt;
     std::vector<uint8_t> store_bytes;
     bool stq_released = false;
     bool published = false;
