@@ -482,16 +482,9 @@ CheckResult NativeCollector::capture_trap_begin(const NativeFrame &frame) {
   if (pending_trap_ || pending_fault_rollback_ || owner == allocations_.end() || trap.source_cycle != frame.cycle ||
       trap.pc != owner->second.pc || trap.identity.rob_generation != owner->second.rob.generation)
     return invalid("BOOM physical trap has no unique live instruction/ROB owner");
-  if (pending_system_) {
-    if (!same_instruction(pending_system_->core.identity, trap.identity) ||
-        pending_system_->core.pc != trap.pc ||
-        (pending_system_->core.instruction == 0x00100073 && trap.cause != 3) ||
-        (pending_system_->core.instruction == 0x00000073 &&
-         trap.cause != 8 && trap.cause != 9 && trap.cause != 11))
-      return invalid("BOOM ECALL/EBREAK trap UID, PC or cause differs from its retired owner");
-  } else if (trap.cause != 2) {
-    return {CheckStatus::Unsupported, 0, "BOOM trap without a paired system retire is not a checked illegal instruction"};
-  }
+  if (pending_system_ && (!same_instruction(pending_system_->core.identity, trap.identity) ||
+                          pending_system_->core.pc != trap.pc))
+    return invalid("BOOM system trap UID or PC differs from its retired owner");
   pending_trap_ = trap;
   return {};
 }
@@ -517,9 +510,8 @@ CheckResult NativeCollector::capture_trap_post(const NativeFrame &frame) {
                           : (post.sepc != trap.pc || post.scause != trap.cause))
     return {CheckStatus::Violation, 0, "BOOM trap CSR EPC/cause differs from its physical fault"};
   const bool physically_retired = pending_system_.has_value();
-  if (!physically_retired && (allocation->second.instruction != 0 ||
-                              trap.source_cycle > UINT64_MAX - 3))
-    return {CheckStatus::Unsupported, 0, "BOOM illegal trap lacks a bounded precise rollback owner"};
+  if (!physically_retired && trap.source_cycle > UINT64_MAX - 3)
+    return incomplete("BOOM synchronous fault lacks a bounded precise rollback owner");
   auto recorded = adapter_.trap(instruction_id, allocation->second.rob, trap.pc, trap.cause,
                                 capture_source(trap.source_cycle));
   if (!recorded) return recorded;
@@ -583,7 +575,7 @@ CheckResult NativeCollector::capture_terminations(const NativeFrame &frame) {
         ++attempt;
   }
   if (pending_fault_rollback_ && frame.cycle >= pending_fault_rollback_->cycle)
-    return incomplete("BOOM precise illegal trap lacks its immediate physical ROB rollback");
+    return incomplete("BOOM precise synchronous trap lacks its immediate physical ROB rollback");
   return {};
 }
 

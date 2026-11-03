@@ -490,8 +490,7 @@ CheckResult ObservationSession::consume_trap(const RuntimeEvent &event, const Tr
     return pending("trap awaits its independent physical post-state snapshot");
   const auto &state = snapshot->second;
   if (state.id != trap.instruction || state.pc != trap.pc || state.cause != trap.cause ||
-      trap.hart != state.id.hart || trap.interrupt ||
-      (state.instruction != 0 && state.instruction != 0x00100073 && state.instruction != 0x00000073))
+      trap.hart != state.id.hart || trap.interrupt)
     return remember_failure(invalid("trap boundary differs from its physical instruction, PC or cause"));
   if (!completed_traps_.count(state.id)) {
     auto prepared = consumer_.prepare_trap(trap);

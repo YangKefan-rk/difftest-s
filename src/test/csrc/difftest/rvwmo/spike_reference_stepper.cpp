@@ -312,17 +312,15 @@ CheckResult SpikeReferenceStepper::step_trap(const TrapEvent &trap, const Archit
       trap.cause != snapshot.cause || snapshot.pc % 2 || snapshot.target_pc % 2 ||
       (snapshot.privilege != 1 && snapshot.privilege != 3))
     return invalid("trap lacks matching synchronous physical UID, PC, cause or redirect");
-  const bool illegal = snapshot.instruction == 0 && snapshot.cause == 2 && !snapshot.physically_retired;
-  const bool breakpoint = snapshot.instruction == 0x00100073 && snapshot.cause == 3 && snapshot.physically_retired;
-  const bool ecall = snapshot.instruction == 0x00000073 && snapshot.physically_retired;
-  if (!illegal && !breakpoint && !ecall)
-    return unsupported("trap profile supports only illegal word zero, EBREAK and ECALL");
+  // The physical trace identifies the faulting instruction; Spike, not a
+  // per-cause whitelist, independently decides whether and how it traps.
 
+  const size_t instruction_bytes = (snapshot.instruction & 3) == 3 ? 4 : 2;
   uint8_t bytes[4]{};
-  if (!read_independent_instruction_ || !read_independent_instruction_(snapshot.pc, bytes, sizeof(bytes)))
+  if (!read_independent_instruction_ || !read_independent_instruction_(snapshot.pc, bytes, instruction_bytes))
     return incomplete("trap cannot fetch independently initialized instruction bytes");
   uint32_t fetched = 0;
-  for (size_t index = 0; index < sizeof(bytes); ++index)
+  for (size_t index = 0; index < instruction_bytes; ++index)
     fetched |= uint32_t(bytes[index]) << (8 * index);
   if (fetched != snapshot.instruction)
     return violation("trap instruction differs from independent reference memory");
@@ -333,10 +331,6 @@ CheckResult SpikeReferenceStepper::step_trap(const TrapEvent &trap, const Archit
     return incomplete("Spike cannot expose pre-trap architectural state");
   if (before.pc != snapshot.pc)
     return violation("Spike pre-trap PC differs from the faulting physical UID");
-  const uint64_t expected_ecall_cause = before.privilege == 0 ? 8 : before.privilege == 1 ? 9 :
-                                        before.privilege == 3 ? 11 : UINT64_MAX;
-  if (ecall && snapshot.cause != expected_ecall_cause)
-    return violation("ECALL physical cause differs from pre-trap privilege");
   uint64_t ordinary = 0, atomics = 0;
   if (difftest_ref_pending_store_traces_v1(state.handle, &ordinary) != DIFFTEST_REF_API_OK || ordinary ||
       (state.profile.capabilities & DIFFTEST_REF_CAP_ATOMIC_TRACE_V1 &&

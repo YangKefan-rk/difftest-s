@@ -120,7 +120,14 @@ four-hart result also requires the common session's final verdict, every hart's
 independent reference state, closed fabric/transport prefixes and native workload
 completion. Hart park, an empty STQ or a successful host conversion is not that
 verdict. Scalar integer RAM is the current generic path; unsupported architectural
-state, atomics/LRSC, split access, FP/vector, trap and MMIO must not be dropped.
+state, LR/SC, split access, vector operations, interrupts and unmodeled MMIO must
+not be dropped. A synchronous fault is checked only after its precise physical
+ROB owner, post-trap CSR/redirect snapshot and (for non-retiring faults) rollback
+are captured. The faulting owner must have no outstanding load attempt or local,
+device, atomic or public memory effect. Spike independently steps the faulting
+instruction and checks cause, EPC, tval, privilege, redirect and register/CSR
+state; a new synchronous cause needs no BOOM-specific allowlist entry. A missing
+observation remains Incomplete or Unsupported, never a successful comparison.
 
 ## Checked RAM address contract
 
@@ -148,8 +155,9 @@ still require their own coverage and lifecycle checks).
 An actually retired `WFI` (`0x10500073`) has no scalar register or CSR write;
 its PC, raw instruction and absence of a GPR result are checked through the
 ordinary reference step. The validated scope is M-mode with no pending
-interrupt. Other system instructions, CSR effects and trap/interrupt handling
-retain their explicit coverage limits.
+interrupt. Other system instructions and CSR effects retain their explicit
+coverage limits; synchronous faults follow the independent trap-step rules
+above, while interrupts need separate arrival and reference evidence.
 
 WFI retirement does not complete a hart or close any source prefix. BOOM may
 stall its ROB at WFI until an interrupt arrives. Seeing its execution request,
