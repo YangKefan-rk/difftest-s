@@ -130,7 +130,15 @@ replaced with checker ranks or host callback order. The source reset observer
 must see assert then deassert on all four harts before labeling epoch 1.
 Any omitted or unverifiable **scalar** effect yields `complete:false` and
 diagnostic `incomplete_reasons`; no inferred load source, within-cycle order,
-or physical-drain certificate is included. The scalar-only scope never claims
+or physical-drain certificate is included. A retired store outside initialized
+GlobalMem is **not** automatically a device store: it may target an unmodeled
+RAM address. Such stores remain `complete:false` and appear separately as
+`excluded_device_stores` with hart, architectural/store UIDs, PC, instruction,
+physical address, local source cycle and byte mask. The attested marker and
+sidecar both report `excluded_device_store_count`. A DUT-specific adapter may
+certify a narrower coherent-RAM scoring scope against its pinned RTL address
+decode and boot image; the generic runtime never upgrades the raw sidecar or
+checker verdict on that basis. The scalar-only scope never claims
 a complete all-memory interaction stream or an atomic read-from relation. The separate static layout must pin the shared NoC observation
 cycle and its coarse, **unordered** same-cycle interpretation.
 
