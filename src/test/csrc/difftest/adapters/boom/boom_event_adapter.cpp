@@ -524,6 +524,7 @@ CheckResult BoomEventAdapter::commit_store(const StoreCommit &record) {
   operation.byte_mask = record.byte_mask;
   operation.store = true;
   found->second.store = operation;
+  found->second.store_attempt = record.attempt;
   found->second.store_bytes = record.bytes;
   return {};
 }
@@ -551,8 +552,9 @@ CheckResult BoomEventAdapter::publish_store(const StorePublication &record) {
     return result;
   auto found = instructions_.find(record.id);
   if (found == instructions_.end() || !found->second.store || found->second.published ||
-      !found->second.allocation.stq || !(*found->second.allocation.stq == record.stq))
-    return invalid("BOOM publication has no matching LocalStore generation or was already published");
+      !found->second.allocation.stq || !(*found->second.allocation.stq == record.stq) ||
+      !found->second.store_attempt || *found->second.store_attempt != record.attempt)
+    return invalid("BOOM publication has no matching LocalStore generation/attempt or was already published");
   if (!found->second.stq_released) {
     result = owned_slot(stq_, record.stq, record.id);
     if (!result)
@@ -571,7 +573,9 @@ CheckResult BoomEventAdapter::publish_store(const StorePublication &record) {
     if (record.byte_mask[byte] && record.byte_writers[byte] != record.id)
       return invalid("BOOM single-store publication names a different logical byte writer");
   StorePublishEvent publication{record.transaction_id, record.address, record.bytes, record.byte_mask,
-                                record.byte_writers, {{record.id, record.source.position}}};
+                                record.byte_writers,
+                                {{record.id, record.source.position, record.stq.generation, record.attempt}}};
+  publication.allocation_generation = record.stq.generation;
   result = append(record.source, RuntimeEventKind::StorePublish, std::move(publication));
   if (!result)
     return result;
@@ -641,8 +645,9 @@ CheckResult BoomEventAdapter::publish_merged_stores(const MergedStorePublication
       return result;
     const auto found = instructions_.find(member.id);
     if (found == instructions_.end() || !found->second.store || found->second.published ||
-        !found->second.allocation.stq || !(*found->second.allocation.stq == member.stq))
-      return invalid("BOOM merged member has no unpublished LocalStore with the matching STQ generation");
+        !found->second.allocation.stq || !(*found->second.allocation.stq == member.stq) ||
+        !found->second.store_attempt || *found->second.store_attempt != member.attempt)
+      return invalid("BOOM merged member has no unpublished LocalStore with matching STQ generation/attempt");
     if (!found->second.stq_released) {
       result = owned_slot(stq_, member.stq, member.id);
       if (!result)
@@ -659,7 +664,9 @@ CheckResult BoomEventAdapter::publish_merged_stores(const MergedStorePublication
                                 record.byte_writers, {}};
   publication.coalesced_program_order = true;
   for (const auto &member : members)
-    publication.members.push_back({member.first, record.source.position});
+    publication.members.push_back({member.first, record.source.position,
+                                   member.second->allocation.stq->generation,
+                                   *member.second->store_attempt});
   result = append(record.source, RuntimeEventKind::StorePublish, std::move(publication));
   if (!result)
     return result;
@@ -741,8 +748,11 @@ CheckResult BoomEventAdapter::retire(const Retirement &record) {
   if (state.allocation.stq) {
     if (!state.store && !fence_instruction(record.instruction))
       return incomplete("BOOM store retirement lacks its architectural LocalStore");
-    if (state.store)
+    if (state.store) {
+      if (!record.store_attempt || !state.store_attempt || *record.store_attempt != *state.store_attempt)
+        return invalid("BOOM store retirement attempt differs from committed LocalStore");
       retirement.instruction.memory.push_back(*state.store);
+    }
   }
   result = append(record.source, RuntimeEventKind::InstructionRetire, std::move(retirement));
   if (!result)
