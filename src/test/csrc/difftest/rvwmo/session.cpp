@@ -12,6 +12,20 @@ CheckResult invalid(const char *message) { return {CheckStatus::Invalid, 0, mess
 CheckResult pending(const char *message) { return {CheckStatus::Pending, 0, message}; }
 CheckResult incomplete(const char *message) { return {CheckStatus::Incomplete, 0, message}; }
 
+bool is_semantic_feedback_event(RuntimeEventKind kind) {
+  switch (kind) {
+  case RuntimeEventKind::LoadSample:
+  case RuntimeEventKind::LocalStore:
+  case RuntimeEventKind::StorePublish:
+  case RuntimeEventKind::InstructionRetire:
+  case RuntimeEventKind::InstructionCancelAttempt:
+  case RuntimeEventKind::InstructionSquash:
+    return true;
+  default:
+    return false;
+  }
+}
+
 bool is_memory_event_kind(const RuntimeEvent &event) {
   switch (event.kind) {
   case RuntimeEventKind::LoadSample:
@@ -244,6 +258,14 @@ CheckResult ObservationSession::ensure_statistics_hart(uint32_t hart) {
   return {};
 }
 
+void ObservationSession::set_semantic_event_observer(SemanticEventObserver observer) {
+  if (semantic_observer_ || finalized_ || !pending_events_.empty())
+    throw std::logic_error("semantic observer must be installed once before source delivery");
+  semantic_observer_ = std::move(observer);
+  semantic_observer_error_.clear();
+  semantic_observer_failed_ = false;
+}
+
 CheckResult ObservationSession::consume_pending_events() {
   bool progress = true;
   while (progress) {
@@ -309,6 +331,18 @@ CheckResult ObservationSession::consume_pending_events() {
       }
       if (!result)
         return remember_failure(result);
+      if (semantic_observer_ && !semantic_observer_failed_
+          && is_semantic_feedback_event(event.kind)) {
+        try {
+          semantic_observer_(event);
+        } catch (const std::exception &error) {
+          semantic_observer_failed_ = true;
+          semantic_observer_error_ = error.what();
+        } catch (...) {
+          semantic_observer_failed_ = true;
+          semantic_observer_error_ = "semantic observer failed without a diagnostic";
+        }
+      }
       if (memory_event && (!pending_event->memory_group || --pending_event->memory_group->remaining == 0)) {
         // A certified coalesced physical publication expands to consecutive
         // logical stores; reserve every rank before a later effect can consume it.

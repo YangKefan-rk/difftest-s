@@ -178,6 +178,7 @@ CheckResult convert_store(uint32_t hart, const ProbeStore &probe, const EventSou
     return status;
   result = {operation_id(hart, probe.identity), {probe.queue_index, probe.identity.memory_generation},
             converted.address, std::move(converted.bytes), std::move(converted.byte_mask), true, source};
+  result.attempt = probe.identity.attempt;
   return {};
 }
 
@@ -203,6 +204,7 @@ CheckResult convert_single_store_publication(uint32_t hart, const ProbeStore &pr
   auto writer = operation_id(hart, probe.identity);
   result = {writer, {probe.queue_index, probe.identity.memory_generation}, transaction_id, bytes.address,
             std::move(bytes.bytes), std::move(bytes.byte_mask), {}, evidence, source};
+  result.attempt = probe.identity.attempt;
   result.byte_writers.assign(result.bytes.size(), writer);
   return {};
 }
@@ -236,6 +238,8 @@ CheckResult convert_retirement(uint32_t hart, const ProbeInstruction &probe, con
   } else if (physical_load_address || independent_retire_data) {
     return {CheckStatus::Invalid, 0, "BOOM non-load retirement carries load-only fields"};
   }
+  if (probe.uses_stq)
+    converted.store_attempt = probe.identity.attempt;
   result = std::move(converted);
   return {};
 }

@@ -82,3 +82,47 @@ Final success requires all relevant store publications, reference audits,
 retirements and source drain evidence. Instruction-class support and trustworthy
 hardware order observations remain adapter-specific requirements; these
 optimizations do not establish full-ISA or full-RVWMO completeness.
+
+## Explicit observed-prefix verdict
+
+`DIFFTEST_S_OBSERVED_PREFIX=1` enables a **limited** final marker only for
+four-hart builds with `CONFIG_DIFFTEST_SOURCEPREFIXEVENT`. The default run is
+unchanged. After the usual `Runtime::finish()` has passed architecture,
+read-value and PPO checks, closed every required observed source prefix and
+found no pending semantic events/stores/atomics, the runtime emits exactly one
+`RVWMO_PREFIX_FINAL_V1 ` JSON line. Its `verdict` is `PassObserved`, its `scope`
+is `observed_prefix_only`, and `physical_drain_certified` is always `false`.
+The line also includes four independently compared hart counts, the closed and
+last-effect source cycles, and zero pending counters.
+
+This does **not** ignore any already observed operation or turn an unsupported
+instruction into success. It deliberately does not claim that every L1/L2,
+store-buffer, CHI or transport producer has become physically idle, so a later
+producer event remains outside the checked prefix. A caller must expose this
+scope explicitly and never equate `PassObserved` with the full `Pass` contract
+from `HostSession::final_report()`. For a whole-run verdict, adapters still
+need independent physical-idle and fully-delivered evidence for every required
+producer before calling `HostSession::drain_producer` and `finalize`.
+
+## Optional SFUZZ semantic interaction tap
+
+`ObservationSession::set_semantic_event_observer` installs an optional
+read-only callback **before** source submission. It observes source-closed raw
+`RuntimeEvent` references only after the semantic consumer accepts them;
+callbacks must copy or synchronously serialize, not retain the reference.
+The hook covers LoadSample, LocalStore, StorePublish, InstructionRetire,
+InstructionCancelAttempt and InstructionSquash. An observer exception disables
+feedback but does not change the checker verdict. The host can supply this
+callback through `HostSessionConfiguration::semantic_event_observer`.
+
+The output is provisional until `HostSession::finalize` succeeds and
+`semantic_feedback_publishable()` is true. Only then can the adapter publish
+its case-local artifact using `semantic_source_watermarks()` and
+`semantic_completed_cycle()`. The adapter must join each load sample to its
+**final retired attempt**, exclude canceled/squashed work, and keep a
+coalesced store publication as one transaction with all its member identities.
+Its original `SourcePosition` is not a checker global-order rank or host
+callback order. The adapter must separately prove post-TLB physical addresses
+and the reset epoch/clock/phase mapping to any RTL functional-point window;
+this generic checker does not invent that mapping. No certification means
+feedback is unavailable, not a zero interaction score or a different verdict.

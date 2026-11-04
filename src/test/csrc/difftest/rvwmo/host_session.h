@@ -24,6 +24,9 @@ struct HostSessionConfiguration {
   // Optional private-adapter bookkeeping over independently computed REF stores.
   // It must finish synchronously; it cannot change the REF result or memory.
   std::function<CheckResult(const ReferenceStoreValue &)> reference_store_observer;
+  // Separate from correctness. Only a terminal HostSession Pass may publish
+  // events saved by this observer as SFuzz feedback.
+  ObservationSession::SemanticEventObserver semantic_event_observer;
 };
 
 struct HartCompletion {
@@ -58,6 +61,15 @@ public:
   CheckResult report_source_failure(CheckResult failure);
   CheckResult finalize(uint64_t completed_cycle);
   bool finalized() const { return finalized_; }
+  bool semantic_feedback_publishable() const {
+    return finalized_ && session_ && session_->semantic_observer_healthy();
+  }
+  const std::map<uint32_t, SourcePosition> &semantic_source_watermarks() const {
+    return source_watermarks_;
+  }
+  std::optional<uint64_t> semantic_completed_cycle() const {
+    return finalized_ ? final_cycle_ : std::nullopt;
+  }
   const ObservationSession *session() const { return session_.get(); }
   // A diagnostic snapshot. Only a successful terminal finalize produces Pass.
   std::string final_report() const;

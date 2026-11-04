@@ -64,7 +64,13 @@ physical STQ slot. Neither event authorizes publication. A publication requires
 the actual cache data-write observation, complete single-writer evidence,
 transaction identity and the fabric source supplied by the common integration.
 Store retirement, native slot release, publication and independent REF audit
-are separate obligations.
+are separate obligations. Single-store publications preserve the observed STQ
+`memory_generation` and store attempt from the original native identity in
+`StorePublishEvent.allocation_generation` and `StorePublishMember`; the
+adapter verifies the generation and attempt against the committed local store
+(and the attempt against its retirement). These are source facts for optional
+feedback, not a checker-created memory-order rank. Older producers which do
+not supply a generation leave the optional public field zero.
 
 The common [incremental checking contract](../../rvwmo/README.md) describes
 early load completion, deferred store order checks and finalization requirements.
@@ -73,8 +79,11 @@ early load completion, deferred store order checks and finalization requirements
 with every logical member's original STQ generation and the final writer of
 each enabled byte. Keep fully overwritten stores in the member list. The
 adapter validates every LocalStore, the byte-mask union and the newest
-program-order writer, then emits one certified `StorePublishEvent`. It does
-not assign a separate hardware time to a member: `coalesced_program_order`
+program-order writer, then emits one certified `StorePublishEvent`. Members
+retain their individual STQ generations and attempts; without an independently
+observed physical *group* generation, the event's `allocation_generation`
+remains zero and a strict semantic-feedback exporter must decline to publish
+that group. It does not assign a separate hardware time to a member: `coalesced_program_order`
 certifies that the complete group first becomes externally visible at one
 indivisible source point, and the common checker chooses its internal
 program-order linearization. Missing that certificate or qualified source

@@ -193,6 +193,10 @@ struct LoadSampleEvent {
 struct StorePublishMember {
   OperationId id;
   SourcePosition publish_position;
+  // Source-observed memory slot generation and attempt; zero generation means
+  // the producer did not supply a BOOM-style allocation identity.
+  uint64_t memory_generation = 0;
+  uint32_t attempt = 0;
 };
 
 struct PhysicalStoreWrite {
@@ -215,6 +219,9 @@ struct StorePublishEvent {
   bool coalesced_program_order = false;
   // ECC may physically rewrite preserved lanes outside the logical byte union.
   std::optional<PhysicalStoreWrite> physical_write = std::nullopt;
+  // Only a source-certified single-store publication currently has this
+  // generation. A merged group's unknown physical generation remains zero.
+  uint64_t allocation_generation = 0;
 };
 
 struct AtomicLifecycleEvent {

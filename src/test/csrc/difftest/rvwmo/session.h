@@ -96,11 +96,18 @@ public:
   using ReferenceStepper =
       std::function<ReferenceStepResult(const InstructionRetireEvent &, const ArchitecturalRetirement &,
                                         const std::vector<ReferenceLoadValue> &)>;
+  // An optional read-only tap on source-closed, checker-accepted raw events.
+  // It is provisional until the owning HostSession reaches a complete Pass.
+  using SemanticEventObserver = std::function<void(const RuntimeEvent &)>;
 
   ObservationSession(StreamContract contract, std::vector<ProducerCapability> producers,
                     Memory::ReadGlobal read_global, Memory::WriteGlobal write_global, ReferenceStepper reference_stepper,
                     size_t max_live_instructions = 65536, size_t max_pending_retirements = 65536,
                     size_t max_harts = 4096);
+
+  void set_semantic_event_observer(SemanticEventObserver observer);
+  bool semantic_observer_healthy() const { return bool(semantic_observer_) && !semantic_observer_failed_; }
+  const std::string &semantic_observer_error() const { return semantic_observer_error_; }
 
   SessionSubmitResult submit(const EventBatch &batch,
                              const std::vector<ArchitecturalRetirement> &retirements = {});
@@ -133,6 +140,9 @@ private:
   ObservationStream stream_;
   CheckerEventConsumer consumer_;
   ReferenceStepper reference_stepper_;
+  SemanticEventObserver semantic_observer_;
+  std::string semantic_observer_error_;
+  bool semantic_observer_failed_ = false;
   std::deque<PendingEvent> pending_events_;
   std::map<OperationId, ArchitecturalRetirement> architectural_retirements_;
   std::map<OperationId, ReferenceRecord> reference_records_;
