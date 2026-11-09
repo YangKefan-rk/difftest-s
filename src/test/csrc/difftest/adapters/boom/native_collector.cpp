@@ -20,17 +20,25 @@ bool same_terminal_owner(const ProbeIdentity &lhs, const ProbeIdentity &rhs) {
          lhs.attempt == rhs.attempt;
 }
 bool faulting_scalar_refill(const ProbeLoad &probe, const InstructionAllocation &owner) {
-  if (owner.length != 4 || (owner.instruction & 0x7f) != 0x03 || !owner.ldq ||
+  if (owner.length != 4 || !owner.ldq ||
       probe.sampling_point != LoadSamplingPoint::RefillData || !probe.source_complete ||
       probe.known_writer_mask || !probe.byte_mask)
     return false;
-  const unsigned funct3 = (owner.instruction >> 12) & 7;
   unsigned log2_size = 0;
-  switch (funct3) {
-  case 1: case 5: log2_size = 1; break; // LH/LHU
-  case 2: case 6: log2_size = 2; break; // LW/LWU
-  case 3: log2_size = 3; break;         // LD
-  default: return false;
+  if (const auto transfer = decode_floating_transfer(owner.instruction)) {
+    if (transfer->kind != FloatingTransferKind::Load ||
+        (transfer->bytes != 4 && transfer->bytes != 8))
+      return false;
+    log2_size = transfer->bytes == 4 ? 2 : 3; // FLW/FLD
+  } else {
+    if ((owner.instruction & 0x7f) != 0x03)
+      return false;
+    switch ((owner.instruction >> 12) & 7) {
+    case 1: case 5: log2_size = 1; break; // LH/LHU
+    case 2: case 6: log2_size = 2; break; // LW/LWU
+    case 3: log2_size = 3; break;         // LD
+    default: return false;
+    }
   }
   if (probe.log2_size != log2_size)
     return false;
