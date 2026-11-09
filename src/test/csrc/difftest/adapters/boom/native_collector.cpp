@@ -331,6 +331,8 @@ CheckResult NativeCollector::capture_attempts(const NativeFrame &frame) {
     auto result = validate_attempt(begin);
     if (!result)
       return result;
+    if (pending_trap_ && same_instruction(begin.identity, pending_trap_->identity))
+      return invalid("BOOM faulted load started a new attempt after its physical trap");
     const AttemptKey key{id(begin.identity), begin.identity.attempt};
     if (!beginning_instructions.insert(key.first).second || !begins.insert(key).second ||
         unresolved_samples_.count(key))
@@ -372,6 +374,8 @@ CheckResult NativeCollector::capture_attempts(const NativeFrame &frame) {
     auto checked = validate_attempt({probe.identity, probe.queue_index});
     if (!checked)
       return checked;
+    if (fault_rollback_cancellations_.count({id(probe.identity), probe.identity.attempt}))
+      return invalid("BOOM faulted load completed after its physical cancellation");
     if (complete.sampled_at.cycle > frame.cycle)
       return invalid("BOOM completed load claims a future source cycle");
     const AttemptKey key{id(probe.identity), probe.identity.attempt};
@@ -403,6 +407,20 @@ CheckResult NativeCollector::capture_attempts(const NativeFrame &frame) {
 }
 
 CheckResult NativeCollector::capture_cancellation(const NativeAttempt &cancel, uint64_t cycle) {
+  if (pending_trap_ && same_instruction(cancel.identity, pending_trap_->identity)) {
+    const AttemptKey key{id(cancel.identity), cancel.identity.attempt};
+    const auto live = unresolved_samples_.find(key);
+    const auto refill = faulting_refills_.find(key.first);
+    const bool faulting_refill = refill != faulting_refills_.end() && refill->second == key.second;
+    // Only an already begun, unsampled attempt of the exact fault owner can
+    // cancel at T+1. The physical fact remains private until the matched
+    // Trap(T), post-state(T+2), and rollback(T+3) all close.
+    if (pending_trap_->source_cycle == UINT64_MAX || cycle != pending_trap_->source_cycle + 1 ||
+        (live == unresolved_samples_.end() && !faulting_refill) ||
+        !fault_rollback_cancellations_.emplace(key, cycle).second)
+      return invalid("BOOM post-trap cancel lacks one live unsampled fault attempt");
+    return {};
+  }
   auto result = adapter_.cancel_load_attempt(convert_attempt(configuration_.hart, cancel.identity, cancel.queue_index),
                                              capture_source(cycle));
   if (result) {
@@ -619,6 +637,13 @@ CheckResult NativeCollector::capture_terminations(const NativeFrame &frame) {
       // source prefix open until the exact physical ROB rollback proves the
       // attempt cannot produce a late public sample.
       const auto instruction_id = id(squash.identity);
+      for (auto cancel = fault_rollback_cancellations_.begin();
+           cancel != fault_rollback_cancellations_.end();) {
+        if (cancel->first.first == instruction_id)
+          cancel = fault_rollback_cancellations_.erase(cancel);
+        else
+          ++cancel;
+      }
       for (auto attempt = unresolved_samples_.begin(); attempt != unresolved_samples_.end();) {
         if (attempt->first.first == instruction_id)
           attempt = unresolved_samples_.erase(attempt);
@@ -828,7 +853,7 @@ CheckResult NativeCollector::certify_parked_wfi_terminal(const ProbeIdentity &ow
   if (!captured_cycle_ || !closed_cycle_ || *captured_cycle_ != *closed_cycle_ ||
       source_cycle != *captured_cycle_ || !queues_empty_ || !cache_idle_ ||
       !staged_events_.empty() || !staged_retirements_.empty() || !unresolved_samples_.empty() ||
-      !faulting_refills_.empty() ||
+      !faulting_refills_.empty() || !fault_rollback_cancellations_.empty() ||
       !pending_csr_.empty() || !pending_counter_writes_.empty() || !pending_counter_reads_.empty() || !pending_fp_.empty() || pending_system_ || pending_trap_ ||
       pending_fault_rollback_ || !staged_traps_.empty() ||
       !skipped_device_stores_.empty() || adapter_.live_instructions())
@@ -863,7 +888,7 @@ CheckResult NativeCollector::completion() const {
     return failure_;
   if (!captured_cycle_ || !closed_cycle_ || *closed_cycle_ != *captured_cycle_ ||
       !staged_events_.empty() || !staged_retirements_.empty() || !unresolved_samples_.empty() ||
-      !faulting_refills_.empty() ||
+      !faulting_refills_.empty() || !fault_rollback_cancellations_.empty() ||
       !allocations_.empty() || !pending_csr_.empty() || !pending_counter_writes_.empty() || !pending_counter_reads_.empty() ||
       !pending_fp_.empty() || pending_system_ || pending_trap_ ||
       pending_fault_rollback_ || !staged_traps_.empty() || !queues_empty_ || !cache_idle_)

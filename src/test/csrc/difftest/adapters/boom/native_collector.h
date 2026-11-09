@@ -181,6 +181,9 @@ private:
   std::optional<PendingFaultRollback> pending_fault_rollback_;
   std::map<OperationId, ArchitecturalTrap> staged_traps_;
   std::map<AttemptKey, uint64_t> unresolved_samples_;
+  // Physical cancellations after a precise fault have a later source cycle
+  // than the Trap; close them only with that fault's post-state and rollback.
+  std::map<AttemptKey, uint64_t> fault_rollback_cancellations_;
   // A misaligned scalar refill cannot become an architectural read. Retain
   // its physical attempt until the same owner faults, cancels, or squashes.
   std::map<OperationId, uint32_t> faulting_refills_;
