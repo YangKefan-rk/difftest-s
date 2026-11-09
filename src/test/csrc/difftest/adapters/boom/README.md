@@ -146,11 +146,23 @@ model and observation contract rather than an invented RAM write.
 
 Only `CSRRS rd,mhartid,x0` with `rd != x0` is in the scalar GPR path.
 It cannot write the CSR; the actual destination bits are compared with
-Spike's independently executed integer result for the same hart. No other
-CSR operation is treated as verified: CSR writes and all other CSR reads
-require a separate architectural CSR-state comparator. This exception does
+Spike's independently executed integer result for the same hart. Other
+CSR operations need their physical post-state comparator or the explicitly
+scoped counter environment described below. This exception does
 not make HartBreaker programs fully supported (FP, AMO, CLINT and termination
 still require their own coverage and lifecycle checks).
+
+## Source-sampled mcycle reads
+
+BOOM RV64 `CSRRS rd,mcycle,x0` with a nonzero destination can opt into a
+counter environment captured from CSRFile at execution, before GPR writeback.
+The collector requires the live UID/ROB generation, PC, CSR address, source
+cycle, and final architectural retirement; missing or stale samples do not pass.
+The matching Spike capability synchronizes this environment for one actual
+instruction step, and the existing PC/opcode/destination/value comparison stays
+active. `counter_reads_synchronized` reports how many reads used this path.
+This is time-environment synchronization, **not an independent verification of
+the counter's generation**. Other counter read forms retain Unsupported.
 
 ## WFI retirement
 

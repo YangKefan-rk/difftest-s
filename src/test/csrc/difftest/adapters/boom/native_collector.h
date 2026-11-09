@@ -74,6 +74,8 @@ struct NativeFrame {
   std::optional<NativeCsrPost> csr_post;
   bool csr_write_probe_available = false;
   std::optional<NativeCsrPost> csr_write_post;
+  bool counter_read_probe_available = false;
+  std::optional<NativeCsrPost> counter_read;
   bool fp_probe_available = false;
   std::vector<NativeFpPost> fp_posts;
   std::vector<ProbeLoadRetirement> retired_loads;
@@ -101,6 +103,7 @@ struct NativeCollectorConfiguration {
   // Enables explicit device-store exclusion only for the opted-in DUT profile.
   bool skip_device_stores = false;
   bool check_csr_post = false;
+  bool check_counter_reads = false;
   bool check_fp_post = false;
   // Independently parsed ELF terminal delimiters; only this BOOM profile opts in.
   std::vector<uint64_t> terminal_wfi_pcs;
@@ -145,6 +148,7 @@ private:
   };
   std::map<OperationId, PendingCsr> pending_csr_;
   std::map<OperationId, NativeCsrPost> pending_counter_writes_;
+  std::map<OperationId, NativeCsrPost> pending_counter_reads_;
   struct PendingFp {
     uint64_t pc = 0;
     uint64_t retirement_cycle = 0;
@@ -168,6 +172,7 @@ private:
   CheckResult capture_frame(const NativeFrame &frame);
   CheckResult capture_allocations(const NativeFrame &frame);
   CheckResult capture_counter_write(const NativeFrame &frame);
+  CheckResult capture_counter_read(const NativeFrame &frame);
   CheckResult capture_attempts(const NativeFrame &frame);
   CheckResult capture_cancellation(const NativeAttempt &cancel, uint64_t cycle);
   CheckResult capture_retirements(const NativeFrame &frame);

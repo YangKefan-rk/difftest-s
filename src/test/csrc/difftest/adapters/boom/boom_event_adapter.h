@@ -164,6 +164,7 @@ struct CapturedRetirement {
   RetirementResultCoverage coverage = RetirementResultCoverage::Complete;
   std::optional<std::pair<uint16_t, uint64_t>> csr_post;
   std::optional<FloatingPostState> fp_post;
+  std::optional<CounterReadEnvironment> counter_read;
 };
 
 struct Retirement {

@@ -6,6 +6,10 @@
 #include <sstream>
 #include <utility>
 
+// Optional extension: ordinary profiles keep working with an older REF library.
+extern "C" int difftest_ref_step_mcycle_read_v1(void *, uint64_t, uint32_t, uint64_t)
+    __attribute__((weak));
+
 namespace rvwmo {
 namespace {
 CheckResult incomplete(const std::string &message) { return {CheckStatus::Incomplete, 0, message}; }
@@ -254,7 +258,7 @@ ReferenceStepResult SpikeReferenceStepper::skip_device_store(
       (instruction.instruction & 0x7f) != 0x23 ||
       ((instruction.instruction >> 12) & 7) != 3 ||
       snapshot.destination != ArchitecturalDestination::None || snapshot.destination_register ||
-      snapshot.destination_value || snapshot.fp_post || snapshot.csr_post) {
+      snapshot.destination_value || snapshot.fp_post || snapshot.csr_post || snapshot.counter_read) {
     result.check = invalid("device-store skip has a RAM effect, non-store opcode or architectural writeback");
     return result;
   }
@@ -328,6 +332,25 @@ ReferenceStepResult SpikeReferenceStepper::step(const InstructionRetireEvent &re
     return result;
   }
   const uint32_t raw = retirement.instruction.instruction;
+  const bool pure_mcycle_read = (raw & 0x7f) == 0x73 && ((raw >> 12) & 7) == 2 &&
+      ((raw >> 15) & 31) == 0 && ((raw >> 7) & 31) != 0 && (raw >> 20) == 0xb00;
+  if (snapshot.counter_read) {
+    const auto &counter = *snapshot.counter_read;
+    if (!pure_mcycle_read || counter.address != 0xb00 || !counter.source_cycle || snapshot.csr_post ||
+        (state.last_counter_source_cycle && counter.source_cycle <= *state.last_counter_source_cycle)) {
+      result.check = invalid("counter environment has a wrong instruction, address or nonincreasing source time");
+      return result;
+    }
+    if (state.profile_id.profile_id != DIFFTEST_REF_PROFILE_ID_BOOM ||
+        !(state.profile.capabilities & DIFFTEST_REF_CAP_MCYCLE_READ_ENV_V1) ||
+        !difftest_ref_step_mcycle_read_v1) {
+      result.check = unsupported("Spike profile has no mcycle read environment capability");
+      return result;
+    }
+  } else if (pure_mcycle_read) {
+    result.check = incomplete("mcycle read is missing its source-sampled environment");
+    return result;
+  }
   size_t atomic_count = 0;
   for (const auto &operation : retirement.instruction.memory) {
     if (operation.lr || operation.sc) {
@@ -417,7 +440,9 @@ ReferenceStepResult SpikeReferenceStepper::step(const InstructionRetireEvent &re
   }
 
   state.active = true;
-  const int stepped = difftest_ref_step(state.handle, 1);
+  const int stepped = snapshot.counter_read
+      ? difftest_ref_step_mcycle_read_v1(state.handle, snapshot.pc, raw, snapshot.counter_read->value)
+      : difftest_ref_step(state.handle, 1);
   state.active = false;
   auto fail_after_step = [&](CheckResult failure) {
     state.poisoned = true;
@@ -433,6 +458,10 @@ ReferenceStepResult SpikeReferenceStepper::step(const InstructionRetireEvent &re
   }
   if (state.consumed_loads != state.expected_loads.size()) {
     return fail_after_step(incomplete("Spike did not consume every modeled load exactly once"));
+  }
+  if (snapshot.counter_read) {
+    result.counter_read_synchronized = true;
+    state.last_counter_source_cycle = snapshot.counter_read->source_cycle;
   }
   if (!state.observed_instruction) {
     return fail_after_step(incomplete("Spike did not report a committed instruction for the single step"));

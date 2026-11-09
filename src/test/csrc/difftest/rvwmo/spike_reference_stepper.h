@@ -52,6 +52,7 @@ private:
     uint8_t destination = 0;
     uint64_t value = 0;
     std::string setup_error;
+    std::optional<uint64_t> last_counter_source_cycle;
   };
 
   std::vector<HartState> harts_;

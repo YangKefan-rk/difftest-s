@@ -11,6 +11,13 @@ inline bool certified_counter_address(uint32_t csr) {
   return csr == 0xb00 || csr == 0xb02; // mcycle or minstret
 }
 
+// Only CSRRS rd,mcycle,x0: a pure RV64 M-mode read with a GPR result.
+inline bool supported_mcycle_read(uint32_t instruction) {
+  return (instruction & 0x7f) == 0x73 && ((instruction >> 12) & 7) == 2 &&
+         ((instruction >> 15) & 31) == 0 && ((instruction >> 7) & 31) != 0 &&
+         (instruction >> 20) == 0xb00;
+}
+
 inline bool certified_counter_write(uint32_t instruction) {
   const auto function = (instruction >> 12) & 7;
   return (instruction & 0x7f) == 0x73 && (function == 1 || function == 5) &&

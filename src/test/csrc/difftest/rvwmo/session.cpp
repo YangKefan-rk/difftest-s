@@ -442,6 +442,13 @@ CheckResult ObservationSession::step_reference(const InstructionRetireEvent &ret
     return {CheckStatus::Violation, 0, "reference produced an unexpected floating CSR state"};
   }
 
+  if (result.counter_read_synchronized != snapshot.counter_read.has_value())
+    return invalid("reference counter environment differs from the captured CSR read");
+  if (snapshot.counter_read) {
+    if (statistics.counter_reads_synchronized == std::numeric_limits<uint64_t>::max())
+      return invalid("counter environment statistics exhausted");
+    ++statistics.counter_reads_synchronized;
+  }
   ++statistics.architecture_compared;
 
   std::vector<const MemoryOperation *> stores;

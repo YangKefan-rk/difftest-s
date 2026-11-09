@@ -69,7 +69,8 @@ CaptureResult NativeCollector::capture(const NativeFrame &frame) {
       frame.completions.size() + frame.local_stores.size() + frame.retirements.size() +
       2 * atomic_retirements + frame.store_releases.size() + frame.squashes.size() +
       frame.publications.size() + frame.merged_publications.size() + frame.atomic_applied.size() +
-      frame.csr_post.has_value() + frame.csr_write_post.has_value() + frame.fp_posts.size();
+      frame.csr_post.has_value() + frame.csr_write_post.has_value() +
+      frame.counter_read.has_value() + frame.fp_posts.size();
   if (facts > configuration_.staged_events - std::min(configuration_.staged_events, staged_events_.size()))
     return {pending("BOOM source staging is full; retain the complete frame and drain before retrying"), false};
   if (facts > std::numeric_limits<uint64_t>::max() - capture_sequence_)
@@ -128,7 +129,8 @@ CheckResult NativeCollector::capture_frame(const NativeFrame &frame) {
     }
   }
   auto result = capture_allocations(frame);
-  if (!result || !(result = capture_counter_write(frame)) || !(result = capture_attempts(frame)))
+  if (!result || !(result = capture_counter_write(frame)) ||
+      !(result = capture_counter_read(frame)) || !(result = capture_attempts(frame)))
     return result;
   for (const auto &store : frame.local_stores) {
     if (store.atomic) {
@@ -286,6 +288,23 @@ CheckResult NativeCollector::capture_counter_write(const NativeFrame &frame) {
   return {};
 }
 
+CheckResult NativeCollector::capture_counter_read(const NativeFrame &frame) {
+  if (!frame.counter_read)
+    return {};
+  if (!configuration_.check_counter_reads || !frame.counter_read_probe_available)
+    return {CheckStatus::Unsupported, 0, "BOOM counter environment has no enabled physical read probe"};
+  const auto &sample = *frame.counter_read;
+  const auto owner = allocations_.find(id(sample.identity));
+  if (owner == allocations_.end() || owner->second.rob.generation != sample.identity.rob_generation ||
+      owner->second.pc != sample.pc || !supported_mcycle_read(owner->second.instruction) ||
+      sample.address != 0xb00 || sample.source_cycle == 0 || sample.source_cycle == UINT64_MAX ||
+      sample.source_cycle + 1 != frame.cycle || sample.identity.memory_generation || sample.identity.attempt)
+    return invalid("BOOM counter read has stale identity, source time or CSR address");
+  if (!pending_counter_reads_.emplace(id(sample.identity), sample).second)
+    return invalid("BOOM counter read repeats a physical execution sample");
+  return {};
+}
+
 CheckResult NativeCollector::capture_attempts(const NativeFrame &frame) {
   std::set<OperationId> beginning_instructions;
   std::set<AttemptKey> begins;
@@ -419,6 +438,15 @@ CheckResult NativeCollector::capture_retirements(const NativeFrame &frame) {
               PendingFp{core.pc, frame.cycle, core.identity.rob_generation, std::nullopt}).second)
           return invalid("BOOM FP retirement repeats an existing transfer owner");
       }
+      if (supported_mcycle_read(core.instruction)) {
+        if (!configuration_.check_counter_reads || !frame.counter_read_probe_available)
+          return {CheckStatus::Unsupported, 0, "BOOM mcycle read lacks a physical counter environment"};
+        const auto sample = pending_counter_reads_.find(instruction_id);
+        if (sample == pending_counter_reads_.end())
+          return incomplete("BOOM retiring mcycle read lacks its execution-time sample");
+        if (sample->second.source_cycle > frame.cycle)
+          return invalid("BOOM counter read sample follows its owner retirement");
+      }
       if (configuration_.check_csr_post && certified_csr_instruction(core.instruction)) {
         const bool counter_write = certified_counter_write(core.instruction);
         if (!(counter_write ? frame.csr_write_probe_available : frame.csr_probe_available))
@@ -439,6 +467,7 @@ CheckResult NativeCollector::capture_retirements(const NativeFrame &frame) {
     }
     if (!core.architectural) {
       pending_counter_writes_.erase(instruction_id);
+      pending_counter_reads_.erase(instruction_id);
       pending_fp_.erase(instruction_id);
     }
     terminal_wfis_.erase(instruction_id);
@@ -473,6 +502,7 @@ CheckResult NativeCollector::capture_terminations(const NativeFrame &frame) {
     }
     terminal_wfis_.erase(instruction_id);
     pending_counter_writes_.erase(instruction_id);
+    pending_counter_reads_.erase(instruction_id);
     pending_fp_.erase(instruction_id);
     allocations_.erase(allocation);
     for (auto attempt = unresolved_samples_.begin(); attempt != unresolved_samples_.end();)
@@ -558,7 +588,7 @@ CheckResult NativeCollector::take_ready(CollectedObservations &output) {
     }
     ready.batch.events.push_back(std::move(converted));
   }
-  std::vector<OperationId> converted_csr, converted_fp;
+  std::vector<OperationId> converted_csr, converted_fp, converted_counters;
   for (const auto &retirement : staged_retirements_) {
     auto position = retirement_positions.find(retirement.id);
     if (position == retirement_positions.end())
@@ -570,6 +600,12 @@ CheckResult NativeCollector::take_ready(CollectedObservations &output) {
         return remember_failure(incomplete("BOOM CSR retirement escaped before its post-update sample"));
       captured.csr_post = std::make_pair(pending->second.address, *pending->second.after);
       converted_csr.push_back(retirement.id);
+    }
+    auto counter = pending_counter_reads_.find(retirement.id);
+    if (counter != pending_counter_reads_.end()) {
+      const auto &sample = counter->second;
+      captured.counter_read = CounterReadEnvironment{sample.address, sample.source_cycle, sample.value};
+      converted_counters.push_back(retirement.id);
     }
     auto fp = pending_fp_.find(retirement.id);
     if (fp != pending_fp_.end()) {
@@ -594,6 +630,8 @@ CheckResult NativeCollector::take_ready(CollectedObservations &output) {
     pending_csr_.erase(id);
   for (const auto &id : converted_fp)
     pending_fp_.erase(id);
+  for (const auto &id : converted_counters)
+    pending_counter_reads_.erase(id);
   emitted_sequence_ = next_sequence;
   closed_cycle_ = through;
   output = std::move(ready);
@@ -616,7 +654,7 @@ CheckResult NativeCollector::certify_parked_wfi_terminal(const ProbeIdentity &ow
   if (!captured_cycle_ || !closed_cycle_ || *captured_cycle_ != *closed_cycle_ ||
       source_cycle != *captured_cycle_ || !queues_empty_ || !cache_idle_ ||
       !staged_events_.empty() || !staged_retirements_.empty() || !unresolved_samples_.empty() ||
-      !pending_csr_.empty() || !pending_counter_writes_.empty() || !pending_fp_.empty() ||
+      !pending_csr_.empty() || !pending_counter_writes_.empty() || !pending_counter_reads_.empty() || !pending_fp_.empty() ||
       !skipped_device_stores_.empty() || adapter_.live_instructions())
     return incomplete("BOOM terminal WFI cannot close while source, cache or older instructions remain live");
   if (!owner.uid || owner.epoch != configuration_.epoch ||
@@ -649,7 +687,7 @@ CheckResult NativeCollector::completion() const {
     return failure_;
   if (!captured_cycle_ || !closed_cycle_ || *closed_cycle_ != *captured_cycle_ ||
       !staged_events_.empty() || !staged_retirements_.empty() || !unresolved_samples_.empty() ||
-      !allocations_.empty() || !pending_csr_.empty() || !pending_counter_writes_.empty() ||
+      !allocations_.empty() || !pending_csr_.empty() || !pending_counter_writes_.empty() || !pending_counter_reads_.empty() ||
       !pending_fp_.empty() || !queues_empty_ || !cache_idle_)
     return incomplete("BOOM source, instruction or cache observations have not drained");
   return adapter_.completion();

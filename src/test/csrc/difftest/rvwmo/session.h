@@ -36,6 +36,14 @@ struct FloatingPostState {
   }
 };
 
+// A physical counter value at the instruction's source-side execution edge.
+// It is an environment input, not an independent check of the counter itself.
+struct CounterReadEnvironment {
+  uint16_t address = 0;
+  uint64_t source_cycle = 0;
+  uint64_t value = 0;
+};
+
 struct ArchitecturalRetirement {
   OperationId id;
   uint64_t pc = 0;
@@ -46,6 +54,7 @@ struct ArchitecturalRetirement {
   // Independently observed CSRFile state after this retirement; opt-in.
   std::optional<std::pair<uint16_t, uint64_t>> csr_post;
   std::optional<FloatingPostState> fp_post;
+  std::optional<CounterReadEnvironment> counter_read;
 };
 
 struct ReferenceIntegerWrite {
@@ -75,12 +84,14 @@ struct ReferenceStepResult {
   uint32_t reference_instruction = 0;
   bool took_trap = false;
   bool skipped_device_store = false;
+  bool counter_read_synchronized = false;
 };
 
 struct SessionHartStatistics {
   uint64_t reference_steps = 0;
   uint64_t architecture_compared = 0;
   uint64_t skipped_device_stores = 0;
+  uint64_t counter_reads_synchronized = 0;
   // Retirement accepted by the consumer; final Pass certifies any deferred PPO
   // work. These are not counters for already completed PPO checks.
   uint64_t retired_instructions = 0;

@@ -357,6 +357,7 @@ std::string HostSession::final_report() const {
     output << "{\"hart\":" << hart << ",\"dut_retired\":" << statistics.retired_instructions
            << ",\"ref_steps\":" << statistics.reference_steps
            << ",\"arch_compares\":" << statistics.architecture_compared
+           << ",\"counter_reads_synchronized\":" << statistics.counter_reads_synchronized
            << ",\"excluded_device_store_skips\":" << statistics.skipped_device_stores
            << ",\"accepted_load_operations\":" << statistics.retired_load_operations
            << ",\"accepted_store_operations\":" << statistics.retired_store_operations
