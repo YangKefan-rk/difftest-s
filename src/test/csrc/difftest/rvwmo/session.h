@@ -8,6 +8,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <utility>
 #include <vector>
 
@@ -42,6 +43,17 @@ struct CounterReadEnvironment {
   uint16_t address = 0;
   uint64_t source_cycle = 0;
   uint64_t value = 0;
+};
+
+// Physical BOOM exception boundary: no invented architectural retirement.
+// The reference hart must independently trap and match every observed field.
+struct ArchitecturalTrap {
+  OperationId id;
+  uint32_t instruction = 0;
+  uint64_t pc = 0, cause = 0, target_pc = 0, privilege = 0;
+  uint64_t mstatus = 0, mepc = 0, mcause = 0, mtval = 0;
+  uint64_t sepc = 0, scause = 0, stval = 0;
+  bool physically_retired = false;
 };
 
 struct ArchitecturalRetirement {
@@ -92,6 +104,7 @@ struct SessionHartStatistics {
   uint64_t architecture_compared = 0;
   uint64_t skipped_device_stores = 0;
   uint64_t counter_reads_synchronized = 0;
+  uint64_t checked_traps = 0;
   // Retirement accepted by the consumer; final Pass certifies any deferred PPO
   // work. These are not counters for already completed PPO checks.
   uint64_t retired_instructions = 0;
@@ -111,6 +124,8 @@ public:
   // It is provisional until the owning HostSession reaches a complete Pass.
   using SemanticEventObserver = std::function<void(const RuntimeEvent &)>;
 
+  using TrapStepper = std::function<CheckResult(const TrapEvent &, const ArchitecturalTrap &)>;
+
   ObservationSession(StreamContract contract, std::vector<ProducerCapability> producers,
                     Memory::ReadGlobal read_global, Memory::WriteGlobal write_global, ReferenceStepper reference_stepper,
                     size_t max_live_instructions = 65536, size_t max_pending_retirements = 65536,
@@ -121,7 +136,9 @@ public:
   const std::string &semantic_observer_error() const { return semantic_observer_error_; }
 
   SessionSubmitResult submit(const EventBatch &batch,
-                             const std::vector<ArchitecturalRetirement> &retirements = {});
+                             const std::vector<ArchitecturalRetirement> &retirements = {},
+                             const std::vector<ArchitecturalTrap> &traps = {});
+  void set_trap_stepper(TrapStepper stepper) { trap_stepper_ = std::move(stepper); }
   CheckResult poll();
   CheckResult finalize(uint64_t completed_cycle);
   size_t pending_events() const { return pending_events_.size(); }
@@ -154,6 +171,9 @@ private:
   SemanticEventObserver semantic_observer_;
   std::string semantic_observer_error_;
   bool semantic_observer_failed_ = false;
+  TrapStepper trap_stepper_;
+  std::map<OperationId, ArchitecturalTrap> architectural_traps_;
+  std::set<OperationId> completed_traps_;
   std::deque<PendingEvent> pending_events_;
   std::map<OperationId, ArchitecturalRetirement> architectural_retirements_;
   std::map<OperationId, ReferenceRecord> reference_records_;
@@ -172,6 +192,7 @@ private:
   CheckResult ensure_statistics_hart(uint32_t hart);
   CheckResult consume_pending_events();
   CheckResult consume_retirement(const RuntimeEvent &event, const InstructionRetireEvent &retirement);
+  CheckResult consume_trap(const RuntimeEvent &event, const TrapEvent &trap);
   CheckResult step_reference(const InstructionRetireEvent &retirement, const ArchitecturalRetirement &snapshot);
   CheckResult remember_failure(CheckResult result);
 };

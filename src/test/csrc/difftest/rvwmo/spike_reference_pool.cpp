@@ -4,7 +4,7 @@
 namespace rvwmo {
 
 SpikeReferencePool::SpikeReferencePool(GlobalMem &memory, uint32_t profile_id,
-                                       const std::vector<difftest_ref_state_v1> &initial_states)
+                                       const std::vector<difftest_ref_state_v1> &initial_states, bool require_boom_entry_csr)
     : memory_(memory) {
   if (initial_states.empty() || initial_states.size() > 1024 || memory_.size() == 0) {
     configuration_ = {CheckStatus::Invalid, 0, "reference pool requires initialized memory and 1..1024 hart states"};
@@ -28,7 +28,10 @@ SpikeReferencePool::SpikeReferencePool(GlobalMem &memory, uint32_t profile_id,
     references_.push_back(std::move(reference));
   }
   stepper_ = std::make_unique<SpikeReferenceStepper>(std::move(handles), profile_id,
-      [this](uint64_t address, uint8_t *bytes, size_t size) { return memory_.read(address, bytes, size); });
+      [this](uint64_t address, uint8_t *bytes, size_t size) { return memory_.read(address, bytes, size); },
+      require_boom_entry_csr);
+  if (require_boom_entry_csr)
+    return;
   for (size_t hart = 0; hart < initial_states.size(); ++hart) {
     auto initialized = stepper_->initialize_hart(static_cast<uint32_t>(hart), initial_states[hart]);
     if (!initialized) {
@@ -39,6 +42,13 @@ SpikeReferencePool::SpikeReferencePool(GlobalMem &memory, uint32_t profile_id,
 }
 
 SpikeReferencePool::~SpikeReferencePool() = default;
+
+CheckResult SpikeReferencePool::initialize_boom_entry_csr(uint32_t hart,
+    const difftest_ref_state_v1 &initial_state, const OperationId &identity) {
+  if (!configuration_ || !stepper_)
+    return configuration_;
+  return stepper_->initialize_hart(hart, initial_state, identity);
+}
 
 ObservationSession::ReferenceStepper SpikeReferencePool::callback() {
   if (!configuration_ || !stepper_) {
@@ -51,6 +61,14 @@ ObservationSession::ReferenceStepper SpikeReferencePool::callback() {
     };
   }
   return stepper_->callback();
+}
+
+ObservationSession::TrapStepper SpikeReferencePool::trap_callback() {
+  if (!configuration_ || !stepper_) {
+    const auto failure = configuration_;
+    return [failure](const TrapEvent &, const ArchitecturalTrap &) { return failure; };
+  }
+  return stepper_->trap_callback();
 }
 
 const difftest_ref_profile_v1 *SpikeReferencePool::profile(uint32_t hart) const {

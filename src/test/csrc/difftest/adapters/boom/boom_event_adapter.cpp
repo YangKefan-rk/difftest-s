@@ -856,6 +856,45 @@ CheckResult BoomEventAdapter::publish_merged_stores(const MergedStorePublication
   return {};
 }
 
+CheckResult BoomEventAdapter::trap(const OperationId &id, const SlotGeneration &rob, uint64_t pc,
+                                  uint64_t cause, const EventSource &source) {
+  auto result = validate_id(id);
+  if (!result) return result;
+  result = owned_slot(rob_, rob, id);
+  if (!result) return result;
+  const auto it = instructions_.find(id);
+  if (it == instructions_.end() || it->second.retired || id.uid <= last_retired_uid_ ||
+      it->second.allocation.pc != pc)
+    return invalid("BOOM trap has no unique live ROB owner in architectural order");
+  const auto &record = it->second;
+  // A fault may have claimed a queue and begun a load attempt without ever
+  // sampling data. The unsampled begin is private; a sampled attempt or any
+  // local, device, atomic or published memory effect cannot be discarded.
+  if (record.store || record.atomic_local_committed || record.atomic_applied ||
+      record.skipped_device_store || record.stq_released || record.published || record.audited ||
+      std::any_of(record.attempts.begin(), record.attempts.end(), [](const auto &attempt) {
+        return attempt.second.state == AttemptState::Sampled;
+      }))
+    return unsupported("BOOM fault has a sampled load or possible memory effect");
+  for (const auto &older : instructions_)
+    if (older.first.hart == id.hart && older.first.epoch == id.epoch &&
+        older.first.uid < id.uid && !older.second.retired)
+      return pending("BOOM trap awaits an older live instruction to retire or squash");
+  const bool interrupt = (cause >> 63) != 0;
+  if (interrupt)
+    return unsupported("BOOM asynchronous interrupt needs a separately checked reference boundary");
+  result = append(source, RuntimeEventKind::Trap, TrapEvent{id.hart, id, pc, cause, interrupt});
+  if (!result) return result;
+  last_retired_uid_ = id.uid;
+  release_slot(rob_, rob);
+  if (record.allocation.ldq)
+    release_slot(ldq_, *record.allocation.ldq);
+  if (record.allocation.stq)
+    release_slot(stq_, *record.allocation.stq);
+  instructions_.erase(it);
+  return {};
+}
+
 CheckResult BoomEventAdapter::retire(const Retirement &record) {
   auto result = validate_id(record.id);
   if (!result)

@@ -279,8 +279,12 @@ CheckResult ObservationSession::consume_pending_events() {
         ++pending_event;
         continue;
       }
-      if (event.kind == RuntimeEventKind::InstructionRetire &&
-          retirement_blocked[std::get<InstructionRetireEvent>(event.payload).instruction.hart]) {
+      const bool retirement = event.kind == RuntimeEventKind::InstructionRetire;
+      const bool trap = event.kind == RuntimeEventKind::Trap;
+      const uint32_t architectural_hart = retirement
+          ? std::get<InstructionRetireEvent>(event.payload).instruction.hart
+          : trap ? std::get<TrapEvent>(event.payload).hart : 0;
+      if ((retirement || trap) && retirement_blocked[architectural_hart]) {
         ++pending_event;
         continue;
       }
@@ -310,6 +314,8 @@ CheckResult ObservationSession::consume_pending_events() {
       CheckResult result;
       if (event.kind == RuntimeEventKind::InstructionRetire)
         result = consume_retirement(event, std::get<InstructionRetireEvent>(event.payload));
+      else if (event.kind == RuntimeEventKind::Trap)
+        result = consume_trap(event, std::get<TrapEvent>(event.payload));
       else if (pending_event->memory_group) {
         if (pending_event->memory_group->independent_effects)
           result = consumer_.consume_independent_group_member(event, true);
@@ -324,8 +330,8 @@ CheckResult ObservationSession::consume_pending_events() {
       if (result.status == CheckStatus::Pending) {
         if (memory_event)
           memory_blocked = true;
-        if (event.kind == RuntimeEventKind::InstructionRetire)
-          retirement_blocked[std::get<InstructionRetireEvent>(event.payload).instruction.hart] = true;
+        if (retirement || trap)
+          retirement_blocked[architectural_hart] = true;
         ++pending_event;
         continue;
       }
@@ -519,8 +525,44 @@ CheckResult ObservationSession::consume_retirement(const RuntimeEvent &event,
   return result;
 }
 
+CheckResult ObservationSession::consume_trap(const RuntimeEvent &event, const TrapEvent &trap) {
+  const auto snapshot = architectural_traps_.find(trap.instruction);
+  if (snapshot == architectural_traps_.end())
+    return pending("trap awaits its independent physical post-state snapshot");
+  const auto &state = snapshot->second;
+  if (state.id != trap.instruction || state.pc != trap.pc || state.cause != trap.cause ||
+      trap.hart != state.id.hart || trap.interrupt)
+    return remember_failure(invalid("trap boundary differs from its physical instruction, PC or cause"));
+  if (!completed_traps_.count(state.id)) {
+    auto prepared = consumer_.prepare_trap(trap);
+    if (!prepared) return remember_failure(prepared);
+    if (!trap_stepper_)
+      return remember_failure({CheckStatus::Unsupported, 0, "trap has no independent reference trap-step callback"});
+    auto checked = ensure_statistics_hart(trap.hart);
+    if (!checked) return remember_failure(checked);
+    auto &statistics = hart_statistics_.at(trap.hart);
+    if (statistics.checked_traps == std::numeric_limits<uint64_t>::max() ||
+        statistics.reference_steps == std::numeric_limits<uint64_t>::max())
+      return remember_failure(invalid("session trap statistics counter exhausted"));
+    checked = trap_stepper_(trap, state);
+    if (checked.status == CheckStatus::Pending)
+      return remember_failure(invalid("reference trap callback must finish synchronously once invoked"));
+    if (!checked) return remember_failure(checked);
+    ++statistics.reference_steps;
+    ++statistics.checked_traps;
+    completed_traps_.insert(state.id);
+  }
+  auto consumed = consumer_.consume_closed(event);
+  if (consumed) {
+    completed_traps_.erase(state.id);
+    architectural_traps_.erase(snapshot);
+  }
+  return consumed;
+}
+
 SessionSubmitResult ObservationSession::submit(const EventBatch &batch,
-                                               const std::vector<ArchitecturalRetirement> &retirements) {
+                                               const std::vector<ArchitecturalRetirement> &retirements,
+                                               const std::vector<ArchitecturalTrap> &traps) {
   SessionSubmitResult result;
   if (!failure_) {
     result.transport = {EventValidationStatus::Invalid, failure_.message};
@@ -572,6 +614,24 @@ SessionSubmitResult ObservationSession::submit(const EventBatch &batch,
     }
   }
 
+  if (traps.size() > max_architectural_retirements_ -
+          std::min(max_architectural_retirements_, architectural_traps_.size())) {
+    result.transport = {EventValidationStatus::Pending, "architectural trap snapshot queue is full"};
+    result.check = pending("retry trap snapshots after their closed trap events are consumed");
+    return result;
+  }
+  std::set<OperationId> new_trap_ids;
+  for (const auto &snapshot : traps)
+    if (!snapshot.id.uid || snapshot.id.subaccess || snapshot.pc % 2 ||
+        (snapshot.privilege != 1 && snapshot.privilege != 3) ||
+        architectural_retirements_.count(snapshot.id) || new_retirement_ids.count(snapshot.id) ||
+        architectural_traps_.count(snapshot.id) || completed_traps_.count(snapshot.id) ||
+        !new_trap_ids.insert(snapshot.id).second) {
+      result.transport = {EventValidationStatus::Invalid, "invalid or duplicate physical trap snapshot"};
+      result.check = remember_failure(invalid("invalid or duplicate physical trap snapshot"));
+      return result;
+    }
+
   result.transport = stream_.submit(batch);
   if (!result.transport) {
     result.check = result.transport.status == EventValidationStatus::Unsupported
@@ -588,6 +648,8 @@ SessionSubmitResult ObservationSession::submit(const EventBatch &batch,
 
   for (const auto &snapshot : retirements)
     architectural_retirements_.emplace(snapshot.id, snapshot);
+  for (const auto &snapshot : traps)
+    architectural_traps_.emplace(snapshot.id, snapshot);
 
   result.check = poll();
   result.pending_events = pending_events_.size();
@@ -637,6 +699,8 @@ CheckResult ObservationSession::finalize(uint64_t completed_cycle) {
     return remember_failure(incomplete("session has retained semantic events that cannot make progress"));
   if (!architectural_retirements_.empty())
     return remember_failure(incomplete("session has architectural snapshots without matching retirements"));
+  if (!architectural_traps_.empty() || !completed_traps_.empty())
+    return remember_failure(incomplete("session has physical trap snapshots without matching exception boundaries"));
   auto result = consumer_.finalize();
   if (result.status == CheckStatus::Pending)
     return remember_failure({CheckStatus::Incomplete, result.rule,

@@ -31,6 +31,7 @@ struct NativePublication {
 struct NativeSquash {
   ProbeIdentity identity;
   uint32_t rob_index = 0;
+  bool rollback = false;
 };
 struct NativeCsrPost {
   ProbeIdentity identity;
@@ -56,6 +57,20 @@ struct NativeAtomicApplied {
   bool exclusive_valid = false;
   EventSource source;
 };
+struct NativeTrap {
+  ProbeIdentity identity;
+  uint64_t source_cycle = 0;
+  uint64_t pc = 0;
+  uint64_t cause = 0;
+};
+struct NativeTrapPost {
+  ProbeIdentity identity;
+  uint64_t source_cycle = 0;
+  uint64_t pc = 0, cause = 0, target_pc = 0, privilege = 0;
+  uint64_t mstatus = 0, mepc = 0, mcause = 0, mtval = 0;
+  uint64_t sepc = 0, scause = 0, stval = 0;
+};
+
 struct NativeFrame {
   uint32_t hart = 0;
   uint64_t epoch = 0;
@@ -83,7 +98,9 @@ struct NativeFrame {
   std::vector<NativeSquash> squashes;
   std::vector<NativePublication> publications;
   std::vector<NativeAtomicApplied> atomic_applied;
-  bool trap = false;
+  std::optional<NativeTrap> trap;
+  bool trap_post_probe_available = false;
+  std::optional<NativeTrapPost> trap_post;
   bool queues_empty = false;
   bool cache_idle = false;
   // Optional typed ingress for a producer that proves a complete coalesced
@@ -111,6 +128,7 @@ struct NativeCollectorConfiguration {
 struct CollectedObservations {
   EventBatch batch;
   std::vector<ArchitecturalRetirement> retirements;
+  std::vector<ArchitecturalTrap> traps;
 };
 struct CaptureResult {
   CheckResult check;
@@ -156,6 +174,12 @@ private:
     std::optional<FloatingPostState> after;
   };
   std::map<OperationId, PendingFp> pending_fp_;
+  struct PendingSystem { ProbeInstruction core; uint64_t retirement_cycle = 0; };
+  std::optional<PendingSystem> pending_system_;
+  std::optional<NativeTrap> pending_trap_;
+  struct PendingFaultRollback { ProbeIdentity identity; uint32_t rob_index; uint64_t cycle; };
+  std::optional<PendingFaultRollback> pending_fault_rollback_;
+  std::map<OperationId, ArchitecturalTrap> staged_traps_;
   std::map<AttemptKey, uint64_t> unresolved_samples_;
   std::vector<RuntimeEvent> staged_events_;
   std::vector<CapturedRetirement> staged_retirements_;
@@ -176,6 +200,8 @@ private:
   CheckResult capture_attempts(const NativeFrame &frame);
   CheckResult capture_cancellation(const NativeAttempt &cancel, uint64_t cycle);
   CheckResult capture_retirements(const NativeFrame &frame);
+  CheckResult capture_trap_begin(const NativeFrame &frame);
+  CheckResult capture_trap_post(const NativeFrame &frame);
   CheckResult capture_terminations(const NativeFrame &frame);
   CheckResult collect_adapter_output();
   CheckResult validate_attempt(const NativeAttempt &attempt) const;
