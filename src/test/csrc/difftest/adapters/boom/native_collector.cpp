@@ -43,7 +43,7 @@ bool faulting_scalar_refill(const ProbeLoad &probe, const InstructionAllocation 
   if (probe.log2_size != log2_size)
     return false;
   const unsigned width = 1U << log2_size;
-  return (probe.address & (width - 1)) != 0 && width > 8 - (probe.address & 7);
+  return (probe.address & (width - 1)) != 0;
 }
 } // namespace
 
@@ -389,9 +389,9 @@ CheckResult NativeCollector::capture_attempts(const NativeFrame &frame) {
     const AttemptKey key{id(probe.identity), probe.identity.attempt};
     const auto owner = allocations_.find(key.first);
     if (owner != allocations_.end() && faulting_scalar_refill(probe, owner->second)) {
-      // The one-word refill has no second-word bytes or writer identities.
-      // It is not a valid LoadSample. Only a later precise misaligned-load
-      // trap (or a cancelled/squashed attempt) can discharge this candidate.
+      // A misaligned refill cannot certify an architectural read, even when
+      // its truncated mask fits one word. Keep it private until a precise
+      // misaligned-load trap or a physical cancellation/squash closes it.
       const auto begin = unresolved_samples_.find(key);
       if (begin == unresolved_samples_.end() || complete.sampled_at.cycle < begin->second ||
           !faulting_refills_.emplace(key.first, key.second).second)
@@ -453,7 +453,7 @@ CheckResult NativeCollector::capture_retirements(const NativeFrame &frame) {
         core.uses_ldq != allocation->second.ldq.has_value() || core.uses_stq != allocation->second.stq.has_value())
       return invalid("BOOM physical retirement differs from its retained core/ROB allocation");
     if (core.architectural && faulting_refills_.count(instruction_id))
-      return {CheckStatus::Unsupported, 0, "BOOM cross-word refill retired without a precise misalignment trap"};
+      return {CheckStatus::Unsupported, 0, "BOOM misaligned refill retired without a precise misalignment trap"};
     // ECALL/EBREAK may retire physically before the precise exception edge.
     // Do not step REF or free the ROB owner until its matching trap post-state.
     const bool system_trap = core.architectural &&
@@ -607,7 +607,7 @@ CheckResult NativeCollector::capture_trap_post(const NativeFrame &frame) {
     return {CheckStatus::Violation, 0, "BOOM trap CSR EPC/cause differs from its physical fault"};
   const bool physically_retired = pending_system_.has_value();
   if (faulting_refills_.count(instruction_id) && trap.cause != 4)
-    return {CheckStatus::Unsupported, 0, "BOOM cross-word refill lacks a misaligned-load fault"};
+    return {CheckStatus::Unsupported, 0, "BOOM misaligned refill lacks a misaligned-load fault"};
   if (!physically_retired && trap.source_cycle > UINT64_MAX - 3)
     return incomplete("BOOM synchronous fault lacks a bounded precise rollback owner");
   auto recorded = adapter_.trap(instruction_id, allocation->second.rob, trap.pc, trap.cause,

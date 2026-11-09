@@ -39,6 +39,14 @@ samples. Preserve the selected result's real `source_cycle`, sampling evidence,
 physical address, width, byte mask and known writer identities. Response delivery
 time is not the load's source time. Unknown byte writers remain unknown.
 
+A naturally misaligned integer or FLW/FLD refill cannot certify a successful
+read, even if the one-word probe supplies some bytes. Retain that attempt only
+until its exact load-misalignment trap (with post-state and physical rollback),
+or a validated cancellation/squash; successful retirement remains unsupported.
+A physical cancellation at T+1 of the pending trap's unsampled load is a private
+rollback fact, not a public cancellation after Trap(T) removed its parent.
+Never discard a sampled load or a cancellation of another instruction this way.
+
 `begin_load_attempt` retains the earliest possible source cycle privately. It
 does not consume a public producer sequence. `take_ready` releases a safe source
 prefix in cycle order and then assigns strictly increasing hart-channel
