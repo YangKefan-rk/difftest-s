@@ -181,6 +181,9 @@ private:
   std::optional<PendingFaultRollback> pending_fault_rollback_;
   std::map<OperationId, ArchitecturalTrap> staged_traps_;
   std::map<AttemptKey, uint64_t> unresolved_samples_;
+  // A misaligned scalar refill cannot become an architectural read. Retain
+  // its physical attempt until the same owner faults, cancels, or squashes.
+  std::map<OperationId, uint32_t> faulting_refills_;
   std::vector<RuntimeEvent> staged_events_;
   std::vector<CapturedRetirement> staged_retirements_;
   std::optional<uint64_t> captured_cycle_;

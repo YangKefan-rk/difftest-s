@@ -19,6 +19,24 @@ bool same_terminal_owner(const ProbeIdentity &lhs, const ProbeIdentity &rhs) {
   return same_instruction(lhs, rhs) && lhs.memory_generation == rhs.memory_generation &&
          lhs.attempt == rhs.attempt;
 }
+bool faulting_scalar_refill(const ProbeLoad &probe, const InstructionAllocation &owner) {
+  if (owner.length != 4 || (owner.instruction & 0x7f) != 0x03 || !owner.ldq ||
+      probe.sampling_point != LoadSamplingPoint::RefillData || !probe.source_complete ||
+      probe.known_writer_mask || !probe.byte_mask)
+    return false;
+  const unsigned funct3 = (owner.instruction >> 12) & 7;
+  unsigned log2_size = 0;
+  switch (funct3) {
+  case 1: case 5: log2_size = 1; break; // LH/LHU
+  case 2: case 6: log2_size = 2; break; // LW/LWU
+  case 3: log2_size = 3; break;         // LD
+  default: return false;
+  }
+  if (probe.log2_size != log2_size)
+    return false;
+  const unsigned width = 1U << log2_size;
+  return (probe.address & (width - 1)) != 0 && width > 8 - (probe.address & 7);
+}
 } // namespace
 
 NativeCollector::NativeCollector(NativeCollectorConfiguration configuration)
@@ -356,6 +374,22 @@ CheckResult NativeCollector::capture_attempts(const NativeFrame &frame) {
       return checked;
     if (complete.sampled_at.cycle > frame.cycle)
       return invalid("BOOM completed load claims a future source cycle");
+    const AttemptKey key{id(probe.identity), probe.identity.attempt};
+    const auto owner = allocations_.find(key.first);
+    if (owner != allocations_.end() && faulting_scalar_refill(probe, owner->second)) {
+      // The one-word refill has no second-word bytes or writer identities.
+      // It is not a valid LoadSample. Only a later precise misaligned-load
+      // trap (or a cancelled/squashed attempt) can discharge this candidate.
+      const auto begin = unresolved_samples_.find(key);
+      if (begin == unresolved_samples_.end() || complete.sampled_at.cycle < begin->second ||
+          !faulting_refills_.emplace(key.first, key.second).second)
+        return invalid("BOOM faulting refill repeats or lacks its live load attempt");
+      auto checked_ram = require_checked_ram(probe.address, size_t{1} << probe.log2_size);
+      if (!checked_ram)
+        return checked_ram;
+      unresolved_samples_.erase(key);
+      continue;
+    }
     LoadObservation sample;
     auto source = capture_source(complete.sampled_at.cycle);
     source.position.qualified_phase = complete.sampled_at.qualified_phase;
@@ -371,8 +405,12 @@ CheckResult NativeCollector::capture_attempts(const NativeFrame &frame) {
 CheckResult NativeCollector::capture_cancellation(const NativeAttempt &cancel, uint64_t cycle) {
   auto result = adapter_.cancel_load_attempt(convert_attempt(configuration_.hart, cancel.identity, cancel.queue_index),
                                              capture_source(cycle));
-  if (result)
+  if (result) {
+    const auto fault = faulting_refills_.find(id(cancel.identity));
+    if (fault != faulting_refills_.end() && fault->second == cancel.identity.attempt)
+      faulting_refills_.erase(fault);
     unresolved_samples_.erase({id(cancel.identity), cancel.identity.attempt});
+  }
   return result;
 }
 
@@ -388,6 +426,8 @@ CheckResult NativeCollector::capture_retirements(const NativeFrame &frame) {
         core.instruction != allocation->second.instruction ||
         core.uses_ldq != allocation->second.ldq.has_value() || core.uses_stq != allocation->second.stq.has_value())
       return invalid("BOOM physical retirement differs from its retained core/ROB allocation");
+    if (core.architectural && faulting_refills_.count(instruction_id))
+      return {CheckStatus::Unsupported, 0, "BOOM cross-word refill retired without a precise misalignment trap"};
     // ECALL/EBREAK may retire physically before the precise exception edge.
     // Do not step REF or free the ROB owner until its matching trap post-state.
     const bool system_trap = core.architectural &&
@@ -485,6 +525,7 @@ CheckResult NativeCollector::capture_retirements(const NativeFrame &frame) {
     }
     terminal_wfis_.erase(instruction_id);
     allocations_.erase(allocation);
+    faulting_refills_.erase(instruction_id);
     for (auto attempt = unresolved_samples_.begin(); attempt != unresolved_samples_.end();)
       if (attempt->first.first == instruction_id)
         attempt = unresolved_samples_.erase(attempt);
@@ -539,6 +580,8 @@ CheckResult NativeCollector::capture_trap_post(const NativeFrame &frame) {
                           : (post.sepc != trap.pc || post.scause != trap.cause))
     return {CheckStatus::Violation, 0, "BOOM trap CSR EPC/cause differs from its physical fault"};
   const bool physically_retired = pending_system_.has_value();
+  if (faulting_refills_.count(instruction_id) && trap.cause != 4)
+    return {CheckStatus::Unsupported, 0, "BOOM cross-word refill lacks a misaligned-load fault"};
   if (!physically_retired && trap.source_cycle > UINT64_MAX - 3)
     return incomplete("BOOM synchronous fault lacks a bounded precise rollback owner");
   auto recorded = adapter_.trap(instruction_id, allocation->second.rob, trap.pc, trap.cause,
@@ -549,6 +592,7 @@ CheckResult NativeCollector::capture_trap_post(const NativeFrame &frame) {
       physically_retired};
   if (!staged_traps_.emplace(instruction_id, snapshot).second)
     return invalid("BOOM physical trap post-state repeats its architectural UID");
+  faulting_refills_.erase(instruction_id);
   if (!physically_retired)
     pending_fault_rollback_ = PendingFaultRollback{trap.identity, allocation->second.rob.index,
                                                     trap.source_cycle + 3};
@@ -608,6 +652,7 @@ CheckResult NativeCollector::capture_terminations(const NativeFrame &frame) {
     pending_counter_reads_.erase(instruction_id);
     pending_fp_.erase(instruction_id);
     allocations_.erase(allocation);
+    faulting_refills_.erase(instruction_id);
     for (auto attempt = unresolved_samples_.begin(); attempt != unresolved_samples_.end();)
       if (attempt->first.first == instruction_id)
         attempt = unresolved_samples_.erase(attempt);
@@ -783,6 +828,7 @@ CheckResult NativeCollector::certify_parked_wfi_terminal(const ProbeIdentity &ow
   if (!captured_cycle_ || !closed_cycle_ || *captured_cycle_ != *closed_cycle_ ||
       source_cycle != *captured_cycle_ || !queues_empty_ || !cache_idle_ ||
       !staged_events_.empty() || !staged_retirements_.empty() || !unresolved_samples_.empty() ||
+      !faulting_refills_.empty() ||
       !pending_csr_.empty() || !pending_counter_writes_.empty() || !pending_counter_reads_.empty() || !pending_fp_.empty() || pending_system_ || pending_trap_ ||
       pending_fault_rollback_ || !staged_traps_.empty() ||
       !skipped_device_stores_.empty() || adapter_.live_instructions())
@@ -817,6 +863,7 @@ CheckResult NativeCollector::completion() const {
     return failure_;
   if (!captured_cycle_ || !closed_cycle_ || *closed_cycle_ != *captured_cycle_ ||
       !staged_events_.empty() || !staged_retirements_.empty() || !unresolved_samples_.empty() ||
+      !faulting_refills_.empty() ||
       !allocations_.empty() || !pending_csr_.empty() || !pending_counter_writes_.empty() || !pending_counter_reads_.empty() ||
       !pending_fp_.empty() || pending_system_ || pending_trap_ ||
       pending_fault_rollback_ || !staged_traps_.empty() || !queues_empty_ || !cache_idle_)
