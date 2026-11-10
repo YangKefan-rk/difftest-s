@@ -114,6 +114,18 @@ private:
     uint64_t address;
     std::vector<uint8_t> mask;
   };
+  struct CheckedFusedRetirement {
+    unsigned hart;
+    uint64_t pc;
+    uint32_t instruction;
+    unsigned n_fused;
+    bool is_rvc;
+    unsigned lane;
+    uint64_t source_cycle;
+    unsigned source_id;
+    uint64_t source_sequence;
+    std::vector<std::pair<uint64_t, uint32_t>> reference_instructions;
+  };
   struct Active {
     RetiredInstruction instruction;
     std::shared_ptr<Load> load;
@@ -122,6 +134,7 @@ private:
     unsigned instruction_count = 1;
     bool is_rvc = false;
     std::vector<std::pair<uint64_t, uint32_t>> reference_instructions;
+    std::optional<CheckedFusedRetirement> checked_fused_retirement;
   };
   struct Hart {
     uint64_t next_uid = 1;
@@ -207,6 +220,9 @@ private:
   bool observed_prefix_emitted_ = false;
   bool semantic_export_enabled_ = false;
   bool semantic_export_overflow_ = false;
+  bool checked_fused_retirements_overflow_ = false;
+  size_t checked_fused_instruction_count_ = 0;
+  std::vector<CheckedFusedRetirement> checked_fused_retirements_;
   bool semantic_excluded_device_store_ = false;
   std::vector<ExcludedDeviceStore> semantic_excluded_device_stores_;
   uint64_t excluded_atomic_effect_count_ = 0;
@@ -225,6 +241,7 @@ private:
   void observe_write(uint64_t cycle, unsigned hart, uint64_t address, const std::vector<uint8_t> &mask);
   CheckResult allocate(unsigned hart, uint16_t rob);
   void collect_released_stores();
+  void record_checked_fused_retirement(Active &active);
   size_t pending_atomics() const;
   void timestamp(uint64_t cycle);
   static void observe_reference_instruction(void *context, uint64_t pc, uint32_t instruction);

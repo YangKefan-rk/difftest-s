@@ -91,6 +91,8 @@ std::vector<uint8_t> mask_bytes(uint64_t mask, size_t count) {
   return bytes;
 }
 constexpr size_t max_semantic_events = 100000;
+// Bound the total raw observer words, including each fused packet's head.
+constexpr size_t max_checked_fused_instructions = 100000;
 uint64_t enabled_byte_mask(const std::vector<uint8_t> &bytes) {
   uint64_t mask = 0;
   for (size_t byte = 0; byte < bytes.size() && byte < 64; ++byte)
@@ -1074,6 +1076,12 @@ CheckResult Runtime::before_commit(unsigned hart, unsigned port, DiffTestState &
   }
   active.instruction_count = unsigned(commit.nFused) + 1;
   active.is_rvc = commit.isRVC;
+#ifdef CONFIG_DIFFTEST_SOURCEPREFIXEVENT
+  if (semantic_export_enabled_ && commit.nFused)
+    active.checked_fused_retirement = CheckedFusedRetirement{
+        hart, commit.pc, commit.instr, commit.nFused, bool(commit.isRVC), port,
+        commit.timestamp, commit.sourceId, commit.sourceSequence, {}};
+#endif
   if (commit.nFused && !reference.set_instruction_observer(&Runtime::observe_reference_instruction, &h))
     return unsupported("fused retirement requires reference instruction observation");
   h.active = std::move(active);
@@ -1264,7 +1272,20 @@ CheckResult Runtime::after_commit(unsigned hart, RefProxy &reference) {
   if (active.atomic && !active.atomic->write_seen)
     h.atomics.erase(active.atomic->id);
   collect_released_stores();
+  record_checked_fused_retirement(active);
   return {};
+}
+void Runtime::record_checked_fused_retirement(Active &active) {
+  if (!active.checked_fused_retirement || checked_fused_retirements_overflow_)
+    return;
+  if (active.reference_instructions.size() > max_checked_fused_instructions - checked_fused_instruction_count_) {
+    checked_fused_retirements_overflow_ = true;
+    return;
+  }
+  auto record = std::move(*active.checked_fused_retirement);
+  record.reference_instructions = std::move(active.reference_instructions);
+  checked_fused_instruction_count_ += record.reference_instructions.size();
+  checked_fused_retirements_.push_back(std::move(record));
 }
 CheckResult Runtime::verify_store(unsigned hart, uint64_t uid, uint64_t address, uint64_t data, uint8_t mask) {
   if (!covered())
@@ -1503,11 +1524,13 @@ bool Runtime::export_semantic_observed_prefix() const {
   bool invalid_physical_address = false;
   bool duplicate_logical_identity = false;
   bool missing_checked_store = false;
+  bool invalid_checked_fused_source = false;
   std::set<std::tuple<unsigned, unsigned, uint64_t>> used_source_positions;
   std::set<std::tuple<unsigned, uint64_t, uint32_t, uint32_t>> used_load_ids;
   std::set<std::pair<unsigned, uint64_t>> used_group_ids;
   std::vector<const SemanticLoad *> checked_loads;
   std::vector<const SemanticGroup *> checked_groups;
+  std::vector<const CheckedFusedRetirement *> checked_fused_retirements;
   const auto source_is_recorded = [&](unsigned hart, unsigned id, uint64_t sequence, uint64_t cycle) {
     const auto found = std::find_if(producers.begin(), producers.end(), [&](const SourceProducerWatermark &producer) {
       return producer.hart == hart && producer.source_id == id;
@@ -1561,6 +1584,22 @@ bool Runtime::export_semantic_observed_prefix() const {
     }
     checked_groups.push_back(&group);
   }
+  for (const auto &retirement : checked_fused_retirements_) {
+    // Only attest packets inside the same certified observation prefix.
+    if (retirement.source_cycle > *source.closed_through)
+      continue;
+    const auto producer = std::find_if(producers.begin(), producers.end(), [&](const SourceProducerWatermark &entry) {
+      return entry.hart == retirement.hart && entry.source_id == retirement.source_id;
+    });
+    // Source transport uses its stable source ordinal as the producer lane;
+    // retirement.lane separately preserves the DUT commit port.
+    if (producer == producers.end() || producer->kind != 1 || producer->lane != retirement.source_id ||
+        !source_is_recorded(retirement.hart, retirement.source_id, retirement.source_sequence, retirement.source_cycle)) {
+      invalid_checked_fused_source = true;
+      continue;
+    }
+    checked_fused_retirements.push_back(&retirement);
+  }
   // Aggregate the enabled bytes by source cycle and physical line. A
   // scalar effect then needs one logarithmic lookup, even with many atomics.
   std::map<std::pair<uint64_t, uint64_t>, uint64_t> atomic_mask_by_cycle_line;
@@ -1585,6 +1624,7 @@ bool Runtime::export_semantic_observed_prefix() const {
         return overlaps_excluded_atomic(group->source_cycle, group->address, group->byte_mask);
       });
   const bool complete = source.reset_epoch_verified && complete_roster && !semantic_export_overflow_ &&
+                        !checked_fused_retirements_overflow_ && !invalid_checked_fused_source &&
                         !semantic_excluded_device_store_ && !atomic_scalar_overlap && !invalid_atomic_span &&
                         !invalid_event_source && !invalid_physical_address &&
                         !duplicate_logical_identity && !missing_checked_store;
@@ -1668,6 +1708,27 @@ bool Runtime::export_semantic_observed_prefix() const {
     }
     json << "]}";
   }
+  json << "],\"checked_fused_retirements_overflow\":" << (checked_fused_retirements_overflow_ ? "true" : "false")
+       << ",\"checked_fused_retirements\":[";
+  for (size_t index = 0; index < checked_fused_retirements.size(); ++index) {
+    if (index)
+      json << ',';
+    const auto &retirement = *checked_fused_retirements[index];
+    json << "{\"hart\":" << retirement.hart << ",\"pc\":" << retirement.pc
+         << ",\"instruction\":" << retirement.instruction << ",\"n_fused\":" << retirement.n_fused
+         << ",\"is_rvc\":" << (retirement.is_rvc ? "true" : "false") << ",\"lane\":" << retirement.lane
+         << ",\"source_cycle\":" << retirement.source_cycle << ",\"source_id\":" << retirement.source_id
+         << ",\"producer_id\":";
+    json_string(json, source_producer_name(retirement.hart, retirement.source_id).c_str());
+    json << ",\"producer_sequence\":" << retirement.source_sequence << ",\"reference_instructions\":[";
+    for (size_t instruction_index = 0; instruction_index < retirement.reference_instructions.size(); ++instruction_index) {
+      if (instruction_index)
+        json << ',';
+      const auto &instruction = retirement.reference_instructions[instruction_index];
+      json << "{\"pc\":" << instruction.first << ",\"instruction\":" << instruction.second << '}';
+    }
+    json << "]}";
+  }
   json << "],\"excluded_device_stores\":[";
   for (size_t index = 0; index < semantic_excluded_device_stores_.size(); ++index) {
     if (index)
@@ -1694,6 +1755,10 @@ bool Runtime::export_semantic_observed_prefix() const {
     add_reason("producer_roster_incomplete");
   if (semantic_export_overflow_)
     add_reason("semantic_event_limit_exceeded");
+  if (checked_fused_retirements_overflow_)
+    add_reason("checked_fused_retirement_limit_exceeded");
+  if (invalid_checked_fused_source)
+    add_reason("checked_fused_retirement_source_unverified");
   if (atomic_scalar_overlap)
     add_reason("atomic_scalar_same_cycle_overlap");
   if (invalid_atomic_span)
