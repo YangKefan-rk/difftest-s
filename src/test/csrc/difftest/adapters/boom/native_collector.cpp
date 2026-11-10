@@ -20,7 +20,7 @@ bool same_terminal_owner(const ProbeIdentity &lhs, const ProbeIdentity &rhs) {
          lhs.attempt == rhs.attempt;
 }
 bool faulting_scalar_refill(const ProbeLoad &probe, const InstructionAllocation &owner) {
-  if (owner.length != 4 || !owner.ldq ||
+  if ((owner.length != 2 && owner.length != 4) || !owner.ldq ||
       probe.sampling_point != LoadSamplingPoint::RefillData || !probe.source_complete ||
       probe.known_writer_mask || !probe.byte_mask)
     return false;
@@ -29,7 +29,16 @@ bool faulting_scalar_refill(const ProbeLoad &probe, const InstructionAllocation 
     if (transfer->kind != FloatingTransferKind::Load ||
         (transfer->bytes != 4 && transfer->bytes != 8))
       return false;
-    log2_size = transfer->bytes == 4 ? 2 : 3; // FLW/FLD
+    log2_size = transfer->bytes == 4 ? 2 : 3; // FLW/FLD, including compressed FLD
+  } else if (owner.length == 2) {
+    const unsigned quadrant = owner.instruction & 3;
+    const unsigned function = (owner.instruction >> 13) & 7;
+    // RV64 C.LW/C.LD and their stack forms are four/eight-byte loads.
+    // A zero destination in a stack form is reserved, not a load fault.
+    if ((quadrant != 0 && quadrant != 2) || (function != 2 && function != 3) ||
+        (quadrant == 2 && ((owner.instruction >> 7) & 31) == 0))
+      return false;
+    log2_size = function;
   } else {
     if ((owner.instruction & 0x7f) != 0x03)
       return false;
