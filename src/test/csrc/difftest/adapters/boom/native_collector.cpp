@@ -19,42 +19,75 @@ bool same_terminal_owner(const ProbeIdentity &lhs, const ProbeIdentity &rhs) {
   return same_instruction(lhs, rhs) && lhs.memory_generation == rhs.memory_generation &&
          lhs.attempt == rhs.attempt;
 }
-bool faulting_scalar_sample(const ProbeLoad &probe, const InstructionAllocation &owner) {
-  const bool memory_sample = probe.sampling_point == LoadSamplingPoint::RefillData ||
-                             probe.sampling_point == LoadSamplingPoint::CacheDataArray;
-  if ((owner.length != 2 && owner.length != 4) || !owner.ldq ||
-      !memory_sample || !probe.source_complete ||
-      probe.known_writer_mask || !probe.byte_mask)
-    return false;
-  unsigned log2_size = 0;
+std::optional<unsigned> scalar_load_log2_size(const InstructionAllocation &owner) {
+  if ((owner.length != 2 && owner.length != 4) || !owner.ldq)
+    return std::nullopt;
   if (const auto transfer = decode_floating_transfer(owner.instruction)) {
-    if (transfer->kind != FloatingTransferKind::Load ||
-        (transfer->bytes != 4 && transfer->bytes != 8))
-      return false;
-    log2_size = transfer->bytes == 4 ? 2 : 3; // FLW/FLD, including compressed FLD
-  } else if (owner.length == 2) {
+    if (transfer->kind == FloatingTransferKind::Load && (transfer->bytes == 4 || transfer->bytes == 8))
+      return transfer->bytes == 4 ? 2 : 3;
+    return std::nullopt;
+  }
+  if (owner.length == 2) {
     const unsigned quadrant = owner.instruction & 3;
     const unsigned function = (owner.instruction >> 13) & 7;
-    // RV64 C.LW/C.LD and their stack forms are four/eight-byte loads.
-    // A zero destination in a stack form is reserved, not a load fault.
     if ((quadrant != 0 && quadrant != 2) || (function != 2 && function != 3) ||
         (quadrant == 2 && ((owner.instruction >> 7) & 31) == 0))
-      return false;
-    log2_size = function;
-  } else {
-    if ((owner.instruction & 0x7f) != 0x03)
-      return false;
-    switch ((owner.instruction >> 12) & 7) {
-    case 1: case 5: log2_size = 1; break; // LH/LHU
-    case 2: case 6: log2_size = 2; break; // LW/LWU
-    case 3: log2_size = 3; break;         // LD
-    default: return false;
-    }
+      return std::nullopt;
+    return function; // RV64 C.LW/C.LD and their stack forms
   }
-  if (probe.log2_size != log2_size)
-    return false;
-  const unsigned width = 1U << log2_size;
-  return (probe.address & (width - 1)) != 0;
+  if ((owner.instruction & 0x7f) != 0x03)
+    return std::nullopt;
+  switch ((owner.instruction >> 12) & 7) {
+  case 1: case 5: return 1; // LH/LHU
+  case 2: case 6: return 2; // LW/LWU
+  case 3: return 3;         // LD
+  default: return std::nullopt;
+  }
+}
+
+CheckResult classify_faulting_sample(const ProbeLoad &probe, const InstructionAllocation &owner,
+                                     bool &faulting) {
+  faulting = false;
+  const auto log2_size = scalar_load_log2_size(owner);
+  if (!log2_size)
+    return {};
+  const unsigned width = 1U << *log2_size;
+  if (!(probe.address & (width - 1)))
+    return {}; // Aligned data uses the ordinary independently checked sample path.
+  if (probe.log2_size != *log2_size || !probe.byte_mask)
+    return invalid("BOOM misaligned load sample width or byte mask is inconsistent");
+  if (!probe.source_complete)
+    return incomplete("BOOM misaligned load lacks complete source sampling evidence");
+  switch (probe.sampling_point) {
+  case LoadSamplingPoint::CacheDataArray:
+  case LoadSamplingPoint::RefillData:
+    if (probe.known_writer_mask)
+      return invalid("BOOM misaligned cache/refill sample carries forwarding writers");
+    break;
+  case LoadSamplingPoint::StoreForwarding: {
+    // LSU GenByteMask names aligned lanes even for an access that will fault.
+    // Validate all observed provenance before retaining a no-value candidate.
+    const unsigned lane = (probe.address & 7) & ~(width - 1);
+    const unsigned mask = ((1U << width) - 1) << lane;
+    if (probe.byte_mask != mask || probe.known_writer_mask != mask)
+      return invalid("BOOM misaligned forwarding lacks its complete observed lane mask");
+    for (unsigned byte = 0; byte < probe.writers.size(); ++byte) {
+      if (!(mask & (1U << byte)))
+        continue;
+      const auto &writer = probe.writers[byte];
+      if (writer.epoch != probe.identity.epoch || !writer.uid || writer.uid >= probe.identity.uid ||
+          !writer.rob_generation || !writer.memory_generation || writer.attempt)
+        return invalid("BOOM misaligned forwarding has no stable older store writer");
+    }
+    break;
+  }
+  case LoadSamplingPoint::Unavailable:
+    return incomplete("BOOM misaligned load has no source sampling evidence");
+  default:
+    return invalid("BOOM misaligned load has an unknown source sampling kind");
+  }
+  faulting = true;
+  return {};
 }
 } // namespace
 
@@ -399,10 +432,14 @@ CheckResult NativeCollector::capture_attempts(const NativeFrame &frame) {
       return invalid("BOOM completed load claims a future source cycle");
     const AttemptKey key{id(probe.identity), probe.identity.attempt};
     const auto owner = allocations_.find(key.first);
-    if (owner != allocations_.end() && faulting_scalar_sample(probe, owner->second)) {
-      // A misaligned cache/refill sample cannot certify an architectural read,
-      // even when its truncated mask fits one word. Keep it private until a precise
-      // misaligned-load trap or a physical cancellation/squash closes it.
+    bool faulting = false;
+    checked = classify_faulting_sample(probe, owner->second, faulting);
+    if (!checked)
+      return checked;
+    if (faulting) {
+      // A misaligned tentative sample cannot certify an architectural read.
+      // Keep it private until a precise fault or physical cancellation/squash
+      // closes it, even when its observed lane mask fits one word.
       const auto begin = unresolved_samples_.find(key);
       if (begin == unresolved_samples_.end() || complete.sampled_at.cycle < begin->second ||
           !faulting_refills_.emplace(key.first, key.second).second)
