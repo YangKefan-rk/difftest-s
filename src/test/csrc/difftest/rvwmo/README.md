@@ -170,3 +170,14 @@ callback order. The adapter must separately prove post-TLB physical addresses
 and the reset epoch/clock/phase mapping to any RTL functional-point window;
 this generic checker does not invent that mapping. No certification means
 feedback is unavailable, not a zero interaction score or a different verdict.
+
+
+### Clean Sbuffer refill bytes and simultaneous-access coverage
+
+A physical Sbuffer publication may include clean refill bytes in its mask.
+Those bytes have no store writer UID and are excluded from simultaneous
+cross-hart access conflicts. The original physical mask and all member/writer
+identities are retained for publication validation: a byte required by a local
+store must still have the matching group writer, and each local store must
+still be completely published before finalization. Real overlapping writes,
+loads and LR effects still require qualified hardware arbitration order.
