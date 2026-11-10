@@ -1,6 +1,7 @@
 #include "runtime.h"
 #include "dependency.h"
 #include "globalmem.h"
+#include "logical_store_mask.h"
 #include "source_boundary.h"
 #include "sha256.h"
 #include <algorithm>
@@ -824,7 +825,9 @@ CheckResult Runtime::capture(const std::vector<DiffTestState *> &states) {
       group.mask = mask_bytes(event.mask, 64);
       group.writers.assign(event.byteWriterUid, event.byteWriterUid + 64);
       group.queued = true;
-      observe_write(group.cycle, hart, group.address, group.mask);
+      // Refill-only bytes are not logical writes. Keep group.mask intact so
+      // complete_group still rejects missing provenance for required bytes.
+      observe_write(group.cycle, hart, group.address, logical_store_mask(group.mask, group.writers));
       auto key = std::make_pair(hart, event.groupId);
       auto inserted =
           events_.emplace(EventKey{event.timestamp, 2, event.groupId, hart},
