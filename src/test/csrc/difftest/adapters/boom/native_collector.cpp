@@ -357,7 +357,7 @@ CheckResult NativeCollector::capture_attempts(const NativeFrame &frame) {
   }
   std::map<AttemptKey, NativeAttempt> cancellations;
   for (const auto &cancel : frame.cancellations) {
-    auto result = validate_attempt(cancel);
+    auto result = validate_cancellation(cancel);
     if (!result)
       return result;
     cancellations.emplace(AttemptKey{id(cancel.identity), cancel.identity.attempt}, cancel);
@@ -424,15 +424,20 @@ CheckResult NativeCollector::capture_attempts(const NativeFrame &frame) {
 }
 
 CheckResult NativeCollector::capture_cancellation(const NativeAttempt &cancel, uint64_t cycle) {
-  if (pending_trap_ && same_instruction(cancel.identity, pending_trap_->identity)) {
+  const bool before_post = pending_trap_ && same_instruction(cancel.identity, pending_trap_->identity);
+  const bool after_post = pending_fault_rollback_ &&
+      same_instruction(cancel.identity, pending_fault_rollback_->identity);
+  if (before_post || after_post) {
+    const uint64_t fault_cycle = before_post ? pending_trap_->source_cycle
+                                            : pending_fault_rollback_->cycle - 3;
     const AttemptKey key{id(cancel.identity), cancel.identity.attempt};
     const auto live = unresolved_samples_.find(key);
     const auto refill = faulting_refills_.find(key.first);
     const bool faulting_refill = refill != faulting_refills_.end() && refill->second == key.second;
-    // Only an already begun, unsampled attempt of the exact fault owner can
-    // cancel at T+1. The physical fact remains private until the matched
-    // Trap(T), post-state(T+2), and rollback(T+3) all close.
-    if (pending_trap_->source_cycle == UINT64_MAX || cycle != pending_trap_->source_cycle + 1 ||
+    // A precise fault can cancel its begun, unsampled attempt before or on
+    // the rollback edge. The post-state releases the architectural owner,
+    // while the saved queue identity keeps these delayed physical facts private.
+    if (fault_cycle > UINT64_MAX - 3 || cycle <= fault_cycle || cycle > fault_cycle + 3 ||
         (live == unresolved_samples_.end() && !faulting_refill) ||
         !fault_rollback_cancellations_.emplace(key, cycle).second)
       return invalid("BOOM post-trap cancel lacks one live unsampled fault attempt");
@@ -627,10 +632,12 @@ CheckResult NativeCollector::capture_trap_post(const NativeFrame &frame) {
       physically_retired};
   if (!staged_traps_.emplace(instruction_id, snapshot).second)
     return invalid("BOOM physical trap post-state repeats its architectural UID");
-  faulting_refills_.erase(instruction_id);
-  if (!physically_retired)
+  if (!physically_retired) {
     pending_fault_rollback_ = PendingFaultRollback{trap.identity, allocation->second.rob.index,
-                                                    trap.source_cycle + 3};
+                                                  trap.source_cycle + 3, allocation->second.ldq};
+  } else {
+    faulting_refills_.erase(instruction_id);
+  }
   allocations_.erase(allocation);
   pending_trap_.reset();
   pending_system_.reset();
@@ -667,6 +674,7 @@ CheckResult NativeCollector::capture_terminations(const NativeFrame &frame) {
         else
           ++attempt;
       }
+      faulting_refills_.erase(instruction_id);
       pending_fault_rollback_.reset();
       continue;
     }
@@ -713,6 +721,17 @@ CheckResult NativeCollector::validate_attempt(const NativeAttempt &attempt) cons
       allocation->second.ldq->generation != attempt.identity.memory_generation ||
       allocation->second.ldq->index != attempt.queue_index)
     return invalid("BOOM native load attempt has a stale ROB or LDQ identity");
+  return {};
+}
+
+CheckResult NativeCollector::validate_cancellation(const NativeAttempt &cancel) const {
+  if (!pending_fault_rollback_ ||
+      !same_instruction(cancel.identity, pending_fault_rollback_->identity))
+    return validate_attempt(cancel);
+  const auto &queue = pending_fault_rollback_->ldq;
+  if (!queue || queue->index != cancel.queue_index ||
+      queue->generation != cancel.identity.memory_generation)
+    return invalid("BOOM fault cancellation has a stale retained LDQ identity");
   return {};
 }
 

@@ -177,7 +177,12 @@ private:
   struct PendingSystem { ProbeInstruction core; uint64_t retirement_cycle = 0; };
   std::optional<PendingSystem> pending_system_;
   std::optional<NativeTrap> pending_trap_;
-  struct PendingFaultRollback { ProbeIdentity identity; uint32_t rob_index; uint64_t cycle; };
+  struct PendingFaultRollback {
+    ProbeIdentity identity;
+    uint32_t rob_index;
+    uint64_t cycle;
+    std::optional<SlotGeneration> ldq;
+  };
   std::optional<PendingFaultRollback> pending_fault_rollback_;
   std::map<OperationId, ArchitecturalTrap> staged_traps_;
   std::map<AttemptKey, uint64_t> unresolved_samples_;
@@ -211,6 +216,7 @@ private:
   CheckResult capture_terminations(const NativeFrame &frame);
   CheckResult collect_adapter_output();
   CheckResult validate_attempt(const NativeAttempt &attempt) const;
+  CheckResult validate_cancellation(const NativeAttempt &cancel) const;
   CheckResult require_checked_ram(uint64_t address, size_t bytes) const;
   OperationId id(const ProbeIdentity &identity) const;
   CheckResult remember_failure(CheckResult result);
