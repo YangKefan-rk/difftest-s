@@ -19,9 +19,11 @@ bool same_terminal_owner(const ProbeIdentity &lhs, const ProbeIdentity &rhs) {
   return same_instruction(lhs, rhs) && lhs.memory_generation == rhs.memory_generation &&
          lhs.attempt == rhs.attempt;
 }
-bool faulting_scalar_refill(const ProbeLoad &probe, const InstructionAllocation &owner) {
+bool faulting_scalar_sample(const ProbeLoad &probe, const InstructionAllocation &owner) {
+  const bool memory_sample = probe.sampling_point == LoadSamplingPoint::RefillData ||
+                             probe.sampling_point == LoadSamplingPoint::CacheDataArray;
   if ((owner.length != 2 && owner.length != 4) || !owner.ldq ||
-      probe.sampling_point != LoadSamplingPoint::RefillData || !probe.source_complete ||
+      !memory_sample || !probe.source_complete ||
       probe.known_writer_mask || !probe.byte_mask)
     return false;
   unsigned log2_size = 0;
@@ -397,9 +399,9 @@ CheckResult NativeCollector::capture_attempts(const NativeFrame &frame) {
       return invalid("BOOM completed load claims a future source cycle");
     const AttemptKey key{id(probe.identity), probe.identity.attempt};
     const auto owner = allocations_.find(key.first);
-    if (owner != allocations_.end() && faulting_scalar_refill(probe, owner->second)) {
-      // A misaligned refill cannot certify an architectural read, even when
-      // its truncated mask fits one word. Keep it private until a precise
+    if (owner != allocations_.end() && faulting_scalar_sample(probe, owner->second)) {
+      // A misaligned cache/refill sample cannot certify an architectural read,
+      // even when its truncated mask fits one word. Keep it private until a precise
       // misaligned-load trap or a physical cancellation/squash closes it.
       const auto begin = unresolved_samples_.find(key);
       if (begin == unresolved_samples_.end() || complete.sampled_at.cycle < begin->second ||
