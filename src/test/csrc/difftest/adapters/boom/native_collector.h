@@ -123,6 +123,7 @@ struct NativeCollectorConfiguration {
 struct CollectedObservations {
   EventBatch batch;
   std::vector<ArchitecturalRetirement> retirements;
+  std::vector<ArchitecturalTrap> traps;
 };
 struct CaptureResult {
   CheckResult check;
