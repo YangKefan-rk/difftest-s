@@ -15,7 +15,7 @@ class SpikeReferenceStepper {
 public:
   // Handles are borrowed and must remain alive until after this stepper is destroyed.
   SpikeReferenceStepper(std::vector<void *> hart_handles, uint32_t expected_profile_id,
-                        std::function<bool(uint64_t, uint8_t *, size_t)> read_independent_instruction,
+                        std::function<bool(uint64_t, uint8_t *, size_t)> read_independent_instruction = {},
                         bool require_boom_entry_csr = false);
   ~SpikeReferenceStepper();
 

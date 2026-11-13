@@ -527,7 +527,7 @@ ReferenceStepResult SpikeReferenceStepper::step(const InstructionRetireEvent &re
       result.check = unsupported("Spike profile has no mcycle read environment capability");
       return result;
     }
-  } else if (pure_mcycle_read) {
+  } else if (pure_mcycle_read && state.profile_id.profile_id == DIFFTEST_REF_PROFILE_ID_BOOM) {
     result.check = incomplete("mcycle read is missing its source-sampled environment");
     return result;
   }
@@ -682,8 +682,14 @@ ReferenceStepResult SpikeReferenceStepper::step(const InstructionRetireEvent &re
       result.floating_point_write = ReferenceFloatingPointWrite{floating.destination, after.fpr[floating.destination]};
   }
   if (snapshot.fp_post) {
-    if (!floating.recognized)
-      return fail_after_step(unsupported("physical floating poststate lacks a recognized FP instruction"));
+    const auto transfer = decode_floating_transfer(raw);
+    if (!transfer)
+      return fail_after_step(unsupported("BOOM floating poststate lacks a supported transfer instruction"));
+    for (uint8_t reg = 0; reg < 32; ++reg)
+      if ((!floating.writes_floating_point || reg != floating.destination) && before.fpr[reg] != after.fpr[reg])
+        return fail_after_step(violation("floating transfer changed an unrelated Spike floating register"));
+    if (before.fcsr != after.fcsr)
+      return fail_after_step(violation("floating data transfer unexpectedly changed Spike FCSR"));
     result.fp_post = FloatingPostState{after.fcsr, after.mstatus};
   }
   if (snapshot.csr_post) {

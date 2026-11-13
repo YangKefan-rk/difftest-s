@@ -459,7 +459,7 @@ CheckResult ObservationSession::step_reference(const InstructionRetireEvent &ret
     if (snapshot.destination_register >= 32 || !result.floating_point_write ||
         result.floating_point_write->destination_register != snapshot.destination_register ||
         result.floating_point_write->value != snapshot.destination_value)
-      return {CheckStatus::Violation, 0, "reference floating-register write differs from the DUT retirement snapshot"};
+      return {CheckStatus::Violation, 0, "reference floating-point write differs from the DUT retirement snapshot"};
     if (result.integer_write)
       return {CheckStatus::Violation, 0, "reference produced an unexpected integer write"};
   } else {
