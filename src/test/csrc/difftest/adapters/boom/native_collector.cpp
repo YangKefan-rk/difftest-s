@@ -48,6 +48,19 @@ CaptureResult NativeCollector::capture(const NativeFrame &frame) {
   if ((captured_cycle_ && *captured_cycle_ == std::numeric_limits<uint64_t>::max()) ||
       frame.hart != configuration_.hart || frame.epoch != configuration_.epoch || frame.cycle != expected)
     return {remember_failure(invalid("BOOM source frame is missing, repeated or from another hart/epoch")), false};
+  // The typed decoder must never turn newly available physical evidence into
+  // ignored fields while its corresponding REF/RVWMO consumers are absent.
+  if (configuration_.skip_device_stores || configuration_.check_csr_post ||
+      configuration_.check_counter_reads || configuration_.check_fp_post ||
+      !configuration_.terminal_wfi_pcs.empty())
+    return {remember_failure({CheckStatus::Unsupported, 0, "BOOM extended checker profile has no consumer"}), false};
+  if (frame.csr_post || frame.csr_write_post || frame.counter_read || !frame.fp_posts.empty() ||
+      !frame.atomic_applied.empty() || frame.trap_post ||
+      std::any_of(frame.squashes.begin(), frame.squashes.end(), [](const NativeSquash &squash) {
+        return squash.rollback;
+      }))
+    return {remember_failure({CheckStatus::Unsupported, 0, "BOOM physical poststate, AMO or rollback has no consumer"}),
+            false};
   const size_t facts = frame.allocations.size() + frame.begins.size() + frame.cancellations.size() +
       frame.completions.size() + frame.local_stores.size() + frame.retirements.size() +
       frame.store_releases.size() + frame.squashes.size() + frame.publications.size() +

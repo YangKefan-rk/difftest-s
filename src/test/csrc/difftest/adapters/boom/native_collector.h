@@ -30,6 +30,43 @@ struct NativePublication {
 struct NativeSquash {
   ProbeIdentity identity;
   uint32_t rob_index = 0;
+  bool rollback = false;
+};
+struct NativeCsrPost {
+  ProbeIdentity identity;
+  uint64_t source_cycle = 0, pc = 0, value = 0;
+  uint16_t address = 0;
+};
+struct NativeFpPost {
+  ProbeIdentity identity;
+  uint64_t source_cycle = 0, pc = 0, fcsr = 0, mstatus = 0;
+};
+// An exclusive data-array write, with the old and new words sampled together.
+struct NativeAtomicApplied {
+  ProbeIdentity identity;
+  uint64_t source_cycle = 0;
+  uint64_t address = 0;
+  uint64_t old_word = 0;
+  uint64_t new_word = 0;
+  uint8_t byte_mask = 0;
+  uint32_t queue_index = 0;
+  uint8_t mem_size = 0;
+  uint8_t command = 0;
+  bool exclusive_valid = false;
+  EventSource source;
+};
+struct NativeTrap {
+  ProbeIdentity identity;
+  uint64_t source_cycle = 0;
+  uint64_t pc = 0;
+  uint64_t cause = 0;
+};
+struct NativeTrapPost {
+  ProbeIdentity identity;
+  uint64_t source_cycle = 0;
+  uint64_t pc = 0, cause = 0, target_pc = 0, privilege = 0;
+  uint64_t mstatus = 0, mepc = 0, mcause = 0, mtval = 0;
+  uint64_t sepc = 0, scause = 0, stval = 0;
 };
 struct NativeFrame {
   uint32_t hart = 0;
@@ -45,11 +82,22 @@ struct NativeFrame {
   std::vector<NativeLoad> completions;
   std::vector<ProbeStore> local_stores;
   std::vector<ProbeInstruction> retirements;
+  bool csr_probe_available = false;
+  std::optional<NativeCsrPost> csr_post;
+  bool csr_write_probe_available = false;
+  std::optional<NativeCsrPost> csr_write_post;
+  bool counter_read_probe_available = false;
+  std::optional<NativeCsrPost> counter_read;
+  bool fp_probe_available = false;
+  std::vector<NativeFpPost> fp_posts;
   std::vector<ProbeLoadRetirement> retired_loads;
   std::vector<NativeAttempt> store_releases;
   std::vector<NativeSquash> squashes;
   std::vector<NativePublication> publications;
-  bool trap = false;
+  std::vector<NativeAtomicApplied> atomic_applied;
+  std::optional<NativeTrap> trap;
+  bool trap_post_probe_available = false;
+  std::optional<NativeTrapPost> trap_post;
   bool queues_empty = false;
   bool cache_idle = false;
   // Optional typed ingress for a producer that proves a complete coalesced
@@ -66,6 +114,11 @@ struct NativeCollectorConfiguration {
   // must supply the bounds of their independently initialized GlobalMem.
   uint64_t checked_ram_base = 0;
   uint64_t checked_ram_size = 0;
+  bool skip_device_stores = false;
+  bool check_csr_post = false;
+  bool check_counter_reads = false;
+  bool check_fp_post = false;
+  std::vector<uint64_t> terminal_wfi_pcs;
 };
 struct CollectedObservations {
   EventBatch batch;
