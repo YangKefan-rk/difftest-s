@@ -19,6 +19,11 @@ struct HostSessionConfiguration {
   StreamContract stream;
   std::vector<ProducerCapability> producers;
   std::vector<difftest_ref_state_v1> initial_harts;
+  // BOOM profiles may request these checks; a scalar-only HostSession fails
+  // closed until a matching consumer is installed.
+  bool skip_device_stores = false;
+  bool check_boom_traps = false;
+  bool check_boom_entry_csr = false;
   // Optional private-adapter bookkeeping over independently computed REF stores.
   // It must finish synchronously; it cannot change the REF result or memory.
   std::function<CheckResult(const ReferenceStoreValue &)> reference_store_observer;
@@ -51,6 +56,9 @@ public:
   const CheckResult &configuration() const { return failure_; }
   SessionSubmitResult submit(const EventBatch &batch,
                              const std::vector<ArchitecturalRetirement> &retirements = {});
+  SessionSubmitResult submit(const EventBatch &batch,
+                             const std::vector<ArchitecturalRetirement> &retirements,
+                             const std::vector<ArchitecturalTrap> &traps);
   CheckResult complete_hart(const HartCompletion &completion);
   CheckResult drain_producer(const ProducerDrain &drain);
   CheckResult poll();

@@ -78,6 +78,11 @@ HostSession::HostSession(GlobalMem &memory, HostSessionConfiguration configurati
     failure_ = references_.configuration();
     return;
   }
+  if (configuration_.check_boom_traps || configuration_.check_boom_entry_csr) {
+    failure_ = {CheckStatus::Unsupported, 0,
+                "BOOM trap or entry-CSR checking requires the dedicated reference consumer"};
+    return;
+  }
   if (configuration_.platform.empty() || configuration_.verification_scope.empty() ||
       configuration_.stream.required_producers.empty()) {
     failure_ = invalid("host session needs a platform name and explicit required producer roster");
@@ -208,6 +213,19 @@ SessionSubmitResult HostSession::submit(const EventBatch &batch,
     output.check = reject({CheckStatus::Incomplete, 0, std::string("host session exception: ") + error.what()});
     return output;
   }
+}
+
+SessionSubmitResult HostSession::submit(const EventBatch &batch,
+                                        const std::vector<ArchitecturalRetirement> &retirements,
+                                        const std::vector<ArchitecturalTrap> &traps) {
+  if (!traps.empty()) {
+    SessionSubmitResult output;
+    output.transport = {EventValidationStatus::Unsupported,
+                        "physical trap observations require the BOOM trap consumer"};
+    output.check = reject({CheckStatus::Unsupported, 0, output.transport.message});
+    return output;
+  }
+  return submit(batch, retirements);
 }
 
 CheckResult HostSession::complete_hart(const HartCompletion &completion) {

@@ -25,7 +25,46 @@ struct ReferenceLoadValue {
   std::vector<uint8_t> expected_bytes;
 };
 
-enum class ArchitecturalDestination : uint8_t { None = 0, Integer = 1, Unsupported = 2, FloatingPoint = 3 };
+enum class ArchitecturalDestination : uint8_t {
+  None = 0,
+  Integer = 1,
+  Unsupported = 2,
+  FloatingPoint = 3,
+  Floating = FloatingPoint
+};
+
+// Optional BOOM post-state records. The scalar session only consumes fields
+// for which an adapter and reference profile provide an independent check.
+struct FloatingPostState {
+  uint64_t fcsr = 0;
+  uint64_t mstatus = 0;
+  bool operator==(const FloatingPostState &other) const {
+    return fcsr == other.fcsr && mstatus == other.mstatus;
+  }
+};
+
+struct CounterReadEnvironment {
+  uint16_t address = 0;
+  uint64_t source_cycle = 0;
+  uint64_t value = 0;
+};
+
+struct ArchitecturalTrap {
+  OperationId id;
+  uint32_t instruction = 0;
+  uint64_t pc = 0;
+  uint64_t cause = 0;
+  uint64_t target_pc = 0;
+  uint64_t privilege = 0;
+  uint64_t mstatus = 0;
+  uint64_t mepc = 0;
+  uint64_t mcause = 0;
+  uint64_t mtval = 0;
+  uint64_t sepc = 0;
+  uint64_t scause = 0;
+  uint64_t stval = 0;
+  bool physically_retired = false;
+};
 
 struct ArchitecturalRetirement {
   OperationId id;
@@ -37,6 +76,11 @@ struct ArchitecturalRetirement {
   // Only provide a CSR snapshot aligned to this instruction's exact post-state.
   // A delayed FPR writeback does not by itself identify such a CSR boundary.
   std::optional<uint8_t> fcsr;
+  // BOOM-specific post-state probes remain opt-in and are unsupported until
+  // the matching checker/reference consumer is installed.
+  std::optional<std::pair<uint16_t, uint64_t>> csr_post;
+  std::optional<FloatingPostState> fp_post;
+  std::optional<CounterReadEnvironment> counter_read;
 };
 
 struct ReferenceIntegerWrite {
@@ -48,6 +92,8 @@ struct ReferenceFloatingPointWrite {
   uint8_t destination_register = 0;
   uint64_t value = 0;
 };
+
+using ReferenceFloatingWrite = ReferenceFloatingPointWrite;
 
 struct ReferenceStoreValue {
   OperationId id;
@@ -64,6 +110,11 @@ struct ReferenceStepResult {
   uint32_t reference_instruction = 0;
   bool took_trap = false;
   std::optional<ReferenceFloatingPointWrite> floating_point_write;
+  // BOOM adapter spelling; current scalar stepper populates the field above.
+  std::optional<ReferenceFloatingWrite> floating_write;
+  std::optional<FloatingPostState> fp_post;
+  bool skipped_device_store = false;
+  bool counter_read_synchronized = false;
   std::optional<uint8_t> fcsr;
 };
 
@@ -88,6 +139,7 @@ public:
   // An optional read-only tap on source-closed, checker-accepted raw events.
   // It is provisional until the owning HostSession reaches a complete Pass.
   using SemanticEventObserver = std::function<void(const RuntimeEvent &)>;
+  using TrapStepper = std::function<CheckResult(const TrapEvent &, const ArchitecturalTrap &)>;
 
   ObservationSession(StreamContract contract, std::vector<ProducerCapability> producers,
                     Memory::ReadGlobal read_global, Memory::WriteGlobal write_global, ReferenceStepper reference_stepper,
@@ -100,6 +152,10 @@ public:
 
   SessionSubmitResult submit(const EventBatch &batch,
                              const std::vector<ArchitecturalRetirement> &retirements = {});
+  SessionSubmitResult submit(const EventBatch &batch,
+                             const std::vector<ArchitecturalRetirement> &retirements,
+                             const std::vector<ArchitecturalTrap> &traps);
+  void set_trap_stepper(TrapStepper stepper) { trap_stepper_ = std::move(stepper); }
   CheckResult poll();
   CheckResult finalize(uint64_t completed_cycle);
   size_t pending_events() const { return pending_events_.size(); }
@@ -132,6 +188,7 @@ private:
   SemanticEventObserver semantic_observer_;
   std::string semantic_observer_error_;
   bool semantic_observer_failed_ = false;
+  TrapStepper trap_stepper_;
   std::deque<PendingEvent> pending_events_;
   std::map<OperationId, ArchitecturalRetirement> architectural_retirements_;
   std::map<OperationId, ReferenceRecord> reference_records_;

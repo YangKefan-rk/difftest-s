@@ -537,6 +537,13 @@ SessionSubmitResult ObservationSession::submit(const EventBatch &batch,
     return result;
   }
   for (const auto &snapshot : retirements) {
+    if (snapshot.csr_post || snapshot.fp_post || snapshot.counter_read) {
+      result.transport = {EventValidationStatus::Unsupported,
+                          "BOOM architectural post-state requires its dedicated checker consumer"};
+      result.check = {CheckStatus::Unsupported, 0, result.transport.message};
+      result.pending_events = pending_events_.size();
+      return result;
+    }
     const bool supported_destination = snapshot.destination == ArchitecturalDestination::None ||
                                        snapshot.destination == ArchitecturalDestination::Integer ||
                                        snapshot.destination == ArchitecturalDestination::Unsupported ||
@@ -577,6 +584,20 @@ SessionSubmitResult ObservationSession::submit(const EventBatch &batch,
   result.pending_events = pending_events_.size();
   result.accepted = true;
   return result;
+}
+
+SessionSubmitResult ObservationSession::submit(const EventBatch &batch,
+                                               const std::vector<ArchitecturalRetirement> &retirements,
+                                               const std::vector<ArchitecturalTrap> &traps) {
+  if (!traps.empty()) {
+    SessionSubmitResult result;
+    result.transport = {EventValidationStatus::Unsupported,
+                        "physical trap observations require the BOOM trap consumer"};
+    result.check = {CheckStatus::Unsupported, 0, result.transport.message};
+    result.pending_events = pending_events_.size();
+    return result;
+  }
+  return submit(batch, retirements);
 }
 
 CheckResult ObservationSession::poll() {

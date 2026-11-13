@@ -154,7 +154,10 @@ enum class AtomicObservationPhase : uint8_t {
   Replay = 5,
   Response = 6,
   Finish = 7,
-  Cancel = 8
+  Cancel = 8,
+  // A single source-certified physical read-modify-write effect.
+  // Consumers that do not implement this evidence must fail closed.
+  RmwEffect = 9
 };
 
 struct InstructionAllocateEvent {
