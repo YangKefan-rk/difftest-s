@@ -2,12 +2,17 @@
 #define DIFFTEST_ADAPTERS_BOOM_EVENT_ADAPTER_H
 
 #include "../../rvwmo/event.h"
+#include "../../rvwmo/session.h"
 #include <map>
 #include <optional>
+#include <utility>
 
 namespace rvwmo {
 class CheckerEventConsumer;
 namespace boom {
+
+// Only ordinary AMO W/D RMW encodings are in the initial certified profile.
+bool supported_amo_rmw(uint32_t instruction);
 
 // Private BOOM records; this header is not a DPI/wire ABI. Producer registration
 // and source-clock/phase qualification belong to the simulation integration.
@@ -33,6 +38,28 @@ struct InstructionAllocation {
   uint32_t instruction = 0;
   uint8_t length = 0;
   EventSource source;
+};
+
+// AMO W/D effects from one exclusive L1 data-array write, never a request
+// or a StorePublish assembled from two independent memory operations.
+struct AtomicApplied {
+  OperationId id;
+  SlotGeneration stq;
+  uint32_t attempt = 0;
+  uint64_t address = 0;
+  uint64_t old_word = 0;
+  uint64_t new_word = 0;
+  uint8_t mask = 0;
+  uint8_t command = 0;
+  bool exclusive_valid = false;
+  EventSource source;
+};
+struct AtomicLocalCommit {
+  OperationId id;
+  SlotGeneration stq;
+  uint64_t address = 0;
+  uint8_t mask = 0;
+  uint8_t command = 0;
 };
 
 struct LoadAttempt {
@@ -135,6 +162,9 @@ struct CapturedRetirement {
   // Raw architectural destination bits. Interpreted by destination_type.
   std::optional<uint64_t> destination_value;
   RetirementResultCoverage coverage = RetirementResultCoverage::Complete;
+  std::optional<std::pair<uint16_t, uint64_t>> csr_post;
+  std::optional<FloatingPostState> fp_post;
+  std::optional<CounterReadEnvironment> counter_read;
 };
 
 struct Retirement {
@@ -152,6 +182,9 @@ struct Retirement {
   IntegerDestinationType destination_type = IntegerDestinationType::None;
   uint8_t logical_destination = 0;
   uint64_t writeback_value = 0;
+  bool skipped_device_store = false;
+  std::optional<EventSource> atomic_response_source;
+  std::optional<EventSource> atomic_finish_source;
   std::optional<uint32_t> store_attempt = std::nullopt;
 };
 
@@ -182,12 +215,20 @@ public:
   CheckResult sample_load(const LoadObservation &record);
   CheckResult cancel_load_attempt(const LoadAttempt &record, const EventSource &source);
   CheckResult commit_store(const StoreCommit &record);
+  CheckResult commit_atomic_local(const AtomicLocalCommit &record);
+  CheckResult apply_atomic(const AtomicApplied &record);
+  // Explicit device exclusion; no LocalStore or coherent-RAM StorePublish.
+  CheckResult skip_device_store(const StoreCommit &record);
   // A physical STQ entry can be reused while its logical store is still
   // travelling through the cache/MSHR. This does not emit StorePublish.
   CheckResult release_store_slot(const OperationId &id, const SlotGeneration &stq);
   CheckResult publish_store(const StorePublication &record);
   CheckResult publish_merged_stores(const MergedStorePublication &record);
   CheckResult retire(const Retirement &record);
+  // An exception consumes its ROB owner, but is not an invented regular
+  // instruction retirement and cannot carry a coherent memory operation.
+  CheckResult trap(const OperationId &id, const SlotGeneration &rob, uint64_t pc,
+                   uint64_t cause, const EventSource &source);
   CheckResult audit_reference_store(CheckerEventConsumer &consumer, const ReferenceStoreAudit &record);
   // Checks an independent REF store without requiring access to a session's
   // private consumer. The common session must still perform its own audit.
@@ -213,11 +254,23 @@ private:
   struct Instruction {
     InstructionAllocation allocation;
     bool unsupported_memory = false;
+    bool is_atomic_rmw = false;
+    bool atomic_local_committed = false;
+    uint64_t atomic_local_address = 0;
+    uint8_t atomic_local_mask = 0;
+    bool atomic_applied = false;
+    uint64_t atomic_address = 0;
+    uint64_t atomic_old_word = 0;
+    uint64_t atomic_new_word = 0;
+    uint8_t atomic_mask = 0;
+    uint8_t atomic_command = 0;
+    uint32_t atomic_attempt = 0;
     std::map<uint32_t, Attempt> attempts;
     std::optional<uint32_t> latest_attempt;
     std::optional<MemoryOperation> store;
     std::optional<uint32_t> store_attempt;
     std::vector<uint8_t> store_bytes;
+    bool skipped_device_store = false;
     bool stq_released = false;
     bool published = false;
     bool audited = false;

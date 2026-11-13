@@ -122,6 +122,8 @@ struct RetiredInstruction {
   bool failed_sc = false;
   std::vector<MemoryOperation> memory;
   DependencyMetadata dependencies;
+  // Explicitly excluded physical device store. No coherent RAM effect or REF execution.
+  bool skipped_device_store = false;
 };
 
 // Internal C++ event contract. Language-specific transports must convert to
@@ -234,6 +236,8 @@ struct AtomicLifecycleEvent {
   uint8_t fuop = 0;
   bool success = false;
   bool error = false;
+  uint64_t new_data = 0; // Used only by indivisible RmwEffect.
+  bool exclusive_write_witness = false; // Only from the physical exclusive cache data-array write.
 };
 
 // Source facts for a *candidate* atomic commit. This typed transport is not

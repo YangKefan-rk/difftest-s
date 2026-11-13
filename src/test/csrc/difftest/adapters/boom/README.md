@@ -39,6 +39,14 @@ samples. Preserve the selected result's real `source_cycle`, sampling evidence,
 physical address, width, byte mask and known writer identities. Response delivery
 time is not the load's source time. Unknown byte writers remain unknown.
 
+A naturally misaligned integer or FLW/FLD refill cannot certify a successful
+read, even if the one-word probe supplies some bytes. Retain that attempt only
+until its exact load-misalignment trap (with post-state and physical rollback),
+or a validated cancellation/squash; successful retirement remains unsupported.
+A physical cancellation at T+1 of the pending trap's unsampled load is a private
+rollback fact, not a public cancellation after Trap(T) removed its parent.
+Never discard a sampled load or a cancellation of another instruction this way.
+
 `begin_load_attempt` retains the earliest possible source cycle privately. It
 does not consume a public producer sequence. `take_ready` releases a safe source
 prefix in cycle order and then assigns strictly increasing hart-channel
@@ -129,7 +137,48 @@ four-hart result also requires the common session's final verdict, every hart's
 independent reference state, closed fabric/transport prefixes and native workload
 completion. Hart park, an empty STQ or a successful host conversion is not that
 verdict. Scalar integer RAM is the current generic path; unsupported architectural
-state, atomics/LRSC, split access, FP/vector, trap and MMIO must not be dropped.
+state, LR/SC, split access, vector operations, interrupts and unmodeled MMIO must
+not be dropped. A synchronous fault is checked only after its precise physical
+ROB owner, post-trap CSR/redirect snapshot and (for non-retiring faults) rollback
+are captured. An unsampled private load begin is discarded only after its
+exact fault-owner rollback; sampled loads and local, device, atomic or public
+memory effects must not be silently discarded. Spike independently steps the faulting
+instruction and checks cause, EPC, tval, privilege, redirect and register/CSR
+state; a new synchronous cause needs no BOOM-specific allowlist entry. A missing
+observation remains Incomplete or Unsupported, never a successful comparison.
+
+## Checked RAM address contract
+
+When the host supplies `NativeCollectorConfiguration::checked_ram_base` and
+`checked_ram_size` from its independently initialized GlobalMem, the private
+collector refuses final loads, local stores and cache publications outside
+that complete address interval **before** treating them as ordinary RAM.
+In particular, CLINT/IOMSHR writes cannot masquerade as L1 data-array
+publications. An unset range retains existing scalar-fixture compatibility;
+production workloads must set it, and genuine MMIO needs an independent device
+model and observation contract rather than an invented RAM write.
+
+## Immutable per-hart CSR read
+
+Only `CSRRS rd,mhartid,x0` with `rd != x0` is in the scalar GPR path.
+It cannot write the CSR; the actual destination bits are compared with
+Spike's independently executed integer result for the same hart. Other
+CSR operations need their physical post-state comparator or the explicitly
+scoped counter environment described below. This exception does
+not make HartBreaker programs fully supported (FP, AMO, CLINT and termination
+still require their own coverage and lifecycle checks).
+
+## Source-sampled mcycle reads
+
+BOOM RV64 `CSRRS rd,mcycle,x0` with a nonzero destination can opt into a
+counter environment captured from CSRFile at execution, before GPR writeback.
+The collector requires the live UID/ROB generation, PC, CSR address, source
+cycle, and final architectural retirement; missing or stale samples do not pass.
+The matching Spike capability synchronizes this environment for one actual
+instruction step, and the existing PC/opcode/destination/value comparison stays
+active. `counter_reads_synchronized` reports how many reads used this path.
+This is time-environment synchronization, **not an independent verification of
+the counter's generation**. Other counter read forms retain Unsupported.
 
 ## Checked RAM address contract
 
@@ -157,8 +206,9 @@ still require their own coverage and lifecycle checks).
 An actually retired `WFI` (`0x10500073`) has no scalar register or CSR write;
 its PC, raw instruction and absence of a GPR result are checked through the
 ordinary reference step. The validated scope is M-mode with no pending
-interrupt. Other system instructions, CSR effects and trap/interrupt handling
-retain their explicit coverage limits.
+interrupt. Other system instructions and CSR effects retain their explicit
+coverage limits; synchronous faults follow the independent trap-step rules
+above, while interrupts need separate arrival and reference evidence.
 
 WFI retirement does not complete a hart or close any source prefix. BOOM may
 stall its ROB at WFI until an interrupt arrives. Seeing its execution request,

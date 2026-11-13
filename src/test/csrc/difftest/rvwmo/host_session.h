@@ -19,10 +19,11 @@ struct HostSessionConfiguration {
   StreamContract stream;
   std::vector<ProducerCapability> producers;
   std::vector<difftest_ref_state_v1> initial_harts;
-  // BOOM profiles may request these checks; a scalar-only HostSession fails
-  // closed until a matching consumer is installed.
+  // Opt-in device writes are excluded from RAM/PPO and counted, not compared.
   bool skip_device_stores = false;
+  // Require an exact physical trap snapshot and Spike post-trap comparison.
   bool check_boom_traps = false;
+  // Require a physically drained DRAM-entry CSR prestate before stepping BOOM.
   bool check_boom_entry_csr = false;
   // Optional private-adapter bookkeeping over independently computed REF stores.
   // It must finish synchronously; it cannot change the REF result or memory.
@@ -30,6 +31,18 @@ struct HostSessionConfiguration {
   // Separate from correctness. Only a terminal HostSession Pass may publish
   // events saved by this observer as SFuzz feedback.
   ObservationSession::SemanticEventObserver semantic_event_observer;
+};
+
+// From the same physical dispatch edge as the first checked BOOM allocation.
+// The ingress joins UID/PC/epoch to that allocation before making this claim.
+struct BoomEntryCsrSnapshot {
+  OperationId identity;
+  // Zero is a valid CSR value; an absent field must not impersonate one.
+  std::optional<uint64_t> source_cycle, pc, privilege, mstatus;
+  std::optional<uint64_t> mepc, mcause, mtval;
+  std::optional<uint64_t> sepc, scause, stval;
+  // Physical proof that no older bootstrap CSR write/trap can alter prestate.
+  bool older_drained = false;
 };
 
 struct HartCompletion {
@@ -54,11 +67,10 @@ class HostSession {
 public:
   HostSession(GlobalMem &memory, HostSessionConfiguration configuration);
   const CheckResult &configuration() const { return failure_; }
+  CheckResult initialize_boom_entry_csr(const BoomEntryCsrSnapshot &snapshot);
   SessionSubmitResult submit(const EventBatch &batch,
-                             const std::vector<ArchitecturalRetirement> &retirements = {});
-  SessionSubmitResult submit(const EventBatch &batch,
-                             const std::vector<ArchitecturalRetirement> &retirements,
-                             const std::vector<ArchitecturalTrap> &traps);
+                             const std::vector<ArchitecturalRetirement> &retirements = {},
+                             const std::vector<ArchitecturalTrap> &traps = {});
   CheckResult complete_hart(const HartCompletion &completion);
   CheckResult drain_producer(const ProducerDrain &drain);
   CheckResult poll();
@@ -86,6 +98,8 @@ private:
   SpikeReferencePool references_;
   std::unique_ptr<ObservationSession> session_;
   std::map<uint32_t, HartCompletion> completed_harts_;
+  std::map<uint32_t, BoomEntryCsrSnapshot> entry_csrs_;
+  std::map<uint32_t, bool> entry_allocations_seen_;
   std::map<uint32_t, ProducerDrain> drained_producers_;
   std::map<uint32_t, SourcePosition> source_watermarks_;
   std::map<uint32_t, uint64_t> last_source_cycles_;

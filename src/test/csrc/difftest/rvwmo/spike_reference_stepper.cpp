@@ -3,8 +3,16 @@
 
 #include <algorithm>
 #include <cstring>
+#include <sstream>
 #include <utility>
 
+// Optional extension: ordinary profiles keep working with an older REF library.
+extern "C" int difftest_ref_step_mcycle_read_v1(void *, uint64_t, uint32_t, uint64_t)
+    __attribute__((weak));
+// The observer is an optional extension: older Rocket/BlackParrot Spike DSOs
+// still link and run their unmodified non-trap reference profile.
+extern "C" int difftest_ref_set_trap_observer_v1(void *, difftest_ref_trap_observer_v1_fn,
+                                                 void *) __attribute__((weak));
 namespace rvwmo {
 namespace {
 CheckResult incomplete(const std::string &message) { return {CheckStatus::Incomplete, 0, message}; }
@@ -41,11 +49,14 @@ CheckResult operand_range(const MemoryOperation &operation, size_t &offset, size
 }
 } // namespace
 
-SpikeReferenceStepper::SpikeReferenceStepper(std::vector<void *> hart_handles, uint32_t expected_profile_id)
-    : harts_(hart_handles.size()) {
+SpikeReferenceStepper::SpikeReferenceStepper(std::vector<void *> hart_handles, uint32_t expected_profile_id,
+    std::function<bool(uint64_t, uint8_t *, size_t)> read_independent_instruction,
+    bool require_boom_entry_csr)
+    : harts_(hart_handles.size()), read_independent_instruction_(std::move(read_independent_instruction)) {
   for (size_t hart = 0; hart < hart_handles.size(); ++hart) {
     auto &state = harts_[hart];
     state.handle = hart_handles[hart];
+    state.require_boom_entry_csr = require_boom_entry_csr;
     if (!state.handle) {
       state.setup_error = "Spike reference pool contains a null hart handle";
       continue;
@@ -81,6 +92,15 @@ SpikeReferenceStepper::SpikeReferenceStepper(std::vector<void *> hart_handles, u
       continue;
     }
     state.callbacks_installed = true;
+    if (state.profile_id.profile_id == DIFFTEST_REF_PROFILE_ID_BOOM &&
+        (state.profile.capabilities & DIFFTEST_REF_CAP_TRAP_OBSERVER_V1)) {
+      if (!difftest_ref_set_trap_observer_v1 ||
+          difftest_ref_set_trap_observer_v1(state.handle, observe_trap, &state) != DIFFTEST_REF_API_OK) {
+        state.setup_error = "Spike advertised but rejected its synchronous trap observer";
+        continue;
+      }
+      state.trap_observer_installed = true;
+    }
   }
 }
 
@@ -90,10 +110,13 @@ SpikeReferenceStepper::~SpikeReferenceStepper() {
       continue;
     difftest_ref_set_load_reader(state.handle, nullptr, nullptr);
     difftest_ref_set_instruction_observer_v2(state.handle, nullptr, nullptr);
+    if (state.trap_observer_installed)
+      difftest_ref_set_trap_observer_v1(state.handle, nullptr, nullptr);
   }
 }
 
-CheckResult SpikeReferenceStepper::initialize_hart(uint32_t hart, const difftest_ref_state_v1 &initial_state) {
+CheckResult SpikeReferenceStepper::initialize_hart(uint32_t hart, const difftest_ref_state_v1 &initial_state,
+                                                   std::optional<OperationId> entry_identity) {
   if (hart >= harts_.size())
     return invalid("Spike reference initialization names an unregistered hart");
   auto &state = harts_[hart];
@@ -101,6 +124,10 @@ CheckResult SpikeReferenceStepper::initialize_hart(uint32_t hart, const difftest
     return incomplete(state.setup_error);
   if (state.initialized)
     return invalid("Spike hart state may only be initialized once per observation session");
+  if (state.require_boom_entry_csr != entry_identity.has_value())
+    return incomplete("BOOM entry requires a certified physical CSR snapshot before Spike initialization");
+  if (entry_identity && entry_identity->hart != hart)
+    return invalid("BOOM entry physical identity has the wrong hart");
   auto copy = initial_state;
   copy.abi_version = DIFFTEST_REF_STATE_ABI_VERSION_1;
   copy.struct_size = sizeof(copy);
@@ -109,7 +136,20 @@ CheckResult SpikeReferenceStepper::initialize_hart(uint32_t hart, const difftest
     return unsupported("Spike profile does not support scalar reference-state initialization");
   if (status != DIFFTEST_REF_API_OK)
     return incomplete("Spike rejected the initial architectural state");
+  if (entry_identity) {
+    difftest_ref_state_v1 installed{};
+    installed.abi_version = DIFFTEST_REF_STATE_ABI_VERSION_1;
+    installed.struct_size = sizeof(installed);
+    if (difftest_ref_get_state_v1(state.handle, &installed) != DIFFTEST_REF_API_OK ||
+        installed.pc != copy.pc || installed.privilege != copy.privilege ||
+        installed.mstatus != copy.mstatus || installed.mepc != copy.mepc ||
+        installed.mcause != copy.mcause || installed.mtval != copy.mtval ||
+        installed.sepc != copy.sepc || installed.scause != copy.scause ||
+        installed.stval != copy.stval)
+      return incomplete("Spike could not reproduce the certified physical BOOM entry CSR state");
+  }
   state.initialized = true;
+  state.entry_identity = entry_identity;
   return {};
 }
 
@@ -122,6 +162,24 @@ const difftest_ref_profile_v1 *SpikeReferenceStepper::profile(uint32_t hart) con
 ObservationSession::ReferenceStepper SpikeReferenceStepper::callback() {
   return [this](const InstructionRetireEvent &retirement, const ArchitecturalRetirement &snapshot,
                 const std::vector<ReferenceLoadValue> &loads) { return step(retirement, snapshot, loads); };
+}
+
+ObservationSession::TrapStepper SpikeReferenceStepper::trap_callback() {
+  return [this](const TrapEvent &trap, const ArchitecturalTrap &snapshot) {
+    return step_trap(trap, snapshot);
+  };
+}
+
+void SpikeReferenceStepper::observe_trap(void *context, uint64_t pc, uint64_t cause, uint64_t tval) {
+  auto &state = *static_cast<HartState *>(context);
+  if (!state.active || state.observed_trap || state.observed_instruction) {
+    state.callback_error = "Spike reported a duplicate or unexpected synchronous trap";
+    return;
+  }
+  state.observed_trap = true;
+  state.trap_pc = pc;
+  state.trap_cause = cause;
+  state.trap_tval = tval;
 }
 
 bool SpikeReferenceStepper::read_modeled_load(void *context, uint64_t address, size_t size, uint8_t *bytes) {
@@ -225,6 +283,178 @@ CheckResult SpikeReferenceStepper::collect_store(void *handle, const MemoryOpera
   return {};
 }
 
+CheckResult SpikeReferenceStepper::collect_atomic_store(void *handle, const MemoryOperation &operation,
+                                                        ReferenceStoreValue &store) {
+  if (!operation.atomic || !operation.load || !operation.store || operation.lr || operation.sc ||
+      operation.address % 8 || operation.byte_mask.size() != 8)
+    return unsupported("Spike atomic write trace requires one aligned RMW W/D operation");
+  uint64_t address = 0, data = 0;
+  uint8_t mask = 0;
+  const int taken = difftest_ref_take_atomic_store_trace_v1(handle, &address, &data, &mask);
+  if (taken == DIFFTEST_REF_API_UNSUPPORTED)
+    return unsupported("Spike profile has no independent atomic store trace");
+  if (taken != DIFFTEST_REF_API_OK)
+    return incomplete("Spike executed AMO without exactly one reference atomic store trace");
+  uint8_t expected_mask = 0;
+  for (unsigned byte = 0; byte < 8; ++byte) {
+    if (operation.byte_mask[byte] > 1)
+      return invalid("AMO retirement has invalid byte mask");
+    expected_mask |= static_cast<uint8_t>(operation.byte_mask[byte] << byte);
+  }
+  if (address != operation.address || mask != expected_mask)
+    return violation("independent Spike AMO store address or byte mask differs from DUT effect");
+  store.id = operation.id;
+  store.address = address;
+  store.byte_mask = operation.byte_mask;
+  store.bytes.resize(8);
+  for (unsigned byte = 0; byte < 8; ++byte)
+    store.bytes[byte] = static_cast<uint8_t>(data >> (8 * byte));
+  return {};
+}
+
+CheckResult SpikeReferenceStepper::step_trap(const TrapEvent &trap, const ArchitecturalTrap &snapshot) {
+  if (trap.hart >= harts_.size())
+    return invalid("trap hart has no Spike reference handle");
+  auto &state = harts_[trap.hart];
+  if (!state.setup_error.empty() || !state.initialized || state.poisoned)
+    return state.poisoned ? state.failure : incomplete("trap lacks an initialized Spike reference hart");
+  if (!state.trap_observer_installed)
+    return unsupported("Spike profile lacks an independent synchronous trap observer");
+  if (!state.first_step_seen && state.entry_identity && trap.instruction != *state.entry_identity)
+    return incomplete("first BOOM trap does not match the certified DRAM-entry physical UID");
+  const auto fail_after_step = [&](CheckResult result) {
+    state.poisoned = true;
+    state.failure = result;
+    return result;
+  };
+  if (trap.interrupt || trap.instruction != snapshot.id || trap.pc != snapshot.pc ||
+      trap.cause != snapshot.cause || snapshot.pc % 2 || snapshot.target_pc % 2 ||
+      (snapshot.privilege != 1 && snapshot.privilege != 3))
+    return invalid("trap lacks matching synchronous physical UID, PC, cause or redirect");
+  // The physical trace identifies the faulting instruction; Spike, not a
+  // per-cause whitelist, independently decides whether and how it traps.
+
+  const size_t instruction_bytes = (snapshot.instruction & 3) == 3 ? 4 : 2;
+  uint8_t bytes[4]{};
+  if (!read_independent_instruction_ || !read_independent_instruction_(snapshot.pc, bytes, instruction_bytes))
+    return incomplete("trap cannot fetch independently initialized instruction bytes");
+  uint32_t fetched = 0;
+  for (size_t index = 0; index < instruction_bytes; ++index)
+    fetched |= uint32_t(bytes[index]) << (8 * index);
+  if (fetched != snapshot.instruction)
+    return violation("trap instruction differs from independent reference memory");
+  difftest_ref_state_v1 before{}, after{};
+  before.abi_version = after.abi_version = DIFFTEST_REF_STATE_ABI_VERSION_1;
+  before.struct_size = after.struct_size = sizeof(before);
+  if (difftest_ref_get_state_v1(state.handle, &before) != DIFFTEST_REF_API_OK)
+    return incomplete("Spike cannot expose pre-trap architectural state");
+  if (before.pc != snapshot.pc)
+    return violation("Spike pre-trap PC differs from the faulting physical UID");
+  uint64_t ordinary = 0, atomics = 0;
+  if (difftest_ref_pending_store_traces_v1(state.handle, &ordinary) != DIFFTEST_REF_API_OK || ordinary ||
+      (state.profile.capabilities & DIFFTEST_REF_CAP_ATOMIC_TRACE_V1 &&
+       (difftest_ref_pending_atomic_store_traces_v1(state.handle, &atomics) != DIFFTEST_REF_API_OK || atomics)))
+    return incomplete("Spike has stale store effects before the faulting instruction");
+  state.expected_loads.clear();
+  state.consumed_loads = 0;
+  state.callback_error.clear();
+  state.callback_status = CheckStatus::Invalid;
+  state.observed_instruction = false;
+  state.observed_trap = false;
+  state.first_step_seen = true;
+  state.active = true;
+  const int stepped = difftest_ref_step(state.handle, 1);
+  state.active = false;
+  if (!state.callback_error.empty())
+    return fail_after_step({state.callback_status, 0, state.callback_error});
+  if (stepped != DIFFTEST_REF_API_OK || !state.observed_trap || state.observed_instruction)
+    return fail_after_step(incomplete("Spike did not independently trap at the physical exception boundary"));
+  if (state.trap_pc != snapshot.pc || state.trap_cause != snapshot.cause)
+    return fail_after_step(violation("Spike trap PC or cause differs from the physical exception"));
+  if (difftest_ref_get_state_v1(state.handle, &after) != DIFFTEST_REF_API_OK)
+    return fail_after_step(incomplete("Spike cannot expose post-trap architectural state"));
+  const bool machine_bank_mismatch = after.mepc != snapshot.mepc || after.mcause != snapshot.mcause ||
+                                     after.mtval != snapshot.mtval;
+  const bool supervisor_bank_mismatch = after.sepc != snapshot.sepc || after.scause != snapshot.scause ||
+                                        after.stval != snapshot.stval;
+  // Legacy bootstrap never captured the inactive bank; the certified entry
+  // profile seeded both banks before any REF step, so it checks both here.
+  const bool trap_bank_mismatch = state.entry_identity
+      ? machine_bank_mismatch || supervisor_bank_mismatch
+      : (snapshot.privilege == 3 ? machine_bank_mismatch : supervisor_bank_mismatch);
+  if (after.pc != snapshot.target_pc || after.privilege != snapshot.privilege ||
+      after.mstatus != snapshot.mstatus || trap_bank_mismatch)
+    return fail_after_step(violation("Spike trap redirect, privilege or CSR state differs from the DUT"));
+  if (state.trap_tval != (after.privilege == 3 ? snapshot.mtval : snapshot.stval) ||
+      !std::equal(std::begin(before.gpr), std::end(before.gpr), std::begin(after.gpr)) ||
+      !std::equal(std::begin(before.fpr), std::end(before.fpr), std::begin(after.fpr)) ||
+      before.fcsr != after.fcsr)
+    return fail_after_step(violation("Spike trap value or register state violates the precise exception profile"));
+  if (difftest_ref_pending_store_traces_v1(state.handle, &ordinary) != DIFFTEST_REF_API_OK || ordinary ||
+      (state.profile.capabilities & DIFFTEST_REF_CAP_ATOMIC_TRACE_V1 &&
+       (difftest_ref_pending_atomic_store_traces_v1(state.handle, &atomics) != DIFFTEST_REF_API_OK || atomics)))
+    return fail_after_step(incomplete("Spike trap produced a hidden memory effect"));
+  return {};
+}
+
+ReferenceStepResult SpikeReferenceStepper::skip_device_store(
+    const InstructionRetireEvent &retirement, const ArchitecturalRetirement &snapshot) {
+  ReferenceStepResult result;
+  const auto hart = retirement.instruction.hart;
+  if (hart >= harts_.size() || !harts_[hart].handle || !harts_[hart].initialized ||
+      !harts_[hart].setup_error.empty() || harts_[hart].poisoned || !read_independent_instruction_) {
+    result.check = incomplete("device-store skip lacks an initialized per-hart reference");
+    return result;
+  }
+  auto &state = harts_[hart];
+  const auto &instruction = retirement.instruction;
+  if (!instruction.memory.empty() || !retirement.loads.empty() ||
+      (instruction.instruction & 0x7f) != 0x23 ||
+      ((instruction.instruction >> 12) & 7) != 3 ||
+      snapshot.destination != ArchitecturalDestination::None || snapshot.destination_register ||
+      snapshot.destination_value || snapshot.fp_post || snapshot.csr_post || snapshot.counter_read) {
+    result.check = invalid("device-store skip has a RAM effect, non-store opcode or architectural writeback");
+    return result;
+  }
+  uint8_t fetched[4]{};
+  if (!read_independent_instruction_(instruction.pc, fetched, sizeof(fetched))) {
+    result.check = incomplete("device-store skip cannot read independent instruction bytes");
+    return result;
+  }
+  uint32_t raw = 0;
+  for (size_t byte = 0; byte < sizeof(fetched); ++byte)
+    raw |= uint32_t(fetched[byte]) << (8 * byte);
+  if (raw != instruction.instruction) {
+    result.check = violation("device-store skip raw instruction differs from independent memory");
+    return result;
+  }
+  uint64_t pending_stores = 0;
+  if (difftest_ref_pending_store_traces_v1(state.handle, &pending_stores) != DIFFTEST_REF_API_OK || pending_stores) {
+    result.check = incomplete("device-store skip has pending reference RAM store traces");
+    return result;
+  }
+  difftest_ref_state_v1 before{}, after{};
+  before.abi_version = after.abi_version = DIFFTEST_REF_STATE_ABI_VERSION_1;
+  before.struct_size = after.struct_size = sizeof(before);
+  if (difftest_ref_get_state_v1(state.handle, &before) != DIFFTEST_REF_API_OK ||
+      before.pc != instruction.pc) {
+    result.check = violation("device-store skip reference PC differs from DUT retirement");
+    return result;
+  }
+  if (difftest_ref_skip_device_store_v1(state.handle, instruction.pc, raw) != DIFFTEST_REF_API_OK ||
+      difftest_ref_get_state_v1(state.handle, &after) != DIFFTEST_REF_API_OK ||
+      after.pc != before.pc + 4 || !std::equal(std::begin(before.gpr), std::end(before.gpr), std::begin(after.gpr))) {
+    state.poisoned = true;
+    state.failure = incomplete("device-store skip failed to advance only the per-hart reference PC");
+    result.check = state.failure;
+    return result;
+  }
+  result.reference_pc = before.pc;
+  result.reference_instruction = raw;
+  result.skipped_device_store = true;
+  return result;
+}
+
 ReferenceStepResult SpikeReferenceStepper::step(const InstructionRetireEvent &retirement,
                                                const ArchitecturalRetirement &snapshot,
                                                const std::vector<ReferenceLoadValue> &modeled_loads) {
@@ -235,6 +465,15 @@ ReferenceStepResult SpikeReferenceStepper::step(const InstructionRetireEvent &re
     return result;
   }
   auto &state = harts_[hart];
+  if (!state.first_step_seen && state.entry_identity &&
+      OperationId{hart, retirement.instruction.epoch, retirement.instruction.uid, 0} != *state.entry_identity) {
+    result.check = incomplete("first BOOM retirement does not match the certified DRAM-entry physical UID");
+    return result;
+  }
+  if (retirement.instruction.skipped_device_store) {
+    state.first_step_seen = true;
+    return skip_device_store(retirement, snapshot);
+  }
   if (!state.setup_error.empty()) {
     result.check = incomplete(state.setup_error);
     return result;
@@ -272,6 +511,50 @@ ReferenceStepResult SpikeReferenceStepper::step(const InstructionRetireEvent &re
     result.check = decoded_fp;
     return result;
   }
+  const uint32_t raw = retirement.instruction.instruction;
+  const bool pure_mcycle_read = (raw & 0x7f) == 0x73 && ((raw >> 12) & 7) == 2 &&
+      ((raw >> 15) & 31) == 0 && ((raw >> 7) & 31) != 0 && (raw >> 20) == 0xb00;
+  if (snapshot.counter_read) {
+    const auto &counter = *snapshot.counter_read;
+    if (!pure_mcycle_read || counter.address != 0xb00 || !counter.source_cycle || snapshot.csr_post ||
+        (state.last_counter_source_cycle && counter.source_cycle <= *state.last_counter_source_cycle)) {
+      result.check = invalid("counter environment has a wrong instruction, address or nonincreasing source time");
+      return result;
+    }
+    if (state.profile_id.profile_id != DIFFTEST_REF_PROFILE_ID_BOOM ||
+        !(state.profile.capabilities & DIFFTEST_REF_CAP_MCYCLE_READ_ENV_V1) ||
+        !difftest_ref_step_mcycle_read_v1) {
+      result.check = unsupported("Spike profile has no mcycle read environment capability");
+      return result;
+    }
+  } else if (pure_mcycle_read) {
+    result.check = incomplete("mcycle read is missing its source-sampled environment");
+    return result;
+  }
+  size_t atomic_count = 0;
+  for (const auto &operation : retirement.instruction.memory) {
+    if (operation.lr || operation.sc) {
+      result.check = unsupported("Spike reference stepper does not yet certify LR/SC reservations");
+      return result;
+    }
+    if (!operation.atomic)
+      continue;
+    const unsigned funct5 = (raw >> 27) & 31;
+    if ((raw & 0x7f) != 0x2f || (((raw >> 12) & 7) != 2 && ((raw >> 12) & 7) != 3) ||
+        funct5 == 2 || funct5 == 3 || !operation.load || !operation.store || ++atomic_count != 1) {
+      result.check = unsupported("Spike reference stepper requires one supported AMO W/D RMW");
+      return result;
+    }
+  }
+  if ((raw & 0x7f) == 0x2f && atomic_count != 1) {
+    result.check = incomplete("AMO retirement lacks its indivisible memory effect");
+    return result;
+  }
+  const bool atomic_traces = (state.profile.capabilities & DIFFTEST_REF_CAP_ATOMIC_TRACE_V1) != 0;
+  if (atomic_count && !atomic_traces) {
+    result.check = unsupported("Spike reference profile has no independent atomic trace capability");
+    return result;
+  }
 
   difftest_ref_state_v1 before{};
   before.abi_version = DIFFTEST_REF_STATE_ABI_VERSION_1;
@@ -295,6 +578,7 @@ ReferenceStepResult SpikeReferenceStepper::step(const InstructionRetireEvent &re
   state.callback_error.clear();
   state.callback_status = CheckStatus::Invalid;
   state.observed_instruction = false;
+  state.observed_trap = false;
   state.observed_pc = 0;
   state.observed_raw = 0;
   state.wrote_integer = false;
@@ -339,8 +623,11 @@ ReferenceStepResult SpikeReferenceStepper::step(const InstructionRetireEvent &re
     return result;
   }
 
+  state.first_step_seen = true;
   state.active = true;
-  const int stepped = difftest_ref_step(state.handle, 1);
+  const int stepped = snapshot.counter_read
+      ? difftest_ref_step_mcycle_read_v1(state.handle, snapshot.pc, raw, snapshot.counter_read->value)
+      : difftest_ref_step(state.handle, 1);
   state.active = false;
   auto fail_after_step = [&](CheckResult failure) {
     state.poisoned = true;
@@ -357,6 +644,12 @@ ReferenceStepResult SpikeReferenceStepper::step(const InstructionRetireEvent &re
   if (state.consumed_loads != state.expected_loads.size()) {
     return fail_after_step(incomplete("Spike did not consume every modeled load exactly once"));
   }
+  if (snapshot.counter_read) {
+    result.counter_read_synchronized = true;
+    state.last_counter_source_cycle = snapshot.counter_read->source_cycle;
+  }
+  if (state.observed_trap)
+    return fail_after_step(unsupported("Spike trapped during an ordinary DUT retirement"));
   if (!state.observed_instruction) {
     return fail_after_step(incomplete("Spike did not report a committed instruction for the single step"));
   }
@@ -388,6 +681,27 @@ ReferenceStepResult SpikeReferenceStepper::step(const InstructionRetireEvent &re
     if (floating.writes_floating_point)
       result.floating_point_write = ReferenceFloatingPointWrite{floating.destination, after.fpr[floating.destination]};
   }
+  if (snapshot.fp_post) {
+    if (!floating.recognized)
+      return fail_after_step(unsupported("physical floating poststate lacks a recognized FP instruction"));
+    result.fp_post = FloatingPostState{after.fcsr, after.mstatus};
+  }
+  if (snapshot.csr_post) {
+    uint64_t reference_csr = 0;
+    const int csr_status = difftest_ref_peek_arch_csr_v1(state.handle, snapshot.csr_post->first, &reference_csr);
+    if (csr_status == DIFFTEST_REF_API_UNSUPPORTED)
+      return fail_after_step(unsupported("Spike has no readback for the retired CSR"));
+    if (csr_status != DIFFTEST_REF_API_OK)
+      return fail_after_step(incomplete("Spike could not read the post-retirement CSR"));
+    if (snapshot.csr_post->second != reference_csr) {
+      std::ostringstream message;
+      message << "BOOM post-retirement CSR differs from Spike: hart=" << hart
+              << std::hex << " pc=0x" << retirement.instruction.pc << " csr=0x"
+              << snapshot.csr_post->first << " dut=0x" << snapshot.csr_post->second
+              << " ref=0x" << reference_csr;
+      return fail_after_step(violation(message.str()));
+    }
+  }
   if (after.fcsr > UINT64_C(0xff))
     return fail_after_step(invalid("Spike exposed FCSR bits outside its architectural width"));
   result.fcsr = static_cast<uint8_t>(after.fcsr);
@@ -404,12 +718,16 @@ ReferenceStepResult SpikeReferenceStepper::step(const InstructionRetireEvent &re
     if (!operation.store)
       continue;
     ReferenceStoreValue store;
-    auto checked = collect_store(state.handle, operation, store);
-    if (!checked) {
+    auto checked = operation.atomic ? collect_atomic_store(state.handle, operation, store) :
+                                      collect_store(state.handle, operation, store);
+    if (!checked)
       return fail_after_step(checked);
-    }
     result.stores.push_back(std::move(store));
   }
+  if (atomic_traces &&
+      (difftest_ref_pending_atomic_store_traces_v1(state.handle, &pending_atomics) != DIFFTEST_REF_API_OK ||
+       pending_atomics != 0))
+    return fail_after_step(incomplete("Spike AMO step left an unconsumed reference store trace"));
   return result;
 }
 

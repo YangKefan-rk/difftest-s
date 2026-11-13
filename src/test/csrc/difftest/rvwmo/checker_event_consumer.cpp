@@ -1,4 +1,6 @@
 #include "checker_event_consumer.h"
+#include "dependency.h"
+#include "producer_ids.h"
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
@@ -31,6 +33,31 @@ std::vector<uint8_t> atomic_data_bytes(uint64_t data) {
   for (unsigned byte = 0; byte < 8; ++byte)
     bytes[byte] = static_cast<uint8_t>(data >> (8 * byte));
   return bytes;
+}
+
+// Certify only architectural AMO W/D operations. LR/SC reservations and
+// optional Zacas encodings need their own hardware witness and REF semantics.
+bool supported_rmw_instruction(uint32_t instruction) {
+  if ((instruction & 0x7f) != 0x2f)
+    return false;
+  const unsigned width = (instruction >> 12) & 7;
+  const unsigned operation = (instruction >> 27) & 31;
+  if (width != 2 && width != 3)
+    return false;
+  switch (operation) {
+  case 0: case 1: case 4: case 8: case 12:
+  case 16: case 20: case 24: case 28:
+    return true;
+  default:
+    return false;
+  }
+}
+
+uint64_t architectural_old_value(uint64_t aligned_old, uint8_t byte_mask) {
+  if (byte_mask == 0xff)
+    return aligned_old;
+  const uint32_t lane = byte_mask == 0xf0 ? uint32_t(aligned_old >> 32) : uint32_t(aligned_old);
+  return uint64_t(int64_t(int32_t(lane)));
 }
 
 } // namespace
@@ -86,6 +113,12 @@ CheckResult CheckerEventConsumer::require_rank(const RuntimeEvent &event, Observ
         return incomplete("equal-rank AMO is not a certified independent effect");
       id = candidate->id;
       attempt = candidate->attempt;
+    } else if (const auto *atomic = std::get_if<AtomicLifecycleEvent>(&event.payload)) {
+      if (certificate != RankCertificate::IndependentEffects ||
+          atomic->phase != AtomicObservationPhase::RmwEffect)
+        return incomplete("certified memory group contains an unsupported atomic effect");
+      id = atomic->id;
+      attempt = atomic->attempt;
     } else {
       return incomplete("certified memory group contains an unsupported event kind");
     }
@@ -205,7 +238,7 @@ CheckResult CheckerEventConsumer::consume_load_sample(const RuntimeEvent &event,
 
 CheckResult CheckerEventConsumer::consume_atomic(const RuntimeEvent &event,
                                                  const AtomicLifecycleEvent &atomic,
-                                                 bool source_prefix_closed) {
+                                                 bool source_prefix_closed, RankCertificate certificate) {
   if (!failure_)
     return failure_;
   const auto parent = instruction_id(atomic.id);
@@ -215,6 +248,18 @@ CheckResult CheckerEventConsumer::consume_atomic(const RuntimeEvent &event,
     return remember_failure(unsupported("split or vector atomic lifecycle is not covered by this consumer"));
 
   auto inflight = atomic_inflight_.find(atomic.id.hart);
+  if (atomic.phase == AtomicObservationPhase::RmwEffect && inflight == atomic_inflight_.end()) {
+    // BOOM's certified cache-array write is itself the first observable AMO
+    // fact: an unseen request is never synthesized as an accepted read.
+    if (!supported_rmw_instruction(allocations_.at(parent).instruction) ||
+        atomics_.count(atomic.id) || atomic.attempt != 0)
+      return remember_failure(unsupported("AMO RMW has no certified instruction or supported attempt"));
+    AtomicRecord record;
+    record.id = atomic.id;
+    record.attempt = atomic.attempt;
+    record.rmw = true;
+    inflight = atomic_inflight_.emplace(atomic.id.hart, std::move(record)).first;
+  }
   if (atomic.phase == AtomicObservationPhase::Begin) {
     if (inflight != atomic_inflight_.end())
       return remember_failure(invalid("overlapping atomic lifecycles on one hart"));
@@ -273,6 +318,33 @@ CheckResult CheckerEventConsumer::consume_atomic(const RuntimeEvent &event,
     record.awaiting_retry = false;
     record.read_seen = false;
     record.write_seen = false;
+    return {};
+  }
+  case AtomicObservationPhase::RmwEffect: {
+    const uint32_t instruction = allocations_.at(parent).instruction;
+    if (!record.rmw || !supported_rmw_instruction(instruction) || record.read_seen ||
+        record.write_seen || record.awaiting_retry || record.response_seen ||
+        (record.request_seen && (record.address != atomic.address || record.mask != atomic.mask)) ||
+        (atomic.address & 7) ||
+        (((instruction >> 12) & 7) == 3 && atomic.mask != 0xff) ||
+        (((instruction >> 12) & 7) == 2 && atomic.mask != 0x0f && atomic.mask != 0xf0))
+      return remember_failure(invalid("indivisible AMO effect disagrees with its owner or earlier request"));
+    if (!atomic.exclusive_write_witness || !event.source.order_qualified ||
+        event.producer_id != memory_fabric_producer_id(record.id.hart))
+      return remember_failure(incomplete("AMO lacks a certified exclusive array-write source"));
+    for (unsigned byte = 0; byte < 8; ++byte)
+      if (!(atomic.mask & (1U << byte)) &&
+          uint8_t(atomic.data >> (byte * 8)) != uint8_t(atomic.new_data >> (byte * 8)))
+        return remember_failure(invalid("AMO changed an unselected cache word byte"));
+    auto result = consume_amo_point(event, record.id, record.attempt, atomic.address, atomic.mask,
+                                    atomic.data, atomic.new_data, source_prefix_closed, certificate);
+    if (!result)
+      return result;
+    record.address = atomic.address;
+    record.mask = atomic.mask;
+    record.old_data = atomic.data;
+    record.new_data = atomic.new_data;
+    record.request_seen = record.read_seen = record.write_seen = true;
     return {};
   }
   case AtomicObservationPhase::ReadEffect: {
@@ -383,6 +455,9 @@ CheckResult CheckerEventConsumer::consume_atomic(const RuntimeEvent &event,
   case AtomicObservationPhase::Response: {
     if (!record.request_seen || record.response_seen)
       return remember_failure(invalid("duplicate atomic response or no outstanding request"));
+    if (record.rmw && (!record.read_seen || !record.write_seen ||
+        atomic.data != architectural_old_value(record.old_data, record.mask)))
+      return remember_failure({CheckStatus::Violation, 0, "AMO response differs from its selected old cache word"});
     record.success = atomic.success;
     record.error = atomic.error;
     record.response_seen = true;
@@ -563,6 +638,11 @@ CheckResult CheckerEventConsumer::consume_independent_group_member(const Runtime
     const auto *publish = std::get_if<StorePublishEvent>(&event.payload);
     if (publish)
       return consume_store_publish(event, *publish, RankCertificate::IndependentEffects);
+  }
+  if (event.kind == RuntimeEventKind::AtomicLifecycle) {
+    const auto *atomic = std::get_if<AtomicLifecycleEvent>(&event.payload);
+    if (atomic && atomic->phase == AtomicObservationPhase::RmwEffect)
+      return consume_atomic(event, *atomic, source_prefix_closed, RankCertificate::IndependentEffects);
   }
   return remember_failure(invalid("independent memory group contains an unsupported effect"));
 }
@@ -815,6 +895,38 @@ CheckResult CheckerEventConsumer::consume_squash(const InstructionSquashEvent &e
   return {};
 }
 
+CheckResult CheckerEventConsumer::prepare_trap(const TrapEvent &event) const {
+  if (event.instruction.hart != event.hart || event.instruction.subaccess || event.interrupt)
+    return unsupported("trap boundary needs a supported synchronous scalar exception");
+  const auto found = allocations_.find(event.instruction);
+  if (found == allocations_.end() || found->second.pc != event.pc)
+    return invalid("trap boundary lacks matching live allocation and physical PC");
+  for (const auto &older : allocations_)
+    if (older.first.hart == event.hart && older.first.epoch == event.instruction.epoch &&
+        older.first.uid < event.instruction.uid)
+      return {CheckStatus::Pending, 0, "trap awaits an older live architectural owner"};
+  if (std::any_of(stores_.begin(), stores_.end(), [&](const auto &store) {
+        return same_parent(store.first, event.instruction);
+      }) || std::any_of(loads_.begin(), loads_.end(), [&](const auto &load) {
+        return same_parent(load.first.first, event.instruction);
+      }))
+    return unsupported("faulting instruction has a memory effect without precise rollback proof");
+  const auto last = last_retired_.find(event.hart);
+  if (last != last_retired_.end() &&
+      (last->second.first != event.instruction.epoch || last->second.second >= event.instruction.uid))
+    return invalid("trap boundary repeats or precedes an architectural predecessor");
+  return {};
+}
+
+CheckResult CheckerEventConsumer::consume_trap(const TrapEvent &event) {
+  auto prepared = prepare_trap(event);
+  if (!prepared) return remember_failure(prepared);
+  auto discarded = consume_squash({event.instruction});
+  if (!discarded) return discarded;
+  last_retired_[event.hart] = {event.instruction.epoch, event.instruction.uid};
+  return {};
+}
+
 CheckResult CheckerEventConsumer::consume_retire(const InstructionRetireEvent &event) {
   auto instruction = event.instruction;
   const OperationId id{instruction.hart, instruction.epoch, instruction.uid, 0};
@@ -841,49 +953,38 @@ CheckResult CheckerEventConsumer::consume_retire(const InstructionRetireEvent &e
                                     [](const MemoryOperation &operation) { return operation.load; });
   const bool has_store = std::any_of(instruction.memory.begin(), instruction.memory.end(),
                                      [](const MemoryOperation &operation) { return operation.store; });
+  if (instruction.skipped_device_store &&
+      ((instruction.instruction & 0x7f) != 0x23 || !instruction.memory.empty() || !event.loads.empty()))
+    return remember_failure(invalid("excluded device store carries a non-store or coherent RAM effect"));
+  const auto floating = decode_floating_transfer(instruction.instruction);
+  const bool floating_load = floating && floating->kind == FloatingTransferKind::Load;
+  const bool floating_store = floating && floating->kind == FloatingTransferKind::Store;
   if (allocation->second.length == 2) {
     const unsigned quadrant = instruction.instruction & 3;
     const unsigned funct3 = (instruction.instruction >> 13) & 7;
-    const bool fp_load = (quadrant == 0 || quadrant == 2) && funct3 == 1;
-    const bool fp_store = (quadrant == 0 || quadrant == 2) && funct3 == 5;
-    const bool compressed_load = (quadrant == 0 || quadrant == 2) && (funct3 == 2 || funct3 == 3);
-    const bool compressed_store = (quadrant == 0 || quadrant == 2) && (funct3 == 6 || funct3 == 7);
-    if ((fp_load || compressed_load) && (!has_load || has_store || instruction.memory.size() != 1))
-      return remember_failure(incomplete("compressed load lacks one matching memory effect"));
-    if ((fp_store || compressed_store) && (!has_store || has_load || instruction.memory.size() != 1))
-      return remember_failure(incomplete("compressed store lacks one matching memory effect"));
-    if ((fp_load || fp_store) && instruction.memory.front().byte_mask.size() != 8)
-      return remember_failure(invalid("RV64 compressed FP memory effect is not eight bytes"));
-    if ((fp_load || fp_store) && std::any_of(instruction.memory.front().byte_mask.begin(),
-          instruction.memory.front().byte_mask.end(), [](uint8_t byte) { return byte != 1; }))
-      return remember_failure(unsupported("compressed FP scalar memory effect has a sparse byte mask"));
-    if (!fp_load && !fp_store && !compressed_load && !compressed_store && !instruction.memory.empty())
+    const bool fp_memory = (quadrant == 0 || quadrant == 2) && (funct3 == 1 || funct3 == 5);
+    if (fp_memory && !floating)
+      return remember_failure(unsupported("compressed floating memory encoding lacks a verified transfer"));
+    const bool compressed_load = floating_load ||
+        ((quadrant == 0 || quadrant == 2) && (funct3 == 2 || funct3 == 3));
+    const bool compressed_store = floating_store ||
+        ((quadrant == 0 || quadrant == 2) && (funct3 == 6 || funct3 == 7));
+    if ((compressed_load && (!has_load || has_store)) || (compressed_store && (!has_store || has_load)))
+      return remember_failure(incomplete("compressed load/store lacks its matching memory event"));
+    if (!compressed_load && !compressed_store && !instruction.memory.empty())
       return remember_failure(invalid("compressed non-memory opcode carries a memory effect"));
   } else {
     const uint32_t opcode = instruction.instruction & 0x7f;
+    if ((opcode == 0x07 || opcode == 0x27) && !floating)
+      return remember_failure(unsupported("vector memory opcode needs a richer consumer"));
     if (opcode == 0x2f) {
       if (instruction.memory.empty())
-        return remember_failure(unsupported("atomic opcode retirement lacks its memory effect"));
+        return remember_failure(incomplete("AMO retirement lacks its certified indivisible memory effect"));
     } else {
-      const bool fp_load = opcode == 0x07;
-      const bool fp_store = opcode == 0x27;
-      if (fp_load || fp_store) {
-        const unsigned width_encoding = (instruction.instruction >> 12) & 7;
-        if (width_encoding != 2 && width_encoding != 3)
-          return remember_failure(unsupported("vector or unsupported FP memory width lacks a scalar model"));
-        if (instruction.memory.size() != 1 || (fp_load && (!has_load || has_store)) ||
-            (fp_store && (!has_store || has_load)))
-          return remember_failure(incomplete("FP load/store retirement lacks one matching memory effect"));
-        const auto expected_width = size_t{1} << width_encoding;
-        if (instruction.memory.front().byte_mask.size() != expected_width)
-          return remember_failure(invalid("FP load/store memory width differs from instruction encoding"));
-        if (std::any_of(instruction.memory.front().byte_mask.begin(),
-              instruction.memory.front().byte_mask.end(), [](uint8_t byte) { return byte != 1; }))
-          return remember_failure(unsupported("FP scalar memory effect has a sparse byte mask"));
-      }
-      if ((opcode == 0x03 && (!has_load || has_store)) || (opcode == 0x23 && (!has_store || has_load)))
-        return remember_failure(incomplete("scalar load/store retirement lacks its matching memory event"));
-      if (opcode != 0x03 && opcode != 0x23 && !fp_load && !fp_store && !instruction.memory.empty())
+      if (((opcode == 0x03 || floating_load) && (!has_load || has_store)) ||
+          ((opcode == 0x23 || floating_store) && (!has_store || has_load) && !instruction.skipped_device_store))
+        return remember_failure(incomplete("supported load/store retirement lacks its matching memory event"));
+      if (opcode != 0x03 && opcode != 0x23 && !floating_load && !floating_store && !instruction.memory.empty())
         return remember_failure(invalid("non-load/store opcode carries a memory effect"));
       if (opcode == 0x0f && ((instruction.instruction >> 12) & 7) == 2)
         return remember_failure(unsupported("cache-block operation is not modeled by this consumer"));
@@ -928,9 +1029,14 @@ CheckResult CheckerEventConsumer::consume_retire(const InstructionRetireEvent &e
         return remember_failure(invalid("duplicate atomic retirement"));
       const bool aq = (instruction.instruction >> 26) & 1;
       const bool rl = (instruction.instruction >> 25) & 1;
-      operation.acquire = operation.sc ? (aq && rl) : aq;
-      operation.release = operation.lr ? (aq && rl) : rl;
-      operation.rcsc = operation.acquire || operation.release;
+      if (operation.atomic) {
+        if (operation.acquire != aq || operation.release != rl || operation.rcsc != (aq || rl))
+          return remember_failure(invalid("AMO ordering annotations differ from the retired instruction"));
+      } else {
+        operation.acquire = operation.sc ? (aq && rl) : aq;
+        operation.release = operation.lr ? (aq && rl) : rl;
+        operation.rcsc = operation.acquire || operation.release;
+      }
     } else if (operation.load && operation.store) {
       return remember_failure(unsupported("split read/write effects are not represented by this consumer"));
     }
@@ -1056,9 +1162,10 @@ CheckResult CheckerEventConsumer::consume_closed(const RuntimeEvent &event, bool
   case RuntimeEventKind::AtomicCommitCandidate:
     return consume_atomic_candidate(event, std::get<AtomicCommitCandidateEvent>(event.payload),
                                     source_prefix_closed);
-  case RuntimeEventKind::HartDone:
   case RuntimeEventKind::Trap:
-    return remember_failure(unsupported("hart completion and trap events are not semantic memory events"));
+    return consume_trap(std::get<TrapEvent>(event.payload));
+  case RuntimeEventKind::HartDone:
+    return remember_failure(unsupported("hart completion is not a semantic memory event"));
   }
   return remember_failure(invalid("unknown event kind"));
 }

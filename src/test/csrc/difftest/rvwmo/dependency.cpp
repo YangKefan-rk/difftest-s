@@ -351,6 +351,47 @@ CheckResult decode_floating_point_instruction(uint32_t instruction, FloatingPoin
   return {};
 }
 
+std::optional<FloatingTransfer> decode_floating_transfer(uint32_t instruction) {
+  const auto opcode = instruction & 0x7f;
+  const auto function = (instruction >> 12) & 7;
+  const auto rd = static_cast<uint8_t>((instruction >> 7) & 31);
+  const auto rs1 = static_cast<uint8_t>((instruction >> 15) & 31);
+  const auto rs2 = static_cast<uint8_t>((instruction >> 20) & 31);
+  if ((instruction & 3) != 3) {
+    const auto quadrant = instruction & 3;
+    const auto compressed_function = (instruction >> 13) & 7;
+    if (quadrant != 0 && quadrant != 2)
+      return std::nullopt;
+    const auto base = static_cast<uint8_t>(quadrant == 0 ? 8 + ((instruction >> 7) & 7) : 2);
+    if (compressed_function == 1) {
+      const auto target = static_cast<uint8_t>(quadrant == 0 ? 8 + ((instruction >> 2) & 7) : rd);
+      return FloatingTransfer{FloatingTransferKind::Load, base, target, 8};
+    }
+    if (compressed_function == 5) {
+      const auto source = static_cast<uint8_t>(quadrant == 0 ? 8 + ((instruction >> 2) & 7)
+                                                                           : (instruction >> 2) & 31);
+      return FloatingTransfer{FloatingTransferKind::Store, base, source, 8};
+    }
+    return std::nullopt;
+  }
+  if ((opcode == 0x07 || opcode == 0x27) && (function == 2 || function == 3))
+    return FloatingTransfer{opcode == 0x07 ? FloatingTransferKind::Load : FloatingTransferKind::Store,
+                            rs1, opcode == 0x07 ? rd : rs2, static_cast<uint8_t>(1U << function)};
+  if (opcode != 0x53 || function != 0 || rs2 != 0)
+    return std::nullopt;
+  switch (instruction >> 25) {
+  case 0x78: return FloatingTransfer{FloatingTransferKind::FromInteger, rs1, rd, 4};
+  case 0x79: return FloatingTransfer{FloatingTransferKind::FromInteger, rs1, rd, 8};
+  case 0x70: return FloatingTransfer{FloatingTransferKind::ToInteger, rd, rs1, 4};
+  case 0x71: return FloatingTransfer{FloatingTransferKind::ToInteger, rd, rs1, 8};
+  default: return std::nullopt;
+  }
+}
+
+bool is_fence_tso_instruction(uint32_t instruction) {
+  return (instruction & 0xfff0707fU) == 0x8330000fU;
+}
+
 CheckResult decode_dependencies(uint32_t inst, DependencyMetadata &m) {
   m = {};
   m.provided = true;
@@ -458,17 +499,17 @@ CheckResult decode_dependencies(uint32_t inst, DependencyMetadata &m) {
       m.control_transfer = true;
       break;
     case 0x0f:
-      // Rocket ignores FENCE.I's reserved immediate/register fields. It orders
-      // instruction fetch, not data memory, even when those fields are nonzero.
-      if (((inst >> 12) & 7) == 1)
+      // BOOM and Spike decode FENCE.I by opcode/funct3, irrespective of its
+      // other encoded fields. It synchronizes fetch, not data-memory accesses.
+      if ((inst & 0x707fU) == 0x100fU)
         break;
       if (((inst >> 12) & 7) != 0)
         return {CheckStatus::Unsupported, 0, "non-data fence requires adapter metadata"};
-      // FENCE.TSO's R/W predecessor/successor masks do not require W->R.
-      if (inst == 0x8330000f)
+      if (is_fence_tso_instruction(inst)) {
         m.fence_tso = true;
-      else if ((inst >> 28) != 0)
+      } else if ((inst >> 28) != 0) {
         return {CheckStatus::Unsupported, 0, "non-base fence requires adapter metadata"};
+      }
       m.fence = true;
       m.fence_predecessor = (inst >> 24) & 15;
       m.fence_successor = (inst >> 20) & 15;

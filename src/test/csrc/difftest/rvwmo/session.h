@@ -8,6 +8,8 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
+#include <utility>
 #include <vector>
 
 namespace rvwmo {
@@ -43,26 +45,22 @@ struct FloatingPostState {
   }
 };
 
+// A physical counter value at the instruction's source-side execution edge.
+// It is an environment input, not an independent check of the counter itself.
 struct CounterReadEnvironment {
   uint16_t address = 0;
   uint64_t source_cycle = 0;
   uint64_t value = 0;
 };
 
+// Physical BOOM exception boundary: no invented architectural retirement.
+// The reference hart must independently trap and match every observed field.
 struct ArchitecturalTrap {
   OperationId id;
   uint32_t instruction = 0;
-  uint64_t pc = 0;
-  uint64_t cause = 0;
-  uint64_t target_pc = 0;
-  uint64_t privilege = 0;
-  uint64_t mstatus = 0;
-  uint64_t mepc = 0;
-  uint64_t mcause = 0;
-  uint64_t mtval = 0;
-  uint64_t sepc = 0;
-  uint64_t scause = 0;
-  uint64_t stval = 0;
+  uint64_t pc = 0, cause = 0, target_pc = 0, privilege = 0;
+  uint64_t mstatus = 0, mepc = 0, mcause = 0, mtval = 0;
+  uint64_t sepc = 0, scause = 0, stval = 0;
   bool physically_retired = false;
 };
 
@@ -76,8 +74,7 @@ struct ArchitecturalRetirement {
   // Only provide a CSR snapshot aligned to this instruction's exact post-state.
   // A delayed FPR writeback does not by itself identify such a CSR boundary.
   std::optional<uint8_t> fcsr;
-  // BOOM-specific post-state probes remain opt-in and are unsupported until
-  // the matching checker/reference consumer is installed.
+  // BOOM-specific post-state probes are checked against the independent reference.
   std::optional<std::pair<uint16_t, uint64_t>> csr_post;
   std::optional<FloatingPostState> fp_post;
   std::optional<CounterReadEnvironment> counter_read;
@@ -110,8 +107,6 @@ struct ReferenceStepResult {
   uint32_t reference_instruction = 0;
   bool took_trap = false;
   std::optional<ReferenceFloatingPointWrite> floating_point_write;
-  // BOOM adapter spelling; current scalar stepper populates the field above.
-  std::optional<ReferenceFloatingWrite> floating_write;
   std::optional<FloatingPostState> fp_post;
   bool skipped_device_store = false;
   bool counter_read_synchronized = false;
@@ -121,6 +116,9 @@ struct ReferenceStepResult {
 struct SessionHartStatistics {
   uint64_t reference_steps = 0;
   uint64_t architecture_compared = 0;
+  uint64_t skipped_device_stores = 0;
+  uint64_t counter_reads_synchronized = 0;
+  uint64_t checked_traps = 0;
   // Retirement accepted by the consumer; final Pass certifies any deferred PPO
   // work. These are not counters for already completed PPO checks.
   uint64_t retired_instructions = 0;
@@ -151,10 +149,8 @@ public:
   const std::string &semantic_observer_error() const { return semantic_observer_error_; }
 
   SessionSubmitResult submit(const EventBatch &batch,
-                             const std::vector<ArchitecturalRetirement> &retirements = {});
-  SessionSubmitResult submit(const EventBatch &batch,
-                             const std::vector<ArchitecturalRetirement> &retirements,
-                             const std::vector<ArchitecturalTrap> &traps);
+                             const std::vector<ArchitecturalRetirement> &retirements = {},
+                             const std::vector<ArchitecturalTrap> &traps = {});
   void set_trap_stepper(TrapStepper stepper) { trap_stepper_ = std::move(stepper); }
   CheckResult poll();
   CheckResult finalize(uint64_t completed_cycle);
@@ -189,6 +185,8 @@ private:
   std::string semantic_observer_error_;
   bool semantic_observer_failed_ = false;
   TrapStepper trap_stepper_;
+  std::map<OperationId, ArchitecturalTrap> architectural_traps_;
+  std::set<OperationId> completed_traps_;
   std::deque<PendingEvent> pending_events_;
   std::map<OperationId, ArchitecturalRetirement> architectural_retirements_;
   std::map<OperationId, ReferenceRecord> reference_records_;
@@ -207,6 +205,7 @@ private:
   CheckResult ensure_statistics_hart(uint32_t hart);
   CheckResult consume_pending_events();
   CheckResult consume_retirement(const RuntimeEvent &event, const InstructionRetireEvent &retirement);
+  CheckResult consume_trap(const RuntimeEvent &event, const TrapEvent &trap);
   CheckResult step_reference(const InstructionRetireEvent &retirement, const ArchitecturalRetirement &snapshot);
   CheckResult remember_failure(CheckResult result);
 };

@@ -316,6 +316,9 @@ CheckResult PpoChecker::retire_instruction(const RetiredInstruction &instruction
   }
   if (deferred > max_pending_stores - std::min(max_pending_stores, hart.pending_stores.size()))
     return {CheckStatus::Incomplete, 0, "deferred PPO store bound exceeded"};
+  if (metadata.fence_tso && (!metadata.fence || metadata.fence_predecessor != 3 ||
+                             metadata.fence_successor != 3 || !is_fence_tso_instruction(instruction.instruction)))
+    return {CheckStatus::Invalid, 4, "FENCE.TSO metadata differs from its exact instruction encoding"};
   if (metadata.fence && (metadata.fence_predecessor & 12 || metadata.fence_successor & 12))
     return {CheckStatus::Unsupported, 4, "I/O fence domain is not represented by memory events"};
 
@@ -354,7 +357,14 @@ CheckResult PpoChecker::retire_instruction(const RetiredInstruction &instruction
     if (op.store && !op.write_time.valid)
       hart.pending_stores.emplace(op.id, PendingStore{std::make_shared<StoreTime>(StoreTime{op.id, {}, {}}), {}, {}});
   apply_constraints(hart, constraints);
-  if (metadata.fence) {
+  if (metadata.fence_tso) {
+    // TSO orders R -> R/W and W -> W, but does not add a W -> R edge.
+    hart.fence_read.include(hart.reads);
+    OrderSummary before_write;
+    before_write.include(hart.reads);
+    before_write.include(hart.writes);
+    hart.fence_write.include(before_write);
+  } else if (metadata.fence) {
     OrderSummary predecessors;
     if (metadata.fence_predecessor & 2)
       predecessors.include(hart.reads);

@@ -2,8 +2,20 @@
 #define DIFFTEST_RVWMO_DEPENDENCY_H
 #include "event.h"
 #include <map>
+#include <optional>
 
 namespace rvwmo {
+enum class FloatingTransferKind { Load, Store, FromInteger, ToInteger };
+struct FloatingTransfer {
+  FloatingTransferKind kind;
+  uint8_t integer_register = 0;
+  uint8_t floating_register = 0;
+  uint8_t bytes = 0;
+};
+// Only scalar floating data transfers are covered; arithmetic and vector
+// memory encodings remain unsupported until their own semantics are supplied.
+std::optional<FloatingTransfer> decode_floating_transfer(uint32_t instruction);
+
 struct DependencySummary {
   bool valid = false;
   uint64_t rank = 0;
@@ -38,6 +50,8 @@ struct FloatingPointInstruction {
 // Decodes RV64 F/D architectural effects independently of DUT classification.
 // Non-FP instructions return recognized=false; unknown FP encodings reject.
 CheckResult decode_floating_point_instruction(uint32_t instruction, FloatingPointInstruction &decoded);
+// FENCE.TSO ignores reserved rd/rs1 fields; its FM/pred/succ are fixed.
+bool is_fence_tso_instruction(uint32_t instruction);
 CheckResult decode_dependencies(uint32_t instruction, DependencyMetadata &metadata);
 } // namespace rvwmo
 #endif

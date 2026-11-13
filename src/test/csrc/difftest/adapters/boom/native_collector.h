@@ -5,6 +5,7 @@
 #include "word_bytes.h"
 #include <map>
 #include <optional>
+#include <set>
 #include <vector>
 
 namespace rvwmo {
@@ -41,7 +42,8 @@ struct NativeFpPost {
   ProbeIdentity identity;
   uint64_t source_cycle = 0, pc = 0, fcsr = 0, mstatus = 0;
 };
-// An exclusive data-array write, with the old and new words sampled together.
+// One physically indivisible AMO W/D cache-array update. Old/new full words
+// are captured at the same exclusive write edge, not inferred from the REF.
 struct NativeAtomicApplied {
   ProbeIdentity identity;
   uint64_t source_cycle = 0;
@@ -68,6 +70,7 @@ struct NativeTrapPost {
   uint64_t mstatus = 0, mepc = 0, mcause = 0, mtval = 0;
   uint64_t sepc = 0, scause = 0, stval = 0;
 };
+
 struct NativeFrame {
   uint32_t hart = 0;
   uint64_t epoch = 0;
@@ -114,10 +117,12 @@ struct NativeCollectorConfiguration {
   // must supply the bounds of their independently initialized GlobalMem.
   uint64_t checked_ram_base = 0;
   uint64_t checked_ram_size = 0;
+  // Enables explicit device-store exclusion only for the opted-in DUT profile.
   bool skip_device_stores = false;
   bool check_csr_post = false;
   bool check_counter_reads = false;
   bool check_fp_post = false;
+  // Independently parsed ELF terminal delimiters; only this BOOM profile opts in.
   std::vector<uint64_t> terminal_wfi_pcs;
 };
 struct CollectedObservations {
@@ -139,8 +144,6 @@ public:
   CaptureResult capture(const NativeFrame &frame);
   CheckResult take_ready(CollectedObservations &output);
   CheckResult audit_reference_store(const ReferenceStoreAudit &reference);
-  // WFI ownership is a profile-specific terminal certificate. The common
-  // scalar collector cannot certify it without the dedicated consumer.
   CheckResult certify_parked_wfi_terminal(const ProbeIdentity &owner, uint64_t pc, uint64_t source_cycle);
   CheckResult completion() const;
 
@@ -149,13 +152,53 @@ private:
   NativeCollectorConfiguration configuration_;
   BoomEventAdapter adapter_;
   std::map<OperationId, InstructionAllocation> allocations_;
+  // WFI still occupies its physical ROB slot, but is outside the retired prefix.
+  struct HeldTerminalWfi { InstructionAllocation allocation; ProbeIdentity identity; };
+  std::map<OperationId, HeldTerminalWfi> terminal_wfis_;
+  struct CertifiedTerminalWfi { ProbeIdentity owner; uint64_t pc = 0; };
+  std::optional<CertifiedTerminalWfi> certified_terminal_wfi_;
+  std::set<OperationId> skipped_device_stores_;
+  struct PendingCsr {
+    uint64_t pc = 0, retirement_cycle = 0;
+    uint16_t address = 0;
+    std::optional<uint64_t> after;
+    uint64_t rob_generation = 0;
+  };
+  std::map<OperationId, PendingCsr> pending_csr_;
+  std::map<OperationId, NativeCsrPost> pending_counter_writes_;
+  std::map<OperationId, NativeCsrPost> pending_counter_reads_;
+  struct PendingFp {
+    uint64_t pc = 0;
+    uint64_t retirement_cycle = 0;
+    uint64_t rob_generation = 0;
+    std::optional<FloatingPostState> after;
+  };
+  std::map<OperationId, PendingFp> pending_fp_;
+  struct PendingSystem { ProbeInstruction core; uint64_t retirement_cycle = 0; };
+  std::optional<PendingSystem> pending_system_;
+  std::optional<NativeTrap> pending_trap_;
+  struct PendingFaultRollback {
+    ProbeIdentity identity;
+    uint32_t rob_index;
+    uint64_t cycle;
+    std::optional<SlotGeneration> ldq;
+  };
+  std::optional<PendingFaultRollback> pending_fault_rollback_;
+  std::map<OperationId, ArchitecturalTrap> staged_traps_;
   std::map<AttemptKey, uint64_t> unresolved_samples_;
+  // Physical cancellations after a precise fault have a later source cycle
+  // than the Trap; close them only with that fault's post-state and rollback.
+  std::map<AttemptKey, uint64_t> fault_rollback_cancellations_;
+  // A misaligned scalar refill cannot become an architectural read. Retain
+  // its physical attempt until the same owner faults, cancels, or squashes.
+  std::map<OperationId, uint32_t> faulting_refills_;
   std::vector<RuntimeEvent> staged_events_;
   std::vector<CapturedRetirement> staged_retirements_;
   std::optional<uint64_t> captured_cycle_;
   std::optional<uint64_t> closed_cycle_;
   uint64_t capture_sequence_ = 0;
   uint64_t emitted_sequence_ = 0;
+  uint64_t last_allocated_uid_ = 0;
   bool queues_empty_ = false;
   bool cache_idle_ = false;
   CheckResult failure_;
@@ -163,12 +206,17 @@ private:
   EventSource capture_source(uint64_t cycle);
   CheckResult capture_frame(const NativeFrame &frame);
   CheckResult capture_allocations(const NativeFrame &frame);
+  CheckResult capture_counter_write(const NativeFrame &frame);
+  CheckResult capture_counter_read(const NativeFrame &frame);
   CheckResult capture_attempts(const NativeFrame &frame);
   CheckResult capture_cancellation(const NativeAttempt &cancel, uint64_t cycle);
   CheckResult capture_retirements(const NativeFrame &frame);
+  CheckResult capture_trap_begin(const NativeFrame &frame);
+  CheckResult capture_trap_post(const NativeFrame &frame);
   CheckResult capture_terminations(const NativeFrame &frame);
   CheckResult collect_adapter_output();
   CheckResult validate_attempt(const NativeAttempt &attempt) const;
+  CheckResult validate_cancellation(const NativeAttempt &cancel) const;
   CheckResult require_checked_ram(uint64_t address, size_t bytes) const;
   OperationId id(const ProbeIdentity &identity) const;
   CheckResult remember_failure(CheckResult result);

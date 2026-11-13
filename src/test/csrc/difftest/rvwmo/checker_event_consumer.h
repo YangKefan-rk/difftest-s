@@ -30,6 +30,8 @@ public:
   // source_prefix_closed additionally certifies that every earlier memory
   // effect has been consumed; ordinary direct callers must leave it false.
   CheckResult consume_closed(const RuntimeEvent &event, bool source_prefix_closed = false);
+  // Before REF executes, confirm this exception has the next live scalar owner.
+  CheckResult prepare_trap(const TrapEvent &event) const;
   CheckResult candidate_load(const OperationId &id, uint32_t attempt, std::vector<uint8_t> &bytes);
   // An audit that precedes LocalStore returns Pending and must be retried.
   CheckResult audit_store(const OperationId &id, uint64_t address, const std::vector<uint8_t> &bytes,
@@ -122,7 +124,8 @@ private:
                                   RankCertificate certificate = RankCertificate::None,
                                   bool source_prefix_closed = false);
   CheckResult consume_atomic(const RuntimeEvent &event, const AtomicLifecycleEvent &atomic,
-                             bool source_prefix_closed);
+                             bool source_prefix_closed,
+                             RankCertificate certificate = RankCertificate::None);
   CheckResult consume_atomic_candidate(const RuntimeEvent &event, const AtomicCommitCandidateEvent &candidate,
                                       bool source_prefix_closed,
                                       RankCertificate certificate = RankCertificate::None);
@@ -136,6 +139,7 @@ private:
   CheckResult audit_physical_write(const StorePublishEvent &publish);
   CheckResult consume_cancel(const InstructionCancelAttemptEvent &event);
   CheckResult consume_squash(const InstructionSquashEvent &event);
+  CheckResult consume_trap(const TrapEvent &event);
   CheckResult consume_retire(const InstructionRetireEvent &event);
   void collect_store_metadata();
   CheckResult remember_failure(CheckResult result);

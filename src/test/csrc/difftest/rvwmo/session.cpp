@@ -37,7 +37,8 @@ bool is_memory_event_kind(const RuntimeEvent &event) {
     const auto &atomic = std::get<AtomicLifecycleEvent>(event.payload);
     const bool lr = atomic.fuop == 2 || atomic.fuop == 3;
     return phase == AtomicObservationPhase::WriteEffect ||
-           (phase == AtomicObservationPhase::ReadEffect && lr);
+           (phase == AtomicObservationPhase::ReadEffect && lr) ||
+           phase == AtomicObservationPhase::RmwEffect;
   }
   case RuntimeEventKind::AtomicCommitCandidate:
     return true;
@@ -74,6 +75,20 @@ std::optional<ScalarEffect> scalar_effect(const RuntimeEvent &event) {
     for (unsigned byte = 0; byte < 8; ++byte)
       mask[byte] = (candidate.byte_mask >> byte) & 1;
     return ScalarEffect{candidate.id, candidate.address, std::move(mask), true};
+  }
+  if (event.kind == RuntimeEventKind::AtomicLifecycle) {
+    // An indivisible RMW conflicts with any other access to its selected bytes;
+    // only disjoint-byte simultaneous effects may share an unordered rank.
+    const auto &atomic = std::get<AtomicLifecycleEvent>(event.payload);
+    if (atomic.phase != AtomicObservationPhase::RmwEffect || atomic.id.subaccess != 0 ||
+        !atomic.exclusive_write_witness || !event.source.order_qualified ||
+        (atomic.address & 7) != 0 ||
+        (atomic.mask != 0x0f && atomic.mask != 0xf0 && atomic.mask != 0xff))
+      return std::nullopt;
+    std::vector<uint8_t> mask(8);
+    for (unsigned byte = 0; byte < mask.size(); ++byte)
+      mask[byte] = (atomic.mask >> byte) & 1;
+    return ScalarEffect{atomic.id, atomic.address, std::move(mask), true};
   }
   if (event.kind != RuntimeEventKind::StorePublish)
     return std::nullopt;
@@ -277,8 +292,12 @@ CheckResult ObservationSession::consume_pending_events() {
         ++pending_event;
         continue;
       }
-      if (event.kind == RuntimeEventKind::InstructionRetire &&
-          retirement_blocked[std::get<InstructionRetireEvent>(event.payload).instruction.hart]) {
+      const bool retirement = event.kind == RuntimeEventKind::InstructionRetire;
+      const bool trap = event.kind == RuntimeEventKind::Trap;
+      const uint32_t architectural_hart = retirement
+          ? std::get<InstructionRetireEvent>(event.payload).instruction.hart
+          : trap ? std::get<TrapEvent>(event.payload).hart : 0;
+      if ((retirement || trap) && retirement_blocked[architectural_hart]) {
         ++pending_event;
         continue;
       }
@@ -308,6 +327,8 @@ CheckResult ObservationSession::consume_pending_events() {
       CheckResult result;
       if (event.kind == RuntimeEventKind::InstructionRetire)
         result = consume_retirement(event, std::get<InstructionRetireEvent>(event.payload));
+      else if (event.kind == RuntimeEventKind::Trap)
+        result = consume_trap(event, std::get<TrapEvent>(event.payload));
       else if (pending_event->memory_group) {
         if (pending_event->memory_group->independent_effects)
           result = consumer_.consume_independent_group_member(event, true);
@@ -322,8 +343,8 @@ CheckResult ObservationSession::consume_pending_events() {
       if (result.status == CheckStatus::Pending) {
         if (memory_event)
           memory_blocked = true;
-        if (event.kind == RuntimeEventKind::InstructionRetire)
-          retirement_blocked[std::get<InstructionRetireEvent>(event.payload).instruction.hart] = true;
+        if (retirement || trap)
+          retirement_blocked[architectural_hart] = true;
         ++pending_event;
         continue;
       }
@@ -407,33 +428,61 @@ CheckResult ObservationSession::step_reference(const InstructionRetireEvent &ret
   if (statistics.reference_steps == std::numeric_limits<uint64_t>::max() ||
       statistics.architecture_compared == std::numeric_limits<uint64_t>::max())
     return invalid("session reference-statistics counter exhausted");
-  ++statistics.reference_steps;
+  if (!retirement.instruction.skipped_device_store)
+    ++statistics.reference_steps;
   auto result = reference_stepper_(retirement, snapshot, loads);
   if (result.check.status == CheckStatus::Pending)
     return invalid("reference step callback must finish synchronously once invoked");
   if (!result.check)
     return result.check;
+  if (result.skipped_device_store != retirement.instruction.skipped_device_store)
+    return invalid("reference device-store exclusion differs from declared retirement");
   if (result.reference_pc != retirement.instruction.pc ||
       result.reference_instruction != retirement.instruction.instruction)
     return {CheckStatus::Violation, 0, "reference PC or instruction differs from retirement"};
   if (result.took_trap)
     return {CheckStatus::Unsupported, 0, "reference instruction trapped outside generic trap semantics"};
+  if (result.skipped_device_store) {
+    if (statistics.skipped_device_stores == std::numeric_limits<uint64_t>::max())
+      return invalid("device-store skip statistics counter exhausted");
+    ++statistics.skipped_device_stores;
+    const OperationId id{retirement.instruction.hart, retirement.instruction.epoch, retirement.instruction.uid, 0};
+    reference_records_[id] = {{}, 0};
+    return {};
+  }
   if (snapshot.destination == ArchitecturalDestination::Integer) {
     if (!snapshot.destination_register || snapshot.destination_register >= 32 || !result.integer_write ||
         result.floating_point_write || result.integer_write->destination_register != snapshot.destination_register ||
         result.integer_write->value != snapshot.destination_value)
       return {CheckStatus::Violation, 0, "reference integer write differs from the DUT retirement snapshot"};
-  } else if (snapshot.destination == ArchitecturalDestination::FloatingPoint) {
-    if (snapshot.destination_register >= 32 || !result.floating_point_write || result.integer_write ||
+  } else if (snapshot.destination == ArchitecturalDestination::Floating) {
+    if (snapshot.destination_register >= 32 || !result.floating_point_write ||
         result.floating_point_write->destination_register != snapshot.destination_register ||
         result.floating_point_write->value != snapshot.destination_value)
-      return {CheckStatus::Violation, 0, "reference floating-point write differs from the DUT retirement snapshot"};
-  } else if (snapshot.destination_register != 0 || result.integer_write || result.floating_point_write) {
-    return {CheckStatus::Violation, 0, "unexpected register write for a non-writing retirement"};
+      return {CheckStatus::Violation, 0, "reference floating-register write differs from the DUT retirement snapshot"};
+    if (result.integer_write)
+      return {CheckStatus::Violation, 0, "reference produced an unexpected integer write"};
+  } else {
+    if (snapshot.destination_register != 0 || result.integer_write || result.floating_point_write)
+      return {CheckStatus::Violation, 0, "unexpected register write for a non-writing retirement"};
+  }
+  if (snapshot.fp_post) {
+    if (!result.fp_post || result.fp_post->fcsr != snapshot.fp_post->fcsr ||
+        result.fp_post->mstatus != snapshot.fp_post->mstatus)
+      return {CheckStatus::Violation, 0, "reference floating CSR state differs from the DUT retirement snapshot"};
+  } else if (result.fp_post) {
+    return {CheckStatus::Violation, 0, "reference produced an unexpected floating CSR state"};
   }
   if (snapshot.fcsr && (!result.fcsr || *snapshot.fcsr != *result.fcsr))
     return {CheckStatus::Violation, 0, "reference FCSR differs from the exact DUT retirement snapshot"};
 
+  if (result.counter_read_synchronized != snapshot.counter_read.has_value())
+    return invalid("reference counter environment differs from the captured CSR read");
+  if (snapshot.counter_read) {
+    if (statistics.counter_reads_synchronized == std::numeric_limits<uint64_t>::max())
+      return invalid("counter environment statistics exhausted");
+    ++statistics.counter_reads_synchronized;
+  }
   ++statistics.architecture_compared;
 
   std::vector<const MemoryOperation *> stores;
@@ -504,8 +553,44 @@ CheckResult ObservationSession::consume_retirement(const RuntimeEvent &event,
   return result;
 }
 
+CheckResult ObservationSession::consume_trap(const RuntimeEvent &event, const TrapEvent &trap) {
+  const auto snapshot = architectural_traps_.find(trap.instruction);
+  if (snapshot == architectural_traps_.end())
+    return pending("trap awaits its independent physical post-state snapshot");
+  const auto &state = snapshot->second;
+  if (state.id != trap.instruction || state.pc != trap.pc || state.cause != trap.cause ||
+      trap.hart != state.id.hart || trap.interrupt)
+    return remember_failure(invalid("trap boundary differs from its physical instruction, PC or cause"));
+  if (!completed_traps_.count(state.id)) {
+    auto prepared = consumer_.prepare_trap(trap);
+    if (!prepared) return remember_failure(prepared);
+    if (!trap_stepper_)
+      return remember_failure({CheckStatus::Unsupported, 0, "trap has no independent reference trap-step callback"});
+    auto checked = ensure_statistics_hart(trap.hart);
+    if (!checked) return remember_failure(checked);
+    auto &statistics = hart_statistics_.at(trap.hart);
+    if (statistics.checked_traps == std::numeric_limits<uint64_t>::max() ||
+        statistics.reference_steps == std::numeric_limits<uint64_t>::max())
+      return remember_failure(invalid("session trap statistics counter exhausted"));
+    checked = trap_stepper_(trap, state);
+    if (checked.status == CheckStatus::Pending)
+      return remember_failure(invalid("reference trap callback must finish synchronously once invoked"));
+    if (!checked) return remember_failure(checked);
+    ++statistics.reference_steps;
+    ++statistics.checked_traps;
+    completed_traps_.insert(state.id);
+  }
+  auto consumed = consumer_.consume_closed(event);
+  if (consumed) {
+    completed_traps_.erase(state.id);
+    architectural_traps_.erase(snapshot);
+  }
+  return consumed;
+}
+
 SessionSubmitResult ObservationSession::submit(const EventBatch &batch,
-                                               const std::vector<ArchitecturalRetirement> &retirements) {
+                                               const std::vector<ArchitecturalRetirement> &retirements,
+                                               const std::vector<ArchitecturalTrap> &traps) {
   SessionSubmitResult result;
   if (!failure_) {
     result.transport = {EventValidationStatus::Invalid, failure_.message};
@@ -537,13 +622,6 @@ SessionSubmitResult ObservationSession::submit(const EventBatch &batch,
     return result;
   }
   for (const auto &snapshot : retirements) {
-    if (snapshot.csr_post || snapshot.fp_post || snapshot.counter_read) {
-      result.transport = {EventValidationStatus::Unsupported,
-                          "BOOM architectural post-state requires its dedicated checker consumer"};
-      result.check = {CheckStatus::Unsupported, 0, result.transport.message};
-      result.pending_events = pending_events_.size();
-      return result;
-    }
     const bool supported_destination = snapshot.destination == ArchitecturalDestination::None ||
                                        snapshot.destination == ArchitecturalDestination::Integer ||
                                        snapshot.destination == ArchitecturalDestination::Unsupported ||
@@ -563,6 +641,24 @@ SessionSubmitResult ObservationSession::submit(const EventBatch &batch,
     }
   }
 
+  if (traps.size() > max_architectural_retirements_ -
+          std::min(max_architectural_retirements_, architectural_traps_.size())) {
+    result.transport = {EventValidationStatus::Pending, "architectural trap snapshot queue is full"};
+    result.check = pending("retry trap snapshots after their closed trap events are consumed");
+    return result;
+  }
+  std::set<OperationId> new_trap_ids;
+  for (const auto &snapshot : traps)
+    if (!snapshot.id.uid || snapshot.id.subaccess || snapshot.pc % 2 ||
+        (snapshot.privilege != 1 && snapshot.privilege != 3) ||
+        architectural_retirements_.count(snapshot.id) || new_retirement_ids.count(snapshot.id) ||
+        architectural_traps_.count(snapshot.id) || completed_traps_.count(snapshot.id) ||
+        !new_trap_ids.insert(snapshot.id).second) {
+      result.transport = {EventValidationStatus::Invalid, "invalid or duplicate physical trap snapshot"};
+      result.check = remember_failure(invalid("invalid or duplicate physical trap snapshot"));
+      return result;
+    }
+
   result.transport = stream_.submit(batch);
   if (!result.transport) {
     result.check = result.transport.status == EventValidationStatus::Unsupported
@@ -579,25 +675,13 @@ SessionSubmitResult ObservationSession::submit(const EventBatch &batch,
 
   for (const auto &snapshot : retirements)
     architectural_retirements_.emplace(snapshot.id, snapshot);
+  for (const auto &snapshot : traps)
+    architectural_traps_.emplace(snapshot.id, snapshot);
 
   result.check = poll();
   result.pending_events = pending_events_.size();
   result.accepted = true;
   return result;
-}
-
-SessionSubmitResult ObservationSession::submit(const EventBatch &batch,
-                                               const std::vector<ArchitecturalRetirement> &retirements,
-                                               const std::vector<ArchitecturalTrap> &traps) {
-  if (!traps.empty()) {
-    SessionSubmitResult result;
-    result.transport = {EventValidationStatus::Unsupported,
-                        "physical trap observations require the BOOM trap consumer"};
-    result.check = {CheckStatus::Unsupported, 0, result.transport.message};
-    result.pending_events = pending_events_.size();
-    return result;
-  }
-  return submit(batch, retirements);
 }
 
 CheckResult ObservationSession::poll() {
@@ -642,6 +726,8 @@ CheckResult ObservationSession::finalize(uint64_t completed_cycle) {
     return remember_failure(incomplete("session has retained semantic events that cannot make progress"));
   if (!architectural_retirements_.empty())
     return remember_failure(incomplete("session has architectural snapshots without matching retirements"));
+  if (!architectural_traps_.empty() || !completed_traps_.empty())
+    return remember_failure(incomplete("session has physical trap snapshots without matching exception boundaries"));
   auto result = consumer_.finalize();
   if (result.status == CheckStatus::Pending)
     return remember_failure({CheckStatus::Incomplete, result.rule,
