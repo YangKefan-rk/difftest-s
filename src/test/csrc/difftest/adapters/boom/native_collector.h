@@ -138,6 +138,9 @@ public:
   CaptureResult capture(const NativeFrame &frame);
   CheckResult take_ready(CollectedObservations &output);
   CheckResult audit_reference_store(const ReferenceStoreAudit &reference);
+  // WFI ownership is a profile-specific terminal certificate. The common
+  // scalar collector cannot certify it without the dedicated consumer.
+  CheckResult certify_parked_wfi_terminal(const ProbeIdentity &owner, uint64_t pc, uint64_t source_cycle);
   CheckResult completion() const;
 
 private:

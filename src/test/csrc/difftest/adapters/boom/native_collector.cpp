@@ -403,6 +403,11 @@ CheckResult NativeCollector::audit_reference_store(const ReferenceStoreAudit &re
   return remember_failure(result);
 }
 
+CheckResult NativeCollector::certify_parked_wfi_terminal(const ProbeIdentity &, uint64_t, uint64_t) {
+  return remember_failure({CheckStatus::Unsupported, 0,
+                           "BOOM WFI terminal ownership has no common collector consumer"});
+}
+
 CheckResult NativeCollector::completion() const {
   if (!failure_)
     return failure_;
