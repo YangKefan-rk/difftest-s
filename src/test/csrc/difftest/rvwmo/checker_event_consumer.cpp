@@ -344,6 +344,7 @@ CheckResult CheckerEventConsumer::consume_atomic(const RuntimeEvent &event,
     record.mask = atomic.mask;
     record.old_data = atomic.data;
     record.new_data = atomic.new_data;
+    record.exclusive_write_witness = true;
     record.request_seen = record.read_seen = record.write_seen = true;
     return {};
   }
@@ -956,35 +957,50 @@ CheckResult CheckerEventConsumer::consume_retire(const InstructionRetireEvent &e
   if (instruction.skipped_device_store &&
       ((instruction.instruction & 0x7f) != 0x23 || !instruction.memory.empty() || !event.loads.empty()))
     return remember_failure(invalid("excluded device store carries a non-store or coherent RAM effect"));
-  const auto floating = decode_floating_transfer(instruction.instruction);
-  const bool floating_load = floating && floating->kind == FloatingTransferKind::Load;
-  const bool floating_store = floating && floating->kind == FloatingTransferKind::Store;
   if (allocation->second.length == 2) {
     const unsigned quadrant = instruction.instruction & 3;
     const unsigned funct3 = (instruction.instruction >> 13) & 7;
-    const bool fp_memory = (quadrant == 0 || quadrant == 2) && (funct3 == 1 || funct3 == 5);
-    if (fp_memory && !floating)
-      return remember_failure(unsupported("compressed floating memory encoding lacks a verified transfer"));
-    const bool compressed_load = floating_load ||
-        ((quadrant == 0 || quadrant == 2) && (funct3 == 2 || funct3 == 3));
-    const bool compressed_store = floating_store ||
-        ((quadrant == 0 || quadrant == 2) && (funct3 == 6 || funct3 == 7));
-    if ((compressed_load && (!has_load || has_store)) || (compressed_store && (!has_store || has_load)))
-      return remember_failure(incomplete("compressed load/store lacks its matching memory event"));
-    if (!compressed_load && !compressed_store && !instruction.memory.empty())
+    const bool fp_load = (quadrant == 0 || quadrant == 2) && funct3 == 1;
+    const bool fp_store = (quadrant == 0 || quadrant == 2) && funct3 == 5;
+    const bool compressed_load = (quadrant == 0 || quadrant == 2) && (funct3 == 2 || funct3 == 3);
+    const bool compressed_store = (quadrant == 0 || quadrant == 2) && (funct3 == 6 || funct3 == 7);
+    if ((fp_load || compressed_load) && (!has_load || has_store || instruction.memory.size() != 1))
+      return remember_failure(incomplete("compressed load lacks one matching memory effect"));
+    if ((fp_store || compressed_store) && (!has_store || has_load || instruction.memory.size() != 1))
+      return remember_failure(incomplete("compressed store lacks one matching memory effect"));
+    if ((fp_load || fp_store) && instruction.memory.front().byte_mask.size() != 8)
+      return remember_failure(invalid("RV64 compressed FP memory effect is not eight bytes"));
+    if ((fp_load || fp_store) && std::any_of(instruction.memory.front().byte_mask.begin(),
+          instruction.memory.front().byte_mask.end(), [](uint8_t byte) { return byte != 1; }))
+      return remember_failure(unsupported("compressed FP scalar memory effect has a sparse byte mask"));
+    if (!fp_load && !fp_store && !compressed_load && !compressed_store && !instruction.memory.empty())
       return remember_failure(invalid("compressed non-memory opcode carries a memory effect"));
   } else {
     const uint32_t opcode = instruction.instruction & 0x7f;
-    if ((opcode == 0x07 || opcode == 0x27) && !floating)
-      return remember_failure(unsupported("vector memory opcode needs a richer consumer"));
     if (opcode == 0x2f) {
       if (instruction.memory.empty())
-        return remember_failure(incomplete("AMO retirement lacks its certified indivisible memory effect"));
+        return remember_failure(unsupported("atomic opcode retirement lacks its memory effect"));
     } else {
-      if (((opcode == 0x03 || floating_load) && (!has_load || has_store)) ||
-          ((opcode == 0x23 || floating_store) && (!has_store || has_load) && !instruction.skipped_device_store))
-        return remember_failure(incomplete("supported load/store retirement lacks its matching memory event"));
-      if (opcode != 0x03 && opcode != 0x23 && !floating_load && !floating_store && !instruction.memory.empty())
+      const bool fp_load = opcode == 0x07;
+      const bool fp_store = opcode == 0x27;
+      if (fp_load || fp_store) {
+        const unsigned width_encoding = (instruction.instruction >> 12) & 7;
+        if (width_encoding != 2 && width_encoding != 3)
+          return remember_failure(unsupported("vector or unsupported FP memory width lacks a scalar model"));
+        if (instruction.memory.size() != 1 || (fp_load && (!has_load || has_store)) ||
+            (fp_store && (!has_store || has_load)))
+          return remember_failure(incomplete("FP load/store retirement lacks one matching memory effect"));
+        const auto expected_width = size_t{1} << width_encoding;
+        if (instruction.memory.front().byte_mask.size() != expected_width)
+          return remember_failure(invalid("FP load/store memory width differs from instruction encoding"));
+        if (std::any_of(instruction.memory.front().byte_mask.begin(),
+              instruction.memory.front().byte_mask.end(), [](uint8_t byte) { return byte != 1; }))
+          return remember_failure(unsupported("FP scalar memory effect has a sparse byte mask"));
+      }
+      if ((opcode == 0x03 && (!has_load || has_store)) ||
+          (opcode == 0x23 && (!has_store || has_load) && !instruction.skipped_device_store))
+        return remember_failure(incomplete("scalar load/store retirement lacks its matching memory event"));
+      if (opcode != 0x03 && opcode != 0x23 && !fp_load && !fp_store && !instruction.memory.empty())
         return remember_failure(invalid("non-load/store opcode carries a memory effect"));
       if (opcode == 0x0f && ((instruction.instruction >> 12) & 7) == 2)
         return remember_failure(unsupported("cache-block operation is not modeled by this consumer"));
@@ -1029,14 +1045,12 @@ CheckResult CheckerEventConsumer::consume_retire(const InstructionRetireEvent &e
         return remember_failure(invalid("duplicate atomic retirement"));
       const bool aq = (instruction.instruction >> 26) & 1;
       const bool rl = (instruction.instruction >> 25) & 1;
-      if (operation.atomic) {
-        if (operation.acquire != aq || operation.release != rl || operation.rcsc != (aq || rl))
-          return remember_failure(invalid("AMO ordering annotations differ from the retired instruction"));
-      } else {
-        operation.acquire = operation.sc ? (aq && rl) : aq;
-        operation.release = operation.lr ? (aq && rl) : rl;
-        operation.rcsc = operation.acquire || operation.release;
-      }
+      if (operation.atomic && record.exclusive_write_witness &&
+          (operation.acquire != aq || operation.release != rl || operation.rcsc != (aq || rl)))
+        return remember_failure(invalid("AMO ordering annotations differ from the retired instruction"));
+      operation.acquire = operation.sc ? (aq && rl) : aq;
+      operation.release = operation.lr ? (aq && rl) : rl;
+      operation.rcsc = operation.acquire || operation.release;
     } else if (operation.load && operation.store) {
       return remember_failure(unsupported("split read/write effects are not represented by this consumer"));
     }

@@ -68,6 +68,7 @@ private:
     bool lr = false;
     bool sc = false;
     bool rmw = false;
+    bool exclusive_write_witness = false;
     uint64_t address = 0;
     uint8_t mask = 0;
     bool request_seen = false;
