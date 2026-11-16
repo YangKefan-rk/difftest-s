@@ -136,6 +136,8 @@ private:
     std::vector<std::pair<uint64_t, uint32_t>> reference_instructions;
     std::optional<CheckedFusedRetirement> checked_fused_retirement;
     uint64_t retirement_source_cycle = 0;
+    unsigned retirement_source_id = 0;
+    uint64_t retirement_source_sequence = 0;
   };
   struct Hart {
     uint64_t next_uid = 1;
@@ -143,6 +145,7 @@ private:
     uint64_t frame_ref_steps = 0;
     uint64_t arch_compares = 0;
     uint64_t last_retired_uid = 0;
+    uint64_t semantic_retirement_ordinal = 0;
     uint64_t last_store_uid = 0;
     std::map<uint16_t, OperationId> allocations;
     std::map<uint64_t, Store> stores;
@@ -157,6 +160,15 @@ private:
     bool done = false;
     uint64_t end_uid = 0;
     int exit_code = 0;
+  };
+  struct SemanticRetirement {
+    OperationId id;
+    uint64_t pc;
+    uint32_t instruction;
+    uint64_t source_cycle;
+    unsigned source_id;
+    uint64_t source_sequence;
+    uint64_t program_order;
   };
   struct SemanticRetiredMemory {
     uint64_t pc;
@@ -233,6 +245,8 @@ private:
   bool semantic_export_enabled_ = false;
   bool semantic_export_overflow_ = false;
   bool checked_fused_retirements_overflow_ = false;
+  bool semantic_retirements_incomplete_ = false;
+  std::vector<SemanticRetirement> semantic_retirements_;
   size_t checked_fused_instruction_count_ = 0;
   std::vector<CheckedFusedRetirement> checked_fused_retirements_;
   bool semantic_excluded_device_store_ = false;

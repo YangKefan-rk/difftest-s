@@ -950,6 +950,8 @@ CheckResult Runtime::before_commit(unsigned hart, unsigned port, DiffTestState &
   active.instruction.instruction = commit.instr;
 #ifdef CONFIG_DIFFTEST_SOURCEPREFIXEVENT
   active.retirement_source_cycle = commit.timestamp;
+  active.retirement_source_id = commit.sourceId;
+  active.retirement_source_sequence = commit.sourceSequence;
 #endif
   // The simulator's explicit exit marker is not an ISA memory operation.
   const bool exit_marker = (commit.instr & 0x7f) == 0x6b && state.trap.hasTrap && state.trap.pc == commit.pc;
@@ -1270,6 +1272,26 @@ CheckResult Runtime::after_commit(unsigned hart, RefProxy &reference) {
     h.last_retired_uid = instruction.uid;
   }
   if (semantic_export_enabled_) {
+    // Record every successfully checked instruction, including fused scalar
+    // tails verified against the independent REF observer. The one physical
+    // commit packet remains the source position of each fused instruction.
+    const auto record_retirement = [&](const RetiredInstruction &instruction) {
+      if (semantic_retirements_incomplete_)
+        return;
+      if (!active.retirement_source_cycle || !active.retirement_source_sequence ||
+          semantic_retirements_.size() >= max_semantic_events ||
+          h.semantic_retirement_ordinal == UINT64_MAX) {
+        semantic_retirements_incomplete_ = true;
+        return;
+      }
+      semantic_retirements_.push_back({{instruction.hart, 0, instruction.uid, 0},
+          instruction.pc, instruction.instruction, active.retirement_source_cycle,
+          active.retirement_source_id, active.retirement_source_sequence,
+          h.semantic_retirement_ordinal++});
+    };
+    record_retirement(active.instruction);
+    for (const auto &tail : fused_tail)
+      record_retirement(tail);
     // This PC and byte footprint come from the independently accepted retired
     // instruction, not from a nearby retirement cycle or DUT load data.
     for (const auto &operation : active.instruction.memory) {
@@ -1659,6 +1681,33 @@ bool Runtime::export_semantic_observed_prefix() const {
     }
     checked_fused_retirements.push_back(&retirement);
   }
+  bool retirement_trace_complete = !semantic_retirements_incomplete_ && !semantic_retirements_.empty();
+  std::array<uint64_t, NUM_CORES> retired_counts{};
+  std::set<std::pair<unsigned, uint64_t>> retirement_uids;
+  std::map<std::tuple<unsigned, unsigned, uint64_t>, uint64_t> source_packets;
+  for (const auto &retirement : semantic_retirements_) {
+    const auto producer = std::find_if(producers.begin(), producers.end(), [&](const SourceProducerWatermark &item) {
+      return item.hart == retirement.id.hart && item.source_id == retirement.source_id;
+    });
+    const auto packet = std::make_tuple(retirement.id.hart, retirement.source_id,
+                                        retirement.source_sequence);
+    const auto inserted = source_packets.emplace(packet, retirement.source_cycle);
+    if (retirement.id.hart >= retired_counts.size() || !retirement.id.uid ||
+        !retirement_uids.insert({retirement.id.hart, retirement.id.uid}).second ||
+        producer == producers.end() || producer->kind != 1 ||
+        retirement.source_sequence > producer->event_sequence ||
+        !producer->closed_through || retirement.source_cycle > *producer->closed_through ||
+        (!inserted.second && inserted.first->second != retirement.source_cycle) ||
+        retirement.program_order != retired_counts[retirement.id.hart])
+      retirement_trace_complete = false;
+    if (retirement.id.hart < retired_counts.size())
+      ++retired_counts[retirement.id.hart];
+  }
+  for (unsigned hart = 0; hart < harts_.size(); ++hart)
+    if (!retired_counts[hart] || retired_counts[hart] != harts_[hart].arch_compares)
+      retirement_trace_complete = false;
+  if (!source.reset_epoch_verified || !complete_roster)
+    retirement_trace_complete = false;
   // Aggregate the enabled bytes by source cycle and physical line. A
   // scalar effect then needs one logarithmic lookup, even with many atomics.
   std::map<std::pair<uint64_t, uint64_t>, uint64_t> atomic_mask_by_cycle_line;
@@ -1805,7 +1854,27 @@ bool Runtime::export_semantic_observed_prefix() const {
     }
     json << "]}";
   }
-  json << "],\"excluded_device_stores\":[";
+  json << "],\"retirement_trace_complete\":" << (retirement_trace_complete ? "true" : "false");
+  if (retirement_trace_complete) {
+    json << ",\"retirement_source_clock\":\"difftest-source-cycle\""
+         << ",\"retirement_closed_through_cycle\":" << *source.closed_through
+         << ",\"retirements\":[";
+    for (size_t index = 0; index < semantic_retirements_.size(); ++index) {
+      if (index)
+        json << ',';
+      const auto &retirement = semantic_retirements_[index];
+      json << "{\"hart\":" << retirement.id.hart << ",\"epoch\":" << epoch
+           << ",\"uid\":" << retirement.id.uid << ",\"pc\":" << retirement.pc
+           << ",\"instruction\":" << retirement.instruction
+           << ",\"source_cycle\":" << retirement.source_cycle
+           << ",\"producer_id\":";
+      json_string(json, source_producer_name(retirement.id.hart, retirement.source_id).c_str());
+      json << ",\"producer_sequence\":" << retirement.source_sequence
+           << ",\"program_order\":" << retirement.program_order << '}';
+    }
+    json << ']';
+  }
+  json << ",\"excluded_device_stores\":[";
   for (size_t index = 0; index < semantic_excluded_device_stores_.size(); ++index) {
     if (index)
       json << ',';
