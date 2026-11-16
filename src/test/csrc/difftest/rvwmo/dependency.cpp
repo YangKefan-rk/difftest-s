@@ -128,6 +128,17 @@ std::vector<unsigned> csr_dependency_units(unsigned csr) {
 CheckResult decode_system(uint32_t instruction, DependencyMetadata &metadata) {
   const unsigned funct = (instruction >> 12) & 7;
   if (!funct) {
+    if ((instruction & 0xfe007fffU) == 0x12000073U) {
+      // SFENCE.VMA synchronizes implicit page-table accesses. It adds no
+      // ordinary load/store FENCE edges to this explicit-access PPO model.
+      const unsigned rs1 = (instruction >> 15) & 31, rs2 = (instruction >> 20) & 31;
+      if (rs1)
+        metadata.sources.push_back(rs1);
+      if (rs2)
+        metadata.sources.push_back(rs2);
+      metadata.carries_to_destination = false;
+      return {};
+    }
     switch (instruction) {
       case 0x00000073: // ECALL
       case 0x00100073: // EBREAK
