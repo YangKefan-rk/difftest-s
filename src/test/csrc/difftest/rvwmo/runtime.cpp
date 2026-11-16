@@ -1272,6 +1272,11 @@ CheckResult Runtime::after_commit(unsigned hart, RefProxy &reference) {
     h.last_retired_uid = instruction.uid;
   }
   if (semantic_export_enabled_) {
+    const size_t accepted_instructions = 1 + fused_tail.size();
+    if (accepted_instructions > UINT64_MAX - h.accepted_retirement_instructions)
+      semantic_retirements_incomplete_ = true;
+    else
+      h.accepted_retirement_instructions += accepted_instructions;
     // Record every successfully checked instruction, including fused scalar
     // tails verified against the independent REF observer. The one physical
     // commit packet remains the source position of each fused instruction.
@@ -1704,7 +1709,9 @@ bool Runtime::export_semantic_observed_prefix() const {
       ++retired_counts[retirement.id.hart];
   }
   for (unsigned hart = 0; hart < harts_.size(); ++hart)
-    if (!retired_counts[hart] || retired_counts[hart] != harts_[hart].arch_compares)
+    if (!retired_counts[hart] ||
+        retired_counts[hart] != harts_[hart].accepted_retirement_instructions ||
+        retired_counts[hart] < harts_[hart].arch_compares)
       retirement_trace_complete = false;
   if (!source.reset_epoch_verified || !complete_roster)
     retirement_trace_complete = false;
@@ -1745,6 +1752,18 @@ bool Runtime::export_semantic_observed_prefix() const {
        << (complete ? "Complete" : "Incomplete")
        << "\",\"complete\":" << (complete ? "true" : "false")
        << ",\"physical_drain_certified\":false,\"source_clock\":\"difftest-source-cycle\",\"epoch\":" << epoch;
+  json << ",\"retirement_source_diagnostic\":{\"records\":" << semantic_retirements_.size()
+       << ",\"capture_incomplete\":" << (semantic_retirements_incomplete_ ? "true" : "false")
+       << ",\"hart_records\":[";
+  for (unsigned hart = 0; hart < harts_.size(); ++hart)
+    json << (hart ? "," : "") << retired_counts[hart];
+  json << "],\"accepted_retirements\":[";
+  for (unsigned hart = 0; hart < harts_.size(); ++hart)
+    json << (hart ? "," : "") << harts_[hart].accepted_retirement_instructions;
+  json << "],\"architecture_compared\":[";
+  for (unsigned hart = 0; hart < harts_.size(); ++hart)
+    json << (hart ? "," : "") << harts_[hart].arch_compares;
+  json << "]}";
   json << ",\"case_id\":";
   json_string(json, case_id);
   json << ",\"run_id\":";
@@ -1856,7 +1875,10 @@ bool Runtime::export_semantic_observed_prefix() const {
   }
   json << "],\"retirement_trace_complete\":" << (retirement_trace_complete ? "true" : "false");
   if (retirement_trace_complete) {
-    json << ",\"retirement_source_clock\":\"difftest-source-cycle\""
+    json << ",\"retirement_accepted_counts\":[";
+    for (unsigned hart = 0; hart < harts_.size(); ++hart)
+      json << (hart ? "," : "") << harts_[hart].accepted_retirement_instructions;
+    json << ']' << ",\"retirement_source_clock\":\"difftest-source-cycle\""
          << ",\"retirement_closed_through_cycle\":" << *source.closed_through
          << ",\"retirements\":[";
     for (size_t index = 0; index < semantic_retirements_.size(); ++index) {

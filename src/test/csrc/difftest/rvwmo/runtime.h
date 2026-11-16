@@ -146,6 +146,7 @@ private:
     uint64_t arch_compares = 0;
     uint64_t last_retired_uid = 0;
     uint64_t semantic_retirement_ordinal = 0;
+    uint64_t accepted_retirement_instructions = 0;
     uint64_t last_store_uid = 0;
     std::map<uint16_t, OperationId> allocations;
     std::map<uint64_t, Store> stores;
