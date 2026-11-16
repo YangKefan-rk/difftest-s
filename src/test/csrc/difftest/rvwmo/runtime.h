@@ -135,6 +135,7 @@ private:
     bool is_rvc = false;
     std::vector<std::pair<uint64_t, uint32_t>> reference_instructions;
     std::optional<CheckedFusedRetirement> checked_fused_retirement;
+    uint64_t retirement_source_cycle = 0;
   };
   struct Hart {
     uint64_t next_uid = 1;
@@ -156,6 +157,14 @@ private:
     bool done = false;
     uint64_t end_uid = 0;
     int exit_code = 0;
+  };
+  struct SemanticRetiredMemory {
+    uint64_t pc;
+    uint32_t instruction;
+    uint64_t retirement_source_cycle;
+    uint32_t attempt;
+    uint64_t address;
+    uint64_t byte_mask;
   };
   struct SemanticLoad {
     OperationId id;
@@ -228,6 +237,7 @@ private:
   uint64_t excluded_atomic_effect_count_ = 0;
   std::vector<SemanticAtomicEffect> semantic_atomic_effects_;
   std::vector<SemanticLoad> semantic_loads_;
+  std::map<OperationId, SemanticRetiredMemory> semantic_retired_memories_;
   std::vector<SemanticGroup> semantic_groups_;
   std::set<OperationId> retired_semantic_stores_;
   std::set<OperationId> audited_semantic_stores_;

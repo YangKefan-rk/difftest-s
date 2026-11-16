@@ -81,7 +81,9 @@ public:
   CheckResult finalize(uint64_t completed_cycle);
   bool finalized() const { return finalized_; }
   bool semantic_feedback_publishable() const {
-    return finalized_ && session_ && session_->semantic_observer_healthy();
+    return finalized_ && session_ && session_->semantic_observer_healthy() &&
+           (!configuration_.ordered_semantic_event_observer ||
+            session_->ordered_semantic_observer_healthy());
   }
   const std::map<uint32_t, SourcePosition> &semantic_source_watermarks() const {
     return source_watermarks_;

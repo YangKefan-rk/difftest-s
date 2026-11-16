@@ -928,6 +928,9 @@ CheckResult Runtime::before_commit(unsigned hart, unsigned port, DiffTestState &
   active.instruction.uid = allocation->second.uid;
   active.instruction.pc = commit.pc;
   active.instruction.instruction = commit.instr;
+#ifdef CONFIG_DIFFTEST_SOURCEPREFIXEVENT
+  active.retirement_source_cycle = commit.timestamp;
+#endif
   // The simulator's explicit exit marker is not an ISA memory operation.
   const bool exit_marker = (commit.instr & 0x7f) == 0x6b && state.trap.hasTrap && state.trap.pc == commit.pc;
   if (exit_marker) {
@@ -1247,6 +1250,19 @@ CheckResult Runtime::after_commit(unsigned hart, RefProxy &reference) {
     h.last_retired_uid = instruction.uid;
   }
   if (semantic_export_enabled_) {
+    // This PC and byte footprint come from the independently accepted retired
+    // instruction, not from a nearby retirement cycle or DUT load data.
+    for (const auto &operation : active.instruction.memory) {
+      if (operation.atomic || operation.lr || operation.sc ||
+          operation.load == operation.store || semantic_export_overflow_)
+        continue;
+      if (semantic_retired_memories_.size() >= max_semantic_events ||
+          !semantic_retired_memories_.emplace(operation.id, SemanticRetiredMemory{
+              active.instruction.pc, active.instruction.instruction,
+              active.retirement_source_cycle, operation.attempt, operation.address,
+              enabled_byte_mask(operation.byte_mask)}).second)
+        semantic_export_overflow_ = true;
+    }
     if (active.load && !active.atomic && active.load->observed && !active.load->cancelled) {
       if (semantic_loads_.size() + semantic_groups_.size() == max_semantic_events) {
         semantic_export_overflow_ = true;
@@ -1524,6 +1540,7 @@ bool Runtime::export_semantic_observed_prefix() const {
   bool invalid_physical_address = false;
   bool duplicate_logical_identity = false;
   bool missing_checked_store = false;
+  bool missing_retirement_origin = false;
   bool invalid_checked_fused_source = false;
   std::set<std::tuple<unsigned, unsigned, uint64_t>> used_source_positions;
   std::set<std::tuple<unsigned, uint64_t, uint32_t, uint32_t>> used_load_ids;
@@ -1560,6 +1577,11 @@ bool Runtime::export_semantic_observed_prefix() const {
       duplicate_logical_identity = true;
       continue;
     }
+    const auto origin = semantic_retired_memories_.find(load.id);
+    if (origin == semantic_retired_memories_.end() ||
+        origin->second.attempt != load.attempt || origin->second.address != load.address ||
+        origin->second.byte_mask != load.byte_mask || !origin->second.retirement_source_cycle)
+      missing_retirement_origin = true;
     checked_loads.push_back(&load);
   }
   for (const auto &group : semantic_groups_) {
@@ -1581,6 +1603,20 @@ bool Runtime::export_semantic_observed_prefix() const {
     if (!used_group_ids.emplace(group.hart, group.transaction_id).second) {
       duplicate_logical_identity = true;
       continue;
+    }
+    for (const auto &member : group.members) {
+      const auto origin = semantic_retired_memories_.find(member);
+      if (origin == semantic_retired_memories_.end() || !origin->second.retirement_source_cycle ||
+          !origin->second.byte_mask || origin->second.address > UINT64_MAX - 63)
+        missing_retirement_origin = true;
+      else
+        for (unsigned byte = 0; byte < 64; ++byte)
+          if ((origin->second.byte_mask >> byte) & 1) {
+            const uint64_t address = origin->second.address + byte;
+            if (address < group.address || address >= group.address + 64 ||
+                !((group.byte_mask >> (address - group.address)) & 1))
+              missing_retirement_origin = true;
+          }
     }
     checked_groups.push_back(&group);
   }
@@ -1627,7 +1663,8 @@ bool Runtime::export_semantic_observed_prefix() const {
                         !checked_fused_retirements_overflow_ && !invalid_checked_fused_source &&
                         !semantic_excluded_device_store_ && !atomic_scalar_overlap && !invalid_atomic_span &&
                         !invalid_event_source && !invalid_physical_address &&
-                        !duplicate_logical_identity && !missing_checked_store;
+                        !duplicate_logical_identity && !missing_checked_store &&
+                        !missing_retirement_origin;
   std::ostringstream json;
   json << "{\"schema_version\":1,\"kind\":\"difftest-s-observed-prefix.v1\",\"scope\":\"observed_prefix_only\","
           "\"operation_scope\":\"scalar_load_store_only\",\"excluded_atomic_effect_count\":"
@@ -1691,7 +1728,13 @@ bool Runtime::export_semantic_observed_prefix() const {
                  load.address, load.byte_mask);
     json << ",\"kind\":\"retired_load_sample\",\"uid\":" << load.id.uid
          << ",\"attempt\":" << load.attempt << ",\"subaccess\":" << load.id.subaccess
-         << ",\"retired\":true}";
+         << ",\"retired\":true";
+    const auto origin = semantic_retired_memories_.find(load.id);
+    if (origin != semantic_retired_memories_.end())
+      json << ",\"pc\":" << origin->second.pc
+           << ",\"instruction\":" << origin->second.instruction
+           << ",\"retirement_source_cycle\":" << origin->second.retirement_source_cycle;
+    json << '}';
   }
   for (const auto *observed : checked_groups) {
     const auto &group = *observed;
@@ -1703,8 +1746,18 @@ bool Runtime::export_semantic_observed_prefix() const {
       if (index)
         json << ',';
       const auto &member = group.members[index];
+      const auto origin = semantic_retired_memories_.find(member);
       json << "{\"hart\":" << member.hart << ",\"uid\":" << member.uid
-           << ",\"attempt\":0,\"subaccess\":" << member.subaccess << ",\"retired\":true}";
+           << ",\"attempt\":" << (origin == semantic_retired_memories_.end() ? 0 : origin->second.attempt)
+           << ",\"subaccess\":" << member.subaccess << ",\"retired\":true";
+      if (origin != semantic_retired_memories_.end())
+        json << ",\"pc\":" << origin->second.pc
+             << ",\"instruction\":" << origin->second.instruction
+             << ",\"retirement_source_cycle\":" << origin->second.retirement_source_cycle
+             << ",\"physical_address\":" << origin->second.address
+             << ",\"byte_mask\":" << origin->second.byte_mask
+             << ",\"byte_provenance_verified\":true";
+      json << '}';
     }
     json << "]}";
   }
@@ -1771,6 +1824,8 @@ bool Runtime::export_semantic_observed_prefix() const {
     add_reason("event_source_identity_unverified");
   if (missing_checked_store)
     add_reason("store_retirement_or_ref_audit_missing");
+  if (missing_retirement_origin)
+    add_reason("retired_memory_pc_or_byte_provenance_missing");
   if (invalid_physical_address)
     add_reason("physical_address_unverified");
   json << "]}\n";
