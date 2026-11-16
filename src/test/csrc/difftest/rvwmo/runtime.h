@@ -184,6 +184,9 @@ private:
     uint64_t address;
     uint64_t byte_mask;
     std::vector<OperationId> members;
+    // Only bytes whose final physical writer is this dynamic store are
+    // externally visible in this coalesced publication.
+    std::map<OperationId, uint64_t> visible_member_masks;
   };
   struct ExcludedDeviceStore {
     OperationId id;

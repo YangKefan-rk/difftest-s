@@ -332,9 +332,29 @@ CheckResult Runtime::complete_group(Group &group, ObservationTime time) {
       } else if (!semantic_export_overflow_) {
         SemanticGroup record{group.hart, group.id, group.cycle, group.source_id, group.source_sequence,
                              group.address, enabled_byte_mask(architectural_mask), {}};
-        for (const auto &member : ordered_members)
+        for (const auto &member : ordered_members) {
           record.members.push_back(member.first);
-        semantic_groups_.push_back(std::move(record));
+          record.visible_member_masks.emplace(member.first, 0);
+        }
+        for (size_t byte = 0; byte < architectural_mask.size(); ++byte) {
+          if (!architectural_mask[byte])
+            continue;
+          const auto writer = h.stores.find(group.writers[byte]);
+          if (writer == h.stores.end() || !record.visible_member_masks.count(writer->second.id)) {
+            semantic_export_overflow_ = true;
+            break;
+          }
+          const auto &logical = writer->second.operation;
+          const uint64_t address = group.address + byte;
+          if (address < logical.address || address - logical.address >= logical.byte_mask.size() ||
+              !logical.byte_mask[address - logical.address] || address - logical.address >= 64) {
+            semantic_export_overflow_ = true;
+            break;
+          }
+          record.visible_member_masks.at(writer->second.id) |= UINT64_C(1) << (address - logical.address);
+        }
+        if (!semantic_export_overflow_)
+          semantic_groups_.push_back(std::move(record));
       }
     }
     ranks_consumed_ = completed.size();
@@ -1606,12 +1626,15 @@ bool Runtime::export_semantic_observed_prefix() const {
     }
     for (const auto &member : group.members) {
       const auto origin = semantic_retired_memories_.find(member);
+      const auto visible = group.visible_member_masks.find(member);
       if (origin == semantic_retired_memories_.end() || !origin->second.retirement_source_cycle ||
-          !origin->second.byte_mask || origin->second.address > UINT64_MAX - 63)
+          !origin->second.byte_mask || origin->second.address > UINT64_MAX - 63 ||
+          visible == group.visible_member_masks.end() ||
+          (visible->second & ~origin->second.byte_mask))
         missing_retirement_origin = true;
       else
         for (unsigned byte = 0; byte < 64; ++byte)
-          if ((origin->second.byte_mask >> byte) & 1) {
+          if ((visible->second >> byte) & 1) {
             const uint64_t address = origin->second.address + byte;
             if (address < group.address || address >= group.address + 64 ||
                 !((group.byte_mask >> (address - group.address)) & 1))
@@ -1755,7 +1778,7 @@ bool Runtime::export_semantic_observed_prefix() const {
              << ",\"instruction\":" << origin->second.instruction
              << ",\"retirement_source_cycle\":" << origin->second.retirement_source_cycle
              << ",\"physical_address\":" << origin->second.address
-             << ",\"byte_mask\":" << origin->second.byte_mask
+             << ",\"byte_mask\":" << group.visible_member_masks.at(member)
              << ",\"byte_provenance_verified\":true";
       json << '}';
     }
