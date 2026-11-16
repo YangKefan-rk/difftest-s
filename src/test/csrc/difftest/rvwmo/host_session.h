@@ -31,6 +31,7 @@ struct HostSessionConfiguration {
   // Separate from correctness. Only a terminal HostSession Pass may publish
   // events saved by this observer as SFuzz feedback.
   ObservationSession::SemanticEventObserver semantic_event_observer;
+  ObservationSession::OrderedSemanticEventObserver ordered_semantic_event_observer;
 };
 
 // From the same physical dispatch edge as the first checked BOOM allocation.
@@ -87,6 +88,12 @@ public:
   }
   std::optional<uint64_t> semantic_completed_cycle() const {
     return finalized_ ? final_cycle_ : std::nullopt;
+  }
+  bool ordered_semantic_observer_healthy() const {
+    return session_ && session_->ordered_semantic_observer_healthy();
+  }
+  std::string ordered_semantic_observer_error() const {
+    return session_ ? session_->ordered_semantic_observer_error() : "host session was not initialized";
   }
   const ObservationSession *session() const { return session_.get(); }
   // A diagnostic snapshot. Only a successful terminal finalize produces Pass.

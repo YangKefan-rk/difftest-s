@@ -136,6 +136,8 @@ HostSession::HostSession(GlobalMem &memory, HostSessionConfiguration configurati
     session_->set_trap_stepper(references_.trap_callback());
   if (configuration_.semantic_event_observer)
     session_->set_semantic_event_observer(configuration_.semantic_event_observer);
+  if (configuration_.ordered_semantic_event_observer)
+    session_->set_ordered_semantic_event_observer(configuration_.ordered_semantic_event_observer);
 }
 
 CheckResult HostSession::initialize_boom_entry_csr(const BoomEntryCsrSnapshot &snapshot) {
