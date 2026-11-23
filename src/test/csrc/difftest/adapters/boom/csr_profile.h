@@ -33,6 +33,7 @@ inline bool certified_csr_instruction(uint32_t instruction) {
     return true;
   switch (instruction >> 20) {
   case 0x003: // fcsr
+  case 0x100: // sstatus
   case 0x105: // stvec
   case 0x140: // sscratch
   case 0x141: // sepc

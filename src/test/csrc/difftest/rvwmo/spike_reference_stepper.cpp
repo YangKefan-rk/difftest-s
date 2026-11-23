@@ -674,6 +674,16 @@ ReferenceStepResult SpikeReferenceStepper::step(const InstructionRetireEvent &re
   if (state.wrote_integer && after.gpr[state.destination] != state.value) {
     return fail_after_step(invalid("Spike retirement observer differs from its post-step integer register state"));
   }
+  if (snapshot.sfence_state) {
+    const SystemStateTransition transition{{before.satp, before.privilege, before.mstatus},
+                                           {after.satp, after.privilege, after.mstatus}};
+    if (!(transition.before == transition.after) || state.wrote_integer ||
+        !std::equal(std::begin(before.gpr), std::end(before.gpr), std::begin(after.gpr)) ||
+        !std::equal(std::begin(before.fpr), std::end(before.fpr), std::begin(after.fpr)) ||
+        before.fcsr != after.fcsr)
+      return fail_after_step(violation("Spike SFENCE.VMA changed architectural registers or system state"));
+    result.sfence_state = transition;
+  }
   if (floating.recognized) {
     if (state.wrote_integer != floating.writes_integer ||
         (state.wrote_integer && state.destination != floating.destination))

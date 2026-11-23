@@ -52,6 +52,11 @@ struct FloatingPointInstruction {
 CheckResult decode_floating_point_instruction(uint32_t instruction, FloatingPointInstruction &decoded);
 // FENCE.TSO ignores reserved rd/rs1 fields; its FM/pred/succ are fixed.
 bool is_fence_tso_instruction(uint32_t instruction);
+bool is_sstatus_csr_instruction(uint32_t instruction);
+// Status alias dependencies are modeled for nonvirtual retirement only.
 CheckResult decode_dependencies(uint32_t instruction, DependencyMetadata &metadata);
+inline bool is_sfence_vma(uint32_t instruction) {
+  return (instruction & 0xfe007fffU) == 0x12000073U;
+}
 } // namespace rvwmo
 #endif

@@ -64,6 +64,17 @@ struct ArchitecturalTrap {
   bool physically_retired = false;
 };
 
+struct SystemState {
+  uint64_t satp = 0, privilege = 0, mstatus = 0;
+  bool operator==(const SystemState &other) const {
+    return satp == other.satp && privilege == other.privilege && mstatus == other.mstatus;
+  }
+};
+
+struct SystemStateTransition {
+  SystemState before, after;
+};
+
 struct ArchitecturalRetirement {
   OperationId id;
   uint64_t pc = 0;
@@ -78,6 +89,7 @@ struct ArchitecturalRetirement {
   std::optional<std::pair<uint16_t, uint64_t>> csr_post;
   std::optional<FloatingPostState> fp_post;
   std::optional<CounterReadEnvironment> counter_read;
+  std::optional<SystemStateTransition> sfence_state;
 };
 
 struct ReferenceIntegerWrite {
@@ -111,11 +123,13 @@ struct ReferenceStepResult {
   bool skipped_device_store = false;
   bool counter_read_synchronized = false;
   std::optional<uint8_t> fcsr;
+  std::optional<SystemStateTransition> sfence_state;
 };
 
 struct SessionHartStatistics {
   uint64_t reference_steps = 0;
   uint64_t architecture_compared = 0;
+  uint64_t sfence_vma_compared = 0;
   uint64_t skipped_device_stores = 0;
   uint64_t counter_reads_synchronized = 0;
   uint64_t checked_traps = 0;

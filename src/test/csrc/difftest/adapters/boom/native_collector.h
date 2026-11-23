@@ -42,6 +42,11 @@ struct NativeFpPost {
   ProbeIdentity identity;
   uint64_t source_cycle = 0, pc = 0, fcsr = 0, mstatus = 0;
 };
+struct NativeSfenceState {
+  ProbeIdentity identity;
+  uint64_t source_cycle = 0, pc = 0;
+  SystemStateTransition state;
+};
 // One physically indivisible AMO W/D cache-array update. Old/new full words
 // are captured at the same exclusive write edge, not inferred from the REF.
 struct NativeAtomicApplied {
@@ -93,6 +98,8 @@ struct NativeFrame {
   std::optional<NativeCsrPost> counter_read;
   bool fp_probe_available = false;
   std::vector<NativeFpPost> fp_posts;
+  bool sfence_probe_available = false;
+  std::vector<NativeSfenceState> sfence_states;
   std::vector<ProbeLoadRetirement> retired_loads;
   std::vector<NativeAttempt> store_releases;
   std::vector<NativeSquash> squashes;
@@ -174,6 +181,11 @@ private:
     std::optional<FloatingPostState> after;
   };
   std::map<OperationId, PendingFp> pending_fp_;
+  struct PendingSfence {
+    uint64_t pc, retirement_cycle, rob_generation;
+    std::optional<SystemStateTransition> state;
+  };
+  std::map<OperationId, PendingSfence> pending_sfence_;
   struct PendingSystem { ProbeInstruction core; uint64_t retirement_cycle = 0; };
   std::optional<PendingSystem> pending_system_;
   std::optional<NativeTrap> pending_trap_;

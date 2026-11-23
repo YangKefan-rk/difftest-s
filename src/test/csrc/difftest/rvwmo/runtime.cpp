@@ -1580,6 +1580,9 @@ CheckResult Runtime::before_commit(unsigned hart, unsigned port, DiffTestState &
   if (exit_marker) {
     active.instruction.dependencies.provided = true;
   } else {
+    // Keep the legacy path out of the BOOM native CSR post-state profile.
+    if (is_sstatus_csr_instruction(commit.instr))
+      return unsupported("legacy RVWMO sstatus retirement is outside the native CSR post-state profile");
     auto decoded = decode_dependencies(commit.instr, active.instruction.dependencies);
     if (!decoded)
       return unsupported(decoded.message);

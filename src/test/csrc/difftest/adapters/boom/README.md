@@ -214,3 +214,17 @@ WFI retirement does not complete a hart or close any source prefix. BOOM may
 stall its ROB at WFI until an interrupt arrives. Seeing its execution request,
 a quiet cache or a parked program counter cannot substitute for architectural
 retirement, an explicit completion boundary, or physical and transport drain.
+
+## SFENCE.VMA retirement
+
+The native BOOM profile compares SFENCE.VMA in Bare mode with an immutable
+shared instruction image. It requires a UID/ROB-generation/PC-matched sample
+across the retirement edge. The DUT and independently stepped Spike must
+agree on unchanged satp, privilege and mstatus and have no register writeback.
+SFENCE.VMA does not create explicit-memory PPO edges. The final host report
+counts successful comparisons in each hart's `sfence_vma_compared` field.
+
+This does not certify TLB contents, page walks, Sv39, or any runtime change to
+page tables or instruction bytes. Changing page tables would require evidence
+for implicit PTE reads and updates, translation ownership and invalidation
+scope, and the cross-hart publication order that makes new mappings visible.

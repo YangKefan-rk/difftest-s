@@ -459,6 +459,7 @@ std::string HostSession::final_report() const {
     if (configuration_.check_boom_traps)
       output << ",\"checked_traps\":" << statistics.checked_traps;
     output << ",\"arch_compares\":" << statistics.architecture_compared
+           << ",\"sfence_vma_compared\":" << statistics.sfence_vma_compared
            << ",\"counter_reads_synchronized\":" << statistics.counter_reads_synchronized
            << ",\"excluded_device_store_skips\":" << statistics.skipped_device_stores
            << ",\"accepted_load_operations\":" << statistics.retired_load_operations

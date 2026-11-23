@@ -219,16 +219,19 @@ RetirementResultCoverage retirement_coverage(uint32_t instruction, IntegerDestin
   // and proof of native completion remain separate lifecycle obligations.
   if (instruction == 0x10500073)
     return RetirementResultCoverage::Complete;
+  if (is_sfence_vma(instruction))
+    return RetirementResultCoverage::SystemStatePreserving;
   if ((instruction & 0x7f) == 0x73)
     return RetirementResultCoverage::SystemStateNeedsComparator;
   return RetirementResultCoverage::Complete;
 }
 
 bool fence_instruction(uint32_t instruction) {
+  // Physical queue bookkeeping only; this does not classify PPO fences.
   const unsigned opcode = instruction & 0x7f;
   const unsigned function = (instruction >> 12) & 7;
   return (opcode == 0x0f && (function == 0 || function == 1)) ||
-         (opcode == 0x73 && (instruction & 0xfe007fff) == 0x12000073);
+         is_sfence_vma(instruction);
 }
 
 CheckResult validate_publication_evidence(StorePublicationEvidence evidence) {
@@ -1036,7 +1039,7 @@ CheckResult BoomEventAdapter::retire(const Retirement &record) {
   state.retired = true;
   CapturedRetirement captured{record.id, record.pc, record.instruction, record.source,
                               record.destination_type, {}, {},
-                              retirement_coverage(record.instruction, record.destination_type), {}, {}, {}};
+                              retirement_coverage(record.instruction, record.destination_type), {}, {}, {}, {}};
   if (record.destination_type == IntegerDestinationType::Integer && record.logical_destination != 0) {
     captured.destination_register = record.logical_destination;
     captured.destination_value = record.writeback_value;

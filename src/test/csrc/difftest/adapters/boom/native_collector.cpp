@@ -1,5 +1,6 @@
 #include "native_collector.h"
 #include "csr_profile.h"
+#include "../../rvwmo/dependency.h"
 #include "../../rvwmo/producer_ids.h"
 #include <algorithm>
 #include <limits>
@@ -140,7 +141,7 @@ CaptureResult NativeCollector::capture(const NativeFrame &frame) {
       2 * atomic_retirements + frame.store_releases.size() + frame.squashes.size() +
       frame.publications.size() + frame.merged_publications.size() + frame.atomic_applied.size() +
       frame.csr_post.has_value() + frame.csr_write_post.has_value() +
-      frame.counter_read.has_value() + frame.fp_posts.size() +
+      frame.counter_read.has_value() + frame.fp_posts.size() + frame.sfence_states.size() +
       frame.trap.has_value() + frame.trap_post.has_value();
   if (facts > configuration_.staged_events - std::min(configuration_.staged_events, staged_events_.size()))
     return {pending("BOOM source staging is full; retain the complete frame and drain before retrying"), false};
@@ -172,6 +173,18 @@ CheckResult NativeCollector::require_checked_ram(uint64_t address, size_t bytes)
 }
 
 CheckResult NativeCollector::capture_frame(const NativeFrame &frame) {
+  for (const auto &sample : frame.sfence_states) {
+    const auto owner = pending_sfence_.find(id(sample.identity));
+    if (!frame.sfence_probe_available || owner == pending_sfence_.end() || owner->second.state ||
+        !frame.cycle || owner->second.retirement_cycle != frame.cycle - 1 ||
+        sample.source_cycle != owner->second.retirement_cycle || sample.pc != owner->second.pc ||
+        sample.identity.rob_generation != owner->second.rob_generation)
+      return invalid("BOOM SFENCE.VMA system state lacks its immediately preceding retirement owner");
+    owner->second.state = sample.state;
+  }
+  for (const auto &owner : pending_sfence_)
+    if (!owner.second.state)
+      return incomplete("BOOM SFENCE.VMA is missing its next-cycle physical system-state sample");
   auto trap_result = capture_trap_post(frame);
   if (!trap_result) return trap_result;
   if (configuration_.check_csr_post && frame.csr_post) {
@@ -570,6 +583,13 @@ CheckResult NativeCollector::capture_retirements(const NativeFrame &frame) {
               PendingFp{core.pc, frame.cycle, core.identity.rob_generation, std::nullopt}).second)
           return invalid("BOOM FP retirement repeats an existing transfer owner");
       }
+      if (is_sfence_vma(core.instruction)) {
+        if (!frame.sfence_probe_available)
+          return {CheckStatus::Unsupported, 0, "BOOM SFENCE.VMA lacks a physical pre/post system-state probe"};
+        if (!pending_sfence_.emplace(instruction_id,
+              PendingSfence{core.pc, frame.cycle, core.identity.rob_generation, std::nullopt}).second)
+          return invalid("BOOM SFENCE.VMA retirement repeats an existing owner");
+      }
       if (supported_mcycle_read(core.instruction)) {
         if (!configuration_.check_counter_reads || !frame.counter_read_probe_available)
           return {CheckStatus::Unsupported, 0, "BOOM mcycle read lacks a physical counter environment"};
@@ -819,6 +839,13 @@ CheckResult NativeCollector::take_ready(CollectedObservations &output) {
       through = std::min(through, fp.second.retirement_cycle - 1);
     }
   }
+  for (const auto &sfence : pending_sfence_) {
+    if (!sfence.second.state) {
+      if (!sfence.second.retirement_cycle)
+        return incomplete("BOOM SFENCE.VMA at cycle zero needs a delayed system-state sample");
+      through = std::min(through, sfence.second.retirement_cycle - 1);
+    }
+  }
   for (const auto &attempt : unresolved_samples_) {
     if (!attempt.second)
       return pending("BOOM unresolved load can still sample cycle zero");
@@ -860,7 +887,7 @@ CheckResult NativeCollector::take_ready(CollectedObservations &output) {
     }
     ready.batch.events.push_back(std::move(converted));
   }
-  std::vector<OperationId> converted_csr, converted_fp, converted_counters;
+  std::vector<OperationId> converted_csr, converted_fp, converted_counters, converted_sfences;
   for (const auto &retirement : staged_retirements_) {
     auto position = retirement_positions.find(retirement.id);
     if (position == retirement_positions.end())
@@ -886,6 +913,13 @@ CheckResult NativeCollector::take_ready(CollectedObservations &output) {
       captured.fp_post = *fp->second.after;
       converted_fp.push_back(retirement.id);
     }
+    const auto sfence = pending_sfence_.find(retirement.id);
+    if (sfence != pending_sfence_.end()) {
+      if (!sfence->second.state)
+        return remember_failure(incomplete("BOOM SFENCE.VMA escaped without physical system state"));
+      captured.sfence_state = sfence->second.state;
+      converted_sfences.push_back(retirement.id);
+    }
     ArchitecturalRetirement converted;
     result = convert_retirement_snapshot(captured, converted);
     if (!result)
@@ -904,6 +938,8 @@ CheckResult NativeCollector::take_ready(CollectedObservations &output) {
     pending_fp_.erase(id);
   for (const auto &id : converted_counters)
     pending_counter_reads_.erase(id);
+  for (const auto &id : converted_sfences)
+    pending_sfence_.erase(id);
   for (const auto &trap : ready.traps)
     staged_traps_.erase(trap.id);
   emitted_sequence_ = next_sequence;
@@ -929,7 +965,8 @@ CheckResult NativeCollector::certify_parked_wfi_terminal(const ProbeIdentity &ow
       source_cycle != *captured_cycle_ || !queues_empty_ || !cache_idle_ ||
       !staged_events_.empty() || !staged_retirements_.empty() || !unresolved_samples_.empty() ||
       !faulting_refills_.empty() || !fault_rollback_cancellations_.empty() ||
-      !pending_csr_.empty() || !pending_counter_writes_.empty() || !pending_counter_reads_.empty() || !pending_fp_.empty() || pending_system_ || pending_trap_ ||
+      !pending_csr_.empty() || !pending_counter_writes_.empty() || !pending_counter_reads_.empty() ||
+      !pending_fp_.empty() || !pending_sfence_.empty() || pending_system_ || pending_trap_ ||
       pending_fault_rollback_ || !staged_traps_.empty() ||
       !skipped_device_stores_.empty() || adapter_.live_instructions())
     return incomplete("BOOM terminal WFI cannot close while source, cache or older instructions remain live");
@@ -965,7 +1002,7 @@ CheckResult NativeCollector::completion() const {
       !staged_events_.empty() || !staged_retirements_.empty() || !unresolved_samples_.empty() ||
       !faulting_refills_.empty() || !fault_rollback_cancellations_.empty() ||
       !allocations_.empty() || !pending_csr_.empty() || !pending_counter_writes_.empty() || !pending_counter_reads_.empty() ||
-      !pending_fp_.empty() || pending_system_ || pending_trap_ ||
+      !pending_fp_.empty() || !pending_sfence_.empty() || pending_system_ || pending_trap_ ||
       pending_fault_rollback_ || !staged_traps_.empty() || !queues_empty_ || !cache_idle_)
     return incomplete("BOOM source, instruction or cache observations have not drained");
   return adapter_.completion();

@@ -101,7 +101,11 @@ constexpr unsigned csr_fcsr = 0x003;
 constexpr unsigned csr_sstatus = 0x100;
 constexpr unsigned csr_sie = 0x104;
 constexpr unsigned csr_sip = 0x144;
+constexpr unsigned csr_mstatus = 0x300;
 constexpr unsigned csr_mstatush = 0x310;
+constexpr unsigned csr_dependency_base = 64;
+constexpr unsigned supervisor_status_dependency = csr_dependency_base + csr_sstatus;
+constexpr unsigned machine_only_status_dependency = csr_dependency_base + csr_mstatus;
 constexpr unsigned fflags_dependency_base = 0x10000;
 constexpr unsigned frm_dependency = fflags_dependency_base + 5;
 
@@ -121,14 +125,17 @@ std::vector<unsigned> csr_dependency_units(unsigned csr) {
       units.push_back(frm_dependency);
       return units;
     }
-    default: return {64 + csr};
+    // A nonvirtual sstatus write must not replace the origins of M-only fields.
+    case csr_sstatus: return {supervisor_status_dependency};
+    case csr_mstatus: return {supervisor_status_dependency, machine_only_status_dependency};
+    default: return {csr_dependency_base + csr};
   }
 }
 
 CheckResult decode_system(uint32_t instruction, DependencyMetadata &metadata) {
   const unsigned funct = (instruction >> 12) & 7;
   if (!funct) {
-    if ((instruction & 0xfe007fffU) == 0x12000073U) {
+    if (is_sfence_vma(instruction)) {
       // SFENCE.VMA synchronizes implicit page-table accesses. It adds no
       // ordinary load/store FENCE edges to this explicit-access PPO model.
       const unsigned rs1 = (instruction >> 15) & 31, rs2 = (instruction >> 20) & 31;
@@ -152,7 +159,7 @@ CheckResult decode_system(uint32_t instruction, DependencyMetadata &metadata) {
   if (funct == 4)
     return {CheckStatus::Unsupported, 0, "reserved system instruction"};
   const unsigned csr = instruction >> 20;
-  if (csr == csr_sstatus || csr == csr_sie || csr == csr_sip || csr == csr_mstatush)
+  if (csr == csr_sie || csr == csr_sip || csr == csr_mstatush)
     return {CheckStatus::Unsupported, 0, "CSR alias or field dependency tracking requires explicit adapter metadata"};
   const unsigned rd = (instruction >> 7) & 31, rs1 = (instruction >> 15) & 31;
   const auto csr_units = csr_dependency_units(csr);
@@ -401,6 +408,12 @@ std::optional<FloatingTransfer> decode_floating_transfer(uint32_t instruction) {
 
 bool is_fence_tso_instruction(uint32_t instruction) {
   return (instruction & 0xfff0707fU) == 0x8330000fU;
+}
+
+bool is_sstatus_csr_instruction(uint32_t instruction) {
+  const unsigned operation = (instruction >> 12) & 7;
+  return (instruction & 0x7f) == 0x73 && operation != 0 && operation != 4 &&
+         (instruction >> 20) == csr_sstatus;
 }
 
 CheckResult decode_dependencies(uint32_t inst, DependencyMetadata &m) {
