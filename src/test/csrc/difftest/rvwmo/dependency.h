@@ -58,5 +58,8 @@ CheckResult decode_dependencies(uint32_t instruction, DependencyMetadata &metada
 inline bool is_sfence_vma(uint32_t instruction) {
   return (instruction & 0xfe007fffU) == 0x12000073U;
 }
+inline bool is_system_state_retirement(uint32_t instruction) {
+  return is_sfence_vma(instruction) || instruction == 0x30200073; // MRET
+}
 } // namespace rvwmo
 #endif

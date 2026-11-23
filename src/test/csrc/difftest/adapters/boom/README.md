@@ -217,14 +217,22 @@ retirement, an explicit completion boundary, or physical and transport drain.
 
 ## SFENCE.VMA retirement
 
-The native BOOM profile compares SFENCE.VMA in Bare mode with an immutable
-shared instruction image. It requires a UID/ROB-generation/PC-matched sample
+The native BOOM profile compares SFENCE.VMA in Bare or Sv39 mode.
+It requires a UID/ROB-generation/PC-matched sample
 across the retirement edge. The DUT and independently stepped Spike must
 agree on unchanged satp, privilege and mstatus and have no register writeback.
 SFENCE.VMA does not create explicit-memory PPO edges. The final host report
 counts successful comparisons in each hart's `sfence_vma_compared` field.
 
-This does not certify TLB contents, page walks, Sv39, or any runtime change to
-page tables or instruction bytes. Changing page tables would require evidence
-for implicit PTE reads and updates, translation ownership and invalidation
-scope, and the cross-hart publication order that makes new mappings visible.
+Sv39 setup supports checked satp operations and MRET from M to S.
+MRET compares the retirement post-state; the next retirement checks its
+redirected PC. Explicit PTE stores use the ordinary store audit. Native BOOM
+publishes ordinary stores to the shared physical image only after this audit,
+so Spike's implicit PTE reads see matching published bytes. The explicit
+load/store path compares translated physical addresses against Spike.
+
+The program is responsible for publishing page-table updates and executing
+the appropriate local SFENCE.VMA on every affected hart. The checker does not
+search for missing fences, model TLB contents or page walks, or cover implicit
+hardware PTE writes (initialize A/D in the test). FENCE.I uses the existing
+retirement path; instruction-byte modification is not covered by this test.

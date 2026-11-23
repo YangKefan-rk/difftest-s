@@ -412,17 +412,22 @@ CheckResult ObservationSession::step_reference(const InstructionRetireEvent &ret
                                                const ArchitecturalRetirement &snapshot) {
   if (!reference_stepper_)
     return {CheckStatus::Unsupported, 0, "retirement has no independent reference-step callback"};
-  if (snapshot.sfence_state) {
-    const auto &state = *snapshot.sfence_state;
-    if (!is_sfence_vma(snapshot.instruction) || snapshot.destination != ArchitecturalDestination::None ||
+  if (snapshot.system_state) {
+    const auto &state = *snapshot.system_state;
+    if (!is_system_state_retirement(snapshot.instruction) || snapshot.destination != ArchitecturalDestination::None ||
         snapshot.destination_register || snapshot.destination_value || snapshot.csr_post ||
         snapshot.fp_post || snapshot.counter_read || !retirement.instruction.memory.empty() ||
         retirement.instruction.skipped_device_store)
-      return invalid("invalid architectural effects on SFENCE.VMA retirement");
-    if ((state.before.privilege != 1 && state.before.privilege != 3) || !(state.before == state.after))
+      return invalid("invalid explicit effects on BOOM system retirement");
+    const bool sfence = is_sfence_vma(snapshot.instruction);
+    // BOOM executes MRET in the CSRFile before ROB retirement. Its sample
+    // certifies post-state only; SFENCE.VMA certifies both retirement edges.
+    if (sfence && ((state.before.privilege != 1 && state.before.privilege != 3) || !(state.before == state.after)))
       return {CheckStatus::Violation, 0, "DUT SFENCE.VMA changed system state or retired outside M/S mode"};
-    if (state.before.satp >> 60)
-      return {CheckStatus::Unsupported, 0, "BOOM SFENCE.VMA comparison currently requires Bare satp"};
+    const auto mode = state.after.satp >> 60;
+    if ((sfence && mode != 0 && mode != 8) ||
+        (!sfence && (mode != 8 || state.after.privilege != 1)))
+      return {CheckStatus::Unsupported, 0, "BOOM supports Bare/Sv39 SFENCE.VMA and Sv39 MRET to S-mode"};
   }
   if (is_sstatus_csr_instruction(snapshot.instruction)) {
     if (!snapshot.csr_post)
@@ -487,12 +492,12 @@ CheckResult ObservationSession::step_reference(const InstructionRetireEvent &ret
     return {CheckStatus::Violation, 0, "reference PC or instruction differs from retirement"};
   if (result.took_trap)
     return {CheckStatus::Unsupported, 0, "reference instruction trapped outside generic trap semantics"};
-  if (snapshot.sfence_state.has_value() != result.sfence_state.has_value())
-    return invalid("reference SFENCE.VMA comparison lacks matched system-state evidence");
-  if (snapshot.sfence_state &&
-      (!(snapshot.sfence_state->before == result.sfence_state->before) ||
-       !(snapshot.sfence_state->after == result.sfence_state->after)))
-    return {CheckStatus::Violation, 0, "SFENCE.VMA pre/post satp, privilege or mstatus differs from Spike"};
+  if (snapshot.system_state.has_value() != result.system_state.has_value())
+    return invalid("reference system retirement lacks matched state evidence");
+  if (snapshot.system_state &&
+      ((is_sfence_vma(snapshot.instruction) && !(snapshot.system_state->before == result.system_state->before)) ||
+       !(snapshot.system_state->after == result.system_state->after)))
+    return {CheckStatus::Violation, 0, "BOOM system retirement satp, privilege or mstatus differs from Spike"};
   if (result.skipped_device_store) {
     if (statistics.skipped_device_stores == std::numeric_limits<uint64_t>::max())
       return invalid("device-store skip statistics counter exhausted");
@@ -535,7 +540,7 @@ CheckResult ObservationSession::step_reference(const InstructionRetireEvent &ret
     ++statistics.counter_reads_synchronized;
   }
   ++statistics.architecture_compared;
-  if (snapshot.sfence_state)
+  if (snapshot.system_state && is_sfence_vma(snapshot.instruction))
     ++statistics.sfence_vma_compared;
 
   std::vector<const MemoryOperation *> stores;

@@ -42,7 +42,7 @@ struct NativeFpPost {
   ProbeIdentity identity;
   uint64_t source_cycle = 0, pc = 0, fcsr = 0, mstatus = 0;
 };
-struct NativeSfenceState {
+struct NativeSystemRetirementState {
   ProbeIdentity identity;
   uint64_t source_cycle = 0, pc = 0;
   SystemStateTransition state;
@@ -98,8 +98,8 @@ struct NativeFrame {
   std::optional<NativeCsrPost> counter_read;
   bool fp_probe_available = false;
   std::vector<NativeFpPost> fp_posts;
-  bool sfence_probe_available = false;
-  std::vector<NativeSfenceState> sfence_states;
+  bool system_state_probe_available = false;
+  std::vector<NativeSystemRetirementState> system_states;
   std::vector<ProbeLoadRetirement> retired_loads;
   std::vector<NativeAttempt> store_releases;
   std::vector<NativeSquash> squashes;
@@ -181,11 +181,11 @@ private:
     std::optional<FloatingPostState> after;
   };
   std::map<OperationId, PendingFp> pending_fp_;
-  struct PendingSfence {
+  struct PendingSystemState {
     uint64_t pc, retirement_cycle, rob_generation;
     std::optional<SystemStateTransition> state;
   };
-  std::map<OperationId, PendingSfence> pending_sfence_;
+  std::map<OperationId, PendingSystemState> pending_system_state_;
   struct PendingSystem { ProbeInstruction core; uint64_t retirement_cycle = 0; };
   std::optional<PendingSystem> pending_system_;
   std::optional<NativeTrap> pending_trap_;

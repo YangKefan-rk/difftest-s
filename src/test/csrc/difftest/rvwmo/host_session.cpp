@@ -132,6 +132,8 @@ HostSession::HostSession(GlobalMem &memory, HostSessionConfiguration configurati
         }
         return result;
       });
+  if (configuration_.audit_before_publication)
+    session_->require_audited_publications();
   if (configuration_.check_boom_traps)
     session_->set_trap_stepper(references_.trap_callback());
   if (configuration_.semantic_event_observer)

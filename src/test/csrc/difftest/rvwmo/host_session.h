@@ -16,6 +16,7 @@ struct HostSessionConfiguration {
   // checkpoint rather than checking the platform's boot sequence.
   std::string verification_scope = "whole_test";
   uint32_t reference_profile = DIFFTEST_REF_PROFILE_ID_UNKNOWN;
+  bool audit_before_publication = false;
   StreamContract stream;
   std::vector<ProducerCapability> producers;
   std::vector<difftest_ref_state_v1> initial_harts;

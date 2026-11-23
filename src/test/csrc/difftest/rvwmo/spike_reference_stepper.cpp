@@ -674,15 +674,18 @@ ReferenceStepResult SpikeReferenceStepper::step(const InstructionRetireEvent &re
   if (state.wrote_integer && after.gpr[state.destination] != state.value) {
     return fail_after_step(invalid("Spike retirement observer differs from its post-step integer register state"));
   }
-  if (snapshot.sfence_state) {
+  if (snapshot.system_state) {
     const SystemStateTransition transition{{before.satp, before.privilege, before.mstatus},
                                            {after.satp, after.privilege, after.mstatus}};
-    if (!(transition.before == transition.after) || state.wrote_integer ||
+    const bool sfence = is_sfence_vma(raw);
+    if ((sfence && !(transition.before == transition.after)) ||
+        (!sfence && (before.privilege != 3 || after.privilege != 1 || before.satp != after.satp)) ||
+        state.wrote_integer ||
         !std::equal(std::begin(before.gpr), std::end(before.gpr), std::begin(after.gpr)) ||
         !std::equal(std::begin(before.fpr), std::end(before.fpr), std::begin(after.fpr)) ||
         before.fcsr != after.fcsr)
-      return fail_after_step(violation("Spike SFENCE.VMA changed architectural registers or system state"));
-    result.sfence_state = transition;
+      return fail_after_step(violation("Spike system retirement has unexpected register or system effects"));
+    result.system_state = transition;
   }
   if (floating.recognized) {
     if (state.wrote_integer != floating.writes_integer ||
@@ -704,7 +707,11 @@ ReferenceStepResult SpikeReferenceStepper::step(const InstructionRetireEvent &re
   }
   if (snapshot.csr_post) {
     uint64_t reference_csr = 0;
-    const int csr_status = difftest_ref_peek_arch_csr_v1(state.handle, snapshot.csr_post->first, &reference_csr);
+    const bool satp = snapshot.csr_post->first == 0x180;
+    if (satp)
+      reference_csr = after.satp;
+    const int csr_status = satp ? DIFFTEST_REF_API_OK :
+        difftest_ref_peek_arch_csr_v1(state.handle, snapshot.csr_post->first, &reference_csr);
     if (csr_status == DIFFTEST_REF_API_UNSUPPORTED)
       return fail_after_step(unsupported("Spike has no readback for the retired CSR"));
     if (csr_status != DIFFTEST_REF_API_OK)

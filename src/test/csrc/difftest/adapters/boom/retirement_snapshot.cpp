@@ -23,8 +23,8 @@ CheckResult validate_coverage(RetirementResultCoverage coverage) {
     return unsupported("BOOM retirement needs CSR-state comparison");
   case RetirementResultCoverage::SystemStateNeedsComparator:
     return unsupported("BOOM retirement needs architectural system-state comparison");
-  case RetirementResultCoverage::SystemStatePreserving:
-    return unsupported("BOOM SFENCE.VMA retirement lacks physical pre/post system state");
+  case RetirementResultCoverage::SystemStateChecked:
+    return unsupported("BOOM system retirement lacks its physical state sample");
   }
   return invalid("BOOM retirement has an unknown result-coverage kind");
 }
@@ -52,13 +52,13 @@ CheckResult convert_retirement_snapshot(const CapturedRetirement &captured, Arch
   auto result = validate_destination(captured);
   if (!result)
     return result;
-  const bool sfence = is_sfence_vma(captured.instruction);
-  if (sfence != (captured.coverage == RetirementResultCoverage::SystemStatePreserving) ||
-      (!sfence && captured.sfence_state))
-    return invalid("BOOM SFENCE.VMA coverage differs from raw instruction");
-  if (sfence && (captured.destination_type != IntegerDestinationType::None ||
+  const bool checked_system = is_system_state_retirement(captured.instruction);
+  if (checked_system != (captured.coverage == RetirementResultCoverage::SystemStateChecked) ||
+      (!checked_system && captured.system_state))
+    return invalid("BOOM system-state coverage differs from raw instruction");
+  if (checked_system && (captured.destination_type != IntegerDestinationType::None ||
                  captured.csr_post || captured.fp_post || captured.counter_read))
-    return invalid("BOOM SFENCE.VMA retirement carries a register or CSR write");
+    return invalid("BOOM system retirement carries an explicit register or CSR write");
   const bool checked_csr = captured.csr_post.has_value() &&
       (captured.instruction & 0x7f) == 0x73 && ((captured.instruction >> 12) & 7) != 0 &&
       certified_csr_instruction(captured.instruction) &&
@@ -83,7 +83,7 @@ CheckResult convert_retirement_snapshot(const CapturedRetirement &captured, Arch
        captured.coverage == RetirementResultCoverage::Complete);
   result = ((checked_csr || checked_counter) &&
             captured.coverage == RetirementResultCoverage::CsrStateNeedsComparator) ||
-           checked_fp_coverage || (sfence && captured.sfence_state)
+           checked_fp_coverage || (checked_system && captured.system_state)
                ? CheckResult{} : validate_coverage(captured.coverage);
   if (!result)
     return result;
@@ -104,7 +104,7 @@ CheckResult convert_retirement_snapshot(const CapturedRetirement &captured, Arch
   converted.id = captured.id;
   converted.pc = captured.pc;
   converted.instruction = captured.instruction;
-  converted.sfence_state = captured.sfence_state;
+  converted.system_state = captured.system_state;
   if (checked_csr)
     converted.csr_post = captured.csr_post;
   if (checked_fp)

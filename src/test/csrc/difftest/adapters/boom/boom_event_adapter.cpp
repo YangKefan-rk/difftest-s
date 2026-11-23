@@ -219,8 +219,8 @@ RetirementResultCoverage retirement_coverage(uint32_t instruction, IntegerDestin
   // and proof of native completion remain separate lifecycle obligations.
   if (instruction == 0x10500073)
     return RetirementResultCoverage::Complete;
-  if (is_sfence_vma(instruction))
-    return RetirementResultCoverage::SystemStatePreserving;
+  if (is_system_state_retirement(instruction))
+    return RetirementResultCoverage::SystemStateChecked;
   if ((instruction & 0x7f) == 0x73)
     return RetirementResultCoverage::SystemStateNeedsComparator;
   return RetirementResultCoverage::Complete;

@@ -689,6 +689,8 @@ CheckResult CheckerEventConsumer::consume_store_publish(const RuntimeEvent &even
   result = audit_physical_write(publish);
   if (!result)
     return result;
+  if (audit_before_publication_ && !store->second.audited)
+    return pending("shared physical memory publication awaits independent Spike store audit");
   MemoryWriter writer;
   result = checker_.memory_writer(member.id, writer);
   if (!result)
@@ -806,6 +808,9 @@ CheckResult CheckerEventConsumer::consume_coalesced_store_publish(const RuntimeE
   result = audit_physical_write(publish);
   if (!result)
     return result;
+  if (audit_before_publication_ &&
+      std::any_of(members.begin(), members.end(), [](const auto &member) { return !member.second->audited; }))
+    return pending("shared physical memory publication awaits every Spike store audit");
   if (members.size() - 1 > std::numeric_limits<uint64_t>::max() - first_time.rank)
     return remember_failure(invalid("coalesced publication logical rank space exhausted"));
   std::map<OperationId, MemoryWriter> writer_ids;

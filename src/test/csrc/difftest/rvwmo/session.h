@@ -89,7 +89,7 @@ struct ArchitecturalRetirement {
   std::optional<std::pair<uint16_t, uint64_t>> csr_post;
   std::optional<FloatingPostState> fp_post;
   std::optional<CounterReadEnvironment> counter_read;
-  std::optional<SystemStateTransition> sfence_state;
+  std::optional<SystemStateTransition> system_state;
 };
 
 struct ReferenceIntegerWrite {
@@ -123,7 +123,7 @@ struct ReferenceStepResult {
   bool skipped_device_store = false;
   bool counter_read_synchronized = false;
   std::optional<uint8_t> fcsr;
-  std::optional<SystemStateTransition> sfence_state;
+  std::optional<SystemStateTransition> system_state;
 };
 
 struct SessionHartStatistics {
@@ -176,6 +176,7 @@ public:
                              const std::vector<ArchitecturalRetirement> &retirements = {},
                              const std::vector<ArchitecturalTrap> &traps = {});
   void set_trap_stepper(TrapStepper stepper) { trap_stepper_ = std::move(stepper); }
+  void require_audited_publications() { consumer_.require_audited_publications(); }
   CheckResult poll();
   CheckResult finalize(uint64_t completed_cycle);
   size_t pending_events() const { return pending_events_.size(); }

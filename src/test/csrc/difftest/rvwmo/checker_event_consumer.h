@@ -17,6 +17,7 @@ namespace rvwmo {
 // The architectural REF step and source-order proof remain caller-owned.
 class CheckerEventConsumer {
 public:
+  void require_audited_publications() { audit_before_publication_ = true; }
   using RankResolver = std::function<std::optional<ObservationTime>(const RuntimeEvent &)>;
 
   CheckerEventConsumer(Memory::ReadGlobal read_global, Memory::WriteGlobal write_global, RankResolver rank_resolver,
@@ -92,6 +93,7 @@ private:
   std::map<uint32_t, std::pair<uint64_t, uint64_t>> hart_epoch_and_uid_;
   std::map<uint32_t, std::pair<uint64_t, uint64_t>> last_retired_;
   std::map<OperationId, StoreRecord> stores_;
+  bool audit_before_publication_ = false;
   std::map<LoadKey, LoadRecord> loads_;
   std::set<LoadKey> cancelled_loads_;
   std::map<uint32_t, AtomicRecord> atomic_inflight_;

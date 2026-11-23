@@ -39,6 +39,7 @@ inline bool certified_csr_instruction(uint32_t instruction) {
   case 0x141: // sepc
   case 0x142: // scause
   case 0x143: // stval
+  case 0x180: // satp
   case 0x300: // mstatus
   case 0x302: // medeleg
   case 0x303: // mideleg

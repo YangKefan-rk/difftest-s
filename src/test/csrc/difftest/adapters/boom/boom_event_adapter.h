@@ -148,7 +148,7 @@ enum class RetirementResultCoverage : uint8_t {
   FloatingFlagsNeedComparator,
   CsrStateNeedsComparator,
   SystemStateNeedsComparator,
-  SystemStatePreserving
+  SystemStateChecked
 };
 
 // Private architectural result for the caller's REF register-state comparison.
@@ -165,7 +165,7 @@ struct CapturedRetirement {
   RetirementResultCoverage coverage = RetirementResultCoverage::Complete;
   std::optional<std::pair<uint16_t, uint64_t>> csr_post;
   std::optional<FloatingPostState> fp_post;
-  std::optional<SystemStateTransition> sfence_state;
+  std::optional<SystemStateTransition> system_state;
   std::optional<CounterReadEnvironment> counter_read;
 };
 
