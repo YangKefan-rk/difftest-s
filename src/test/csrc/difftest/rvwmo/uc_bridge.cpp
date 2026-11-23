@@ -1,3 +1,5 @@
+// Some simulators compile every rvwmo source even without the external UC transport.
+#ifdef DIFFTEST_S_UC_NATIVE_V1
 #include "uc_bridge.h"
 #include <algorithm>
 #include <deque>
@@ -588,3 +590,4 @@ CheckResult UcBridge::finish() const {
   return {};
 }
 } // namespace rvwmo
+#endif // DIFFTEST_S_UC_NATIVE_V1
