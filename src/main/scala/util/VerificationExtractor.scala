@@ -104,7 +104,8 @@ class VerificationExtractor extends Phase {
     // This transform runs only when any sink is defined
     if (sinkAnnos.nonEmpty) {
       // Extract the Verification IRs and convert them into Sources
-      val (trackers, modules) = c.modules.map(m => onSourceModule(m)).unzip
+      val sinkModule = sinkAnnos.head.target.moduleTarget
+      val (trackers, modules) = c.modules.map(m => onSourceModule(m, sinkModule)).unzip
       // Connect the Sources to the Sink modules
       val (orRSinks, indexSinks) = sinkAnnos.partition(_.index < 0)
       // 1) For orR sink: we use vectored sources.
@@ -121,13 +122,13 @@ class VerificationExtractor extends Phase {
     }
   }
 
-  private def onSourceModule(m: DefModule): (Option[AssertionTracker], DefModule) = {
+  private def onSourceModule(m: DefModule, sinkModule: ModuleTarget): (Option[AssertionTracker], DefModule) = {
     m match {
-      case Module(info, name, public, layers, ports, body) =>
-        val tracker = new AssertionTracker(ModuleName(name))
-        val (regDefs, newBody) = onStmt(body)(tracker)
+      case module: Module =>
+        val tracker = new AssertionTracker(sinkModule.copy(module = module.name).toNamed)
+        val (regDefs, newBody) = onStmt(module.body)(tracker)
         val bodyTail = tracker.bodyTail.getOrElse(EmptyStmt)
-        (Some(tracker), Module(info, name, public, layers, ports, Block(regDefs :+ newBody :+ bodyTail)))
+        (Some(tracker), module.copy(body = Block(regDefs :+ newBody :+ bodyTail)))
       case other: DefModule => (None, other)
     }
   }
@@ -168,7 +169,7 @@ class VerificationExtractor extends Phase {
     val (sinkDefRegs, sinkDefRefs, sinkAnnos) = sources.map { case (w, SourceAnnotation(_, pin)) =>
       val (defReg, ref) = DefRegisterWithRef(NoInfo, pin, UIntType(IntWidth(w)), clock, reset, UIntLiteral(0))
       val conn = Connect(NoInfo, ref, UIntLiteral(0))
-      val anno = SinkAnnotation(ComponentName(pin, ModuleName(m.name)), pin)
+      val anno = SinkAnnotation(verificationSink.target.moduleTarget.ref(pin).toNamed, pin)
       (Block(defReg, conn), ref, anno)
     }.unzip3
     val concat = sinkDefRefs.reduceLeft((result: Expression, sinkRef: Reference) =>

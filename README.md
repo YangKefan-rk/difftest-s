@@ -36,13 +36,29 @@ It will greatly benefit the verification setup since we are providing some advan
 only in Chisel, such as datapath optimizations for higher simulation speed on emulation platforms.
 
 If you are using DiffTest in a non-Chisel environment, we still provide examples of the generated Verilog modules.
-You may configure the test interfaces in [src/test/scala/DifftestMain.scala](src/test/scala/DifftestMain.scala) based on your design details.
+You may configure the test interfaces in [DifftestTop.scala](src/test/scala/DifftestTop.scala) based on your design details.
 The generated Verilog and C++ files will match (in type and count) what you have described about your use case.
 After running the following command, files will be generated at `build`.
 
 ```bash
 make
 ```
+
+`make difftest_verilog` generates interface RTL and C++ packet headers; it does
+not build a processor simulator. A generic build needs no LinkNan UC headers or
+transport. For the optional LinkNan four-hart scalar uncached RAM checker, use
+the matching LinkNan `SFUZZ` checkout and its pinned submodules. The supported
+simulator build runs from that checkout, with its normal VCS and Spike setup:
+
+```bash
+xmake simv --noc=full --core=full --l3=small --socket=sync --ref=Spike --sfuzz_uc_r6
+```
+
+LinkNan packages the producers, C++ transport, and wire ABI under
+`src/test/resources/sfuzz/uc-r6`; no prior experiment directory is required.
+Its `README.md` documents the runtime page, enable switches and scope. Turning
+on only the C++ macro or only the simulator plusarg is not sufficient, and this
+profile does not cover arbitrary MMIO or certify a new simulator build.
 
 We support the DiffTest Profile as a configuration file for DiffTest to record and reconstruct DiffTest interfaces
 through a `json` file.
