@@ -21,6 +21,7 @@
 #include "globalmem.h"
 #include "ram.h"
 #include "spikedasm.h"
+#include "store_audit_fifo.h"
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -53,6 +54,7 @@ static int runtime_error(const rvwmo::CheckResult &result, const char *phase) {
     result.status == rvwmo::CheckStatus::Unsupported ? "UNSUPPORTED" :
     result.status == rvwmo::CheckStatus::Pending ? "INCOMPLETE" : "EVENT_ERROR";
   Info("RVWMO %s during %s: %s\n", kind, phase, result.message.c_str());
+  if (multicore_session) multicore_session->print_native_uc_diagnostics(phase);
   return 1;
 }
 #endif
@@ -183,7 +185,11 @@ int difftest_init() {
   assert(difftest == nullptr);
 #if NUM_CORES > 1
   // A fuzzing process may initialize several independent DUT runs.
-  multicore_session = std::make_unique<rvwmo::Runtime>(NUM_CORES);
+  rvwmo::UcRamProfile uc_profile;
+  const auto configured_uc = rvwmo::native_uc_profile_from_environment(uc_profile);
+  if (!configured_uc) uc_profile = {};
+  multicore_session = std::make_unique<rvwmo::Runtime>(NUM_CORES, std::move(uc_profile));
+  if (!configured_uc) multicore_session->exclude(configured_uc.message);
   native_exit_codes.assign(NUM_CORES, STATE_RUNNING);
 #ifdef CONFIG_DIFFTEST_SOURCEPREFIXEVENT
   rvwmo::source_boundary().reset(NUM_CORES, CONFIG_DIFF_SOURCE_PREFIX_WIDTH);
@@ -958,6 +964,9 @@ int Difftest::do_instr_commit(int i) {
   if (DEBUG_MODE_SKIP(dut->commit[i].valid, dut->commit[i].pc, dut->commit[i].inst))
     multicore_runtime().exclude("debug-mode skipped instruction lacks complete RVWMO semantics");
   if (runtime_error(multicore_runtime().before_commit(id, i, *dut, *proxy), "reference preparation")) return 1;
+  // Mature StoreEvents can accumulate during idle frames. Retire their older
+  // REF FIFO entries before this device RAM store adds and audits its own.
+  if (multicore_runtime().native_uc_store_audit_pending(id) && do_store_check()) return 1;
   if ((commit_instr & 0x7f) == 0x6b && dut->trap.hasTrap && dut->trap.pc == commit_pc) {
     proxy->skip_one(dut->commit[i].isRVC, false, false, false, 0, 0, dut);
     return runtime_error(multicore_runtime().after_commit(id, *proxy), "termination retirement");
@@ -966,7 +975,12 @@ int Difftest::do_instr_commit(int i) {
 
   // MMIO accessing should not be a branch or jump, just +2/+4 to get the next pc
   // to skip the checking of an instruction, just copy the reg state to reference design
-  if (dut->commit[i].skip || (DEBUG_MODE_SKIP(dut->commit[i].valid, dut->commit[i].pc, dut->commit[i].inst))) {
+  bool independently_execute_uc = false;
+#if NUM_CORES > 1
+  independently_execute_uc = multicore_runtime().independently_execute_skipped_uc(id);
+#endif
+  if ((dut->commit[i].skip && !independently_execute_uc) ||
+      (DEBUG_MODE_SKIP(dut->commit[i].valid, dut->commit[i].pc, dut->commit[i].inst))) {
 #if NUM_CORES > 1 && defined(CONFIG_DIFFTEST_TLBEVENT) && !defined(CONFIG_DIFFTEST_SQUASH)
     pending_translations[dut->commit[i].tlbId].clear();
 #endif
@@ -1158,12 +1172,20 @@ int Difftest::drain_store_checks() {
 
 int Difftest::do_store_check() {
 #ifdef CONFIG_DIFFTEST_STOREEVENT
-  while (!store_event_queue.empty()) {
-    auto store_event = store_event_queue.front();
+  using difftest_detail::StoreAuditAction;
+  const auto readiness = [&](const DifftestStoreEvent &store_event) {
+#if NUM_CORES > 1
+    const auto ready = multicore_runtime().legacy_store_reference_ready(id, store_event.storeUid);
+    if (ready.status == rvwmo::CheckStatus::Pending) return StoreAuditAction::Wait;
+    if (runtime_error(ready, "legacy reference store FIFO readiness")) return StoreAuditAction::Error;
+#endif
 #ifdef CONFIG_DIFFTEST_SQUASH
     if (store_event.stamp != commit_stamp)
-      return 0;
+      return StoreAuditAction::Wait;
 #endif // CONFIG_DIFFTEST_SQUASH
+    return StoreAuditAction::Consume;
+  };
+  const auto audit = [&](const DifftestStoreEvent &store_event) {
     auto addr = store_event.addr;
     auto data = store_event.data;
     auto mask = store_event.mask;
@@ -1172,7 +1194,7 @@ int Difftest::do_store_check() {
 #ifdef FUZZING
       if (in_disambiguation_state()) {
         Info("Store mismatch detected with a disambiguation state at pc = 0x%lx.\n", dut->trap.pc);
-        return 0;
+        return StoreAuditAction::Wait;
       }
 #endif
       uint64_t pc = store_event.pc;
@@ -1185,16 +1207,16 @@ int Difftest::do_store_check() {
       Info("  DUT commits addr 0x%016lx, data 0x%016lx, mask 0x%04x, pc 0x%016lx, robidx 0x%x\n", store_event.addr,
            store_event.data, store_event.mask, store_event.pc, store_event.robidx);
 
-      store_event_queue.pop();
-      return 1;
+      return StoreAuditAction::Error;
     }
 
 #if NUM_CORES > 1
     if (runtime_error(multicore_runtime().verify_store(id, store_event.storeUid, addr, data, mask),
-                      "independent reference store audit")) return 1;
+                      "independent reference store audit")) return StoreAuditAction::Error;
 #endif
-    store_event_queue.pop();
-  }
+    return StoreAuditAction::Consume;
+  };
+  return difftest_detail::drain_store_audit_fifo(store_event_queue, readiness, audit);
 #endif // CONFIG_DIFFTEST_STOREEVENT
   return 0;
 }

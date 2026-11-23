@@ -137,6 +137,11 @@ public:
   // An optional read-only tap on source-closed, checker-accepted raw events.
   // It is provisional until the owning HostSession reaches a complete Pass.
   using SemanticEventObserver = std::function<void(const RuntimeEvent &)>;
+  // Source-closed accepted events with the exact rank used by the checker.
+  // Invalid time denotes a non-memory event. Equal unordered group ranks do
+  // not establish an order between members. Evidence remains provisional
+  // until the owning host has independently completed its final checks.
+  using OrderedSemanticEventObserver = std::function<void(const RuntimeEvent &, const ObservationTime &)>;
   using TrapStepper = std::function<CheckResult(const TrapEvent &, const ArchitecturalTrap &)>;
 
   ObservationSession(StreamContract contract, std::vector<ProducerCapability> producers,
@@ -147,6 +152,11 @@ public:
   void set_semantic_event_observer(SemanticEventObserver observer);
   bool semantic_observer_healthy() const { return bool(semantic_observer_) && !semantic_observer_failed_; }
   const std::string &semantic_observer_error() const { return semantic_observer_error_; }
+  void set_ordered_semantic_event_observer(OrderedSemanticEventObserver observer);
+  bool ordered_semantic_observer_healthy() const {
+    return bool(ordered_semantic_observer_) && !ordered_semantic_observer_failed_;
+  }
+  const std::string &ordered_semantic_observer_error() const { return ordered_semantic_observer_error_; }
 
   SessionSubmitResult submit(const EventBatch &batch,
                              const std::vector<ArchitecturalRetirement> &retirements = {},
@@ -184,6 +194,9 @@ private:
   SemanticEventObserver semantic_observer_;
   std::string semantic_observer_error_;
   bool semantic_observer_failed_ = false;
+  OrderedSemanticEventObserver ordered_semantic_observer_;
+  std::string ordered_semantic_observer_error_;
+  bool ordered_semantic_observer_failed_ = false;
   TrapStepper trap_stepper_;
   std::map<OperationId, ArchitecturalTrap> architectural_traps_;
   std::set<OperationId> completed_traps_;
@@ -195,6 +208,7 @@ private:
   ObservationTime current_rank_;
   uint64_t next_rank_ = 1;
   bool finalized_ = false;
+  bool source_delivery_started_ = false;
   CheckResult failure_;
 
   static bool is_memory_event(const RuntimeEvent &event);
@@ -204,6 +218,7 @@ private:
                                      std::vector<std::shared_ptr<MemoryGroup>> &groups) const;
   CheckResult ensure_statistics_hart(uint32_t hart);
   CheckResult consume_pending_events();
+  void notify_semantic_observers(const RuntimeEvent &event, const ObservationTime &time);
   CheckResult consume_retirement(const RuntimeEvent &event, const InstructionRetireEvent &retirement);
   CheckResult consume_trap(const RuntimeEvent &event, const TrapEvent &trap);
   CheckResult step_reference(const InstructionRetireEvent &retirement, const ArchitecturalRetirement &snapshot);

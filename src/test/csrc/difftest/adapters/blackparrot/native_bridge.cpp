@@ -141,6 +141,7 @@ public:
   std::optional<uint64_t> delivery_barrier;
   std::optional<uint64_t> online_closed;
   std::map<uint32_t, uint64_t> online_sequences;
+  std::array<uint64_t, 4> checked_retirement_ordinals{};
   std::map<uint64_t, std::vector<PlannedObservation>> online_observations;
   ConvertedOutput online_batch;
   LoadOrderValidator load_orders;
@@ -1523,6 +1524,39 @@ template <typename Function> int invoke(const char *name, Function action, bool 
   }
 }
 } // namespace
+
+void trace_accepted_semantic_order(const rvwmo::RuntimeEvent &event,
+                                   const rvwmo::ObservationTime &order) {
+  const char *name = std::getenv("BP_DIFFTEST_S_TRACE");
+  if (!name || !*name)
+    return;
+  if (!event.source.producer_sequence)
+    throw std::runtime_error("BlackParrot accepted evidence lacks a producer sequence");
+  std::ostringstream row;
+  if (event.kind == rvwmo::RuntimeEventKind::InstructionRetire) {
+    const auto &instruction = std::get<rvwmo::InstructionRetireEvent>(event.payload).instruction;
+    auto &state = bridge();
+    if (order.valid || instruction.hart >= state.checked_retirement_ordinals.size())
+      throw std::runtime_error("BlackParrot retirement falsely carries GMO order or unknown hart");
+    row << "RETIRE_ACCEPTED\t" << instruction.hart << '\t' << instruction.epoch
+        << '\t' << instruction.uid << '\t' << instruction.pc
+        << '\t' << instruction.instruction << '\t' << event.source.cycle
+        << '\t' << event.producer_id << '\t' << event.source.producer_sequence
+        << '\t' << ++state.checked_retirement_ordinals[instruction.hart];
+  } else if (event.kind == rvwmo::RuntimeEventKind::LoadSample ||
+             event.kind == rvwmo::RuntimeEventKind::StorePublish) {
+    if (!order.valid || !order.rank)
+      throw std::runtime_error("BlackParrot accepted memory effect has no checker GMO order");
+    row << "GMO_ACCEPT\t" << event.producer_id << '\t' << event.source.producer_sequence
+        << '\t' << event.source.cycle << '\t' << order.rank
+        << '\t' << (order.unordered_read_group ? 1 : 0)
+        << '\t' << (order.unordered_effect_group ? 1 : 0)
+        << '\t' << (order.isolated_store_group ? 1 : 0);
+  } else {
+    return;
+  }
+  bridge().trace(row.str());
+}
 
 ConversionResult install_native_sink(Configuration configuration, NativeSink sink,
                                      NativeFailureObserver failure_observer) {

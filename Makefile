@@ -94,7 +94,10 @@ endif
 
 DIFFTEST_ADAPTER_DIR = $(DIFFTEST_CSRC_DIR)/adapters/$(DIFFTEST_S_DUT)
 DIFFTEST_SPIKE_SOURCES = $(addprefix $(DIFFTEST_CSRC_DIR)/rvwmo/,spike_reference_stepper.cpp spike_reference_pool.cpp host_session.cpp)
-DIFFTEST_COMMON_CXXFILES = $(filter-out $(DIFFTEST_SPIKE_SOURCES),$(shell find $(DIFFTEST_CSRC_DIR) -path "$(DIFFTEST_CSRC_DIR)/adapters" -prune -o -name "*.cpp" -print))
+# The passive UC build explicitly adds its bridge and raw transport together.
+# Standalone regression programs must never become simulator translation units.
+DIFFTEST_UC_BRIDGE_SOURCE = $(DIFFTEST_CSRC_DIR)/rvwmo/uc_bridge.cpp
+DIFFTEST_COMMON_CXXFILES = $(filter-out $(DIFFTEST_SPIKE_SOURCES) $(DIFFTEST_UC_BRIDGE_SOURCE),$(shell find $(DIFFTEST_CSRC_DIR) \( -path "$(DIFFTEST_CSRC_DIR)/adapters" -o -path "$(DIFFTEST_CSRC_DIR)/tests" \) -prune -o -name "*.cpp" -print))
 DIFFTEST_ADAPTER_CXXFILES =
 ifneq ($(DIFFTEST_S_DUT),nanhu)
 DIFFTEST_ADAPTER_CXXFILES = $(shell find $(DIFFTEST_ADAPTER_DIR) -name "*.cpp" 2>/dev/null)

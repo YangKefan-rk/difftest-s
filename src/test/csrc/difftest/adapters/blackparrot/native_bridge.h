@@ -166,6 +166,10 @@ ConversionResult install_native_online_verifier(Configuration configuration, Nat
 // An explicit fresh session is allowed only before initialization or after finish.
 ConversionResult reset_native_session();
 const NativeCapture &last_native_capture();
+// Optional, checker-accepted source order/retirement evidence. An absent or
+// failed trace never changes the independent HostSession verdict.
+void trace_accepted_semantic_order(const rvwmo::RuntimeEvent &event,
+                                   const rvwmo::ObservationTime &order);
 
 } // namespace blackparrot
 

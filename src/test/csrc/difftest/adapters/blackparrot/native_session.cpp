@@ -89,7 +89,13 @@ public:
     if (entry != ram_base)
       throw std::invalid_argument("BlackParrot ELF entry must match native boot address 0x80000000");
     validate_initial_registers(memory_, entry);
-    host_ = std::make_unique<rvwmo::HostSession>(memory_, host_configuration(entry));
+    auto config = host_configuration(entry);
+    if (const char *trace = std::getenv("BP_DIFFTEST_S_TRACE"); trace && *trace)
+      config.ordered_semantic_event_observer = [](const rvwmo::RuntimeEvent &event,
+                                                  const rvwmo::ObservationTime &order) {
+        trace_accepted_semantic_order(event, order);
+      };
+    host_ = std::make_unique<rvwmo::HostSession>(memory_, std::move(config));
     if (!host_->configuration() || !host_->session())
       throw std::runtime_error("BlackParrot HostSession configuration failed: " + host_->configuration().message);
     adapter_ = std::make_unique<HostSessionAdapter>(*host_);
@@ -133,6 +139,9 @@ private:
   NativeVerification finish(const NativeCapture &capture) {
     auto result = capture.summary.gaps.empty() ? adapter_->finalize(capture.completion)
         : adapter_->report_source_failure({rvwmo::CheckStatus::Incomplete, 0, capture.summary.gaps.front()});
+    if (std::getenv("BP_DIFFTEST_S_TRACE") && !host_->ordered_semantic_observer_healthy())
+      std::cerr << "[BP-FEEDBACK] accepted order unavailable: "
+                << host_->ordered_semantic_observer_error() << '\n';
     write_statistics(capture);
     return {result, adapter_->finalized()};
   }

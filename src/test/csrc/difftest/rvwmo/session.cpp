@@ -279,6 +279,43 @@ void ObservationSession::set_semantic_event_observer(SemanticEventObserver obser
   semantic_observer_failed_ = false;
 }
 
+void ObservationSession::set_ordered_semantic_event_observer(OrderedSemanticEventObserver observer) {
+  if (ordered_semantic_observer_ || source_delivery_started_ || finalized_ || !pending_events_.empty())
+    throw std::logic_error("ordered semantic observer must be installed once before source delivery");
+  if (!observer)
+    throw std::invalid_argument("ordered semantic observer cannot be empty");
+  ordered_semantic_observer_ = std::move(observer);
+  ordered_semantic_observer_error_.clear();
+  ordered_semantic_observer_failed_ = false;
+}
+
+void ObservationSession::notify_semantic_observers(const RuntimeEvent &event, const ObservationTime &time) {
+  if (!is_semantic_feedback_event(event.kind))
+    return;
+  if (semantic_observer_ && !semantic_observer_failed_) {
+    try {
+      semantic_observer_(event);
+    } catch (const std::exception &error) {
+      semantic_observer_failed_ = true;
+      semantic_observer_error_ = error.what();
+    } catch (...) {
+      semantic_observer_failed_ = true;
+      semantic_observer_error_ = "semantic observer failed without a diagnostic";
+    }
+  }
+  if (ordered_semantic_observer_ && !ordered_semantic_observer_failed_) {
+    try {
+      ordered_semantic_observer_(event, time);
+    } catch (const std::exception &error) {
+      ordered_semantic_observer_failed_ = true;
+      ordered_semantic_observer_error_ = error.what();
+    } catch (...) {
+      ordered_semantic_observer_failed_ = true;
+      ordered_semantic_observer_error_ = "ordered semantic observer failed without a diagnostic";
+    }
+  }
+}
+
 CheckResult ObservationSession::consume_pending_events() {
   bool progress = true;
   while (progress) {
@@ -337,6 +374,7 @@ CheckResult ObservationSession::consume_pending_events() {
       }
       else
         result = consumer_.consume_closed(event, true);
+      const ObservationTime accepted_time = memory_event ? current_rank_ : ObservationTime{};
       current_rank_event_.reset();
       current_rank_ = {};
 
@@ -350,18 +388,7 @@ CheckResult ObservationSession::consume_pending_events() {
       }
       if (!result)
         return remember_failure(result);
-      if (semantic_observer_ && !semantic_observer_failed_
-          && is_semantic_feedback_event(event.kind)) {
-        try {
-          semantic_observer_(event);
-        } catch (const std::exception &error) {
-          semantic_observer_failed_ = true;
-          semantic_observer_error_ = error.what();
-        } catch (...) {
-          semantic_observer_failed_ = true;
-          semantic_observer_error_ = "semantic observer failed without a diagnostic";
-        }
-      }
+      notify_semantic_observers(event, accepted_time);
       if (memory_event && (!pending_event->memory_group || --pending_event->memory_group->remaining == 0)) {
         // A certified coalesced physical publication expands to consecutive
         // logical stores; reserve every rank before a later effect can consume it.
@@ -673,6 +700,7 @@ SessionSubmitResult ObservationSession::submit(const EventBatch &batch,
     return result;
   }
 
+  source_delivery_started_ = true;
   for (const auto &snapshot : retirements)
     architectural_retirements_.emplace(snapshot.id, snapshot);
   for (const auto &snapshot : traps)

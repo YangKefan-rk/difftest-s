@@ -6,18 +6,90 @@
 #include "reference.h"
 #include "refproxy.h"
 #include <array>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <set>
 #include <tuple>
+#include <variant>
 
 namespace rvwmo {
+
+class UcBridge;
+struct UcBoundRequest;
+struct UcJoinedEffect;
+
+// Opt-in host prototype. Raw Uncache A/grant handshakes have no qualification.
+enum class UcRamProfileKind { Disabled, LinkNanExtraMemScalar, LinkNanExtraMemNative };
+enum class UcAccessKind { Load, Store };
+enum class UcObservationKind { UnqualifiedGrant, ReadSample, WriteEffect };
+
+struct UcRamSources {
+  static constexpr unsigned absent = 256;
+  std::set<unsigned> request;
+  std::set<unsigned> read_sample;
+  std::set<unsigned> write_effect;
+};
+
+struct UcRamProfile {
+  UcRamProfileKind kind = UcRamProfileKind::Disabled;
+  // Whole zero pages in the independent extraMem aperture. Existing backing
+  // is rejected before any page is seeded; DUT return bytes never seed RAM.
+  std::vector<uint64_t> zero_pages;
+  std::vector<UcRamSources> sources;
+  std::shared_ptr<UcBridge> native_bridge;
+};
+
+CheckResult native_uc_profile_from_environment(UcRamProfile &profile);
+
+struct UcSourcePosition {
+  unsigned source_id = UcRamSources::absent;
+  uint64_t sequence = 0;
+  uint64_t cycle = 0;
+};
+
+struct UcRequest {
+  unsigned hart = 0;
+  uint64_t transaction_uid = 0;
+  uint16_t robidx = 0;
+  uint64_t allocation_uid = 0; // Exact request generation, never inferred at completion.
+  UcAccessKind kind = UcAccessKind::Load;
+  uint64_t store_uid = 0;
+  uint64_t address = 0; // Aligned eight-byte word; mask selects scalar bytes.
+  uint8_t mask = 0;
+  UcSourcePosition source;
+};
+
+struct UcCompletion {
+  unsigned hart = 0;
+  uint64_t transaction_uid = 0;
+  UcObservationKind observation = UcObservationKind::UnqualifiedGrant;
+  uint64_t address = 0;
+  uint8_t mask = 0;
+  std::array<uint8_t, 8> bytes{};
+  bool denied = false;
+  bool corrupt = false;
+  UcSourcePosition source;
+};
 
 // Adapter for the generated DiffTest event ABI. The rule and memory engines do
 // not depend on this adapter or on any particular RTL implementation.
 class Runtime {
 public:
-  explicit Runtime(unsigned harts);
+  explicit Runtime(unsigned harts, UcRamProfile uc_profile = {});
+  // Submit before capture; request must name the exact allocation generation.
+  // Completion uses only that saved identity, never the current ROB slot.
+  // The source bridge must finish a bounded request/effect join before delivery
+  // and preserve per-producer sequence and original effect time. Raw endpoint
+  // callbacks from independent producers are not this joined input contract.
+  CheckResult submit_uc_request(const UcRequest &request);
+  CheckResult submit_uc_completion(const UcCompletion &completion);
+  bool independently_execute_skipped_uc(unsigned hart) const;
+  bool native_uc_store_audit_pending(unsigned hart) const;
+  // A native device RAM store shares REF's FIFO with legacy StoreEvents.
+  // Only events whose allocation has already retired in REF may consume it.
+  CheckResult legacy_store_reference_ready(unsigned hart, uint64_t store_uid) const;
+  void print_native_uc_diagnostics(const char *phase) const;
   CheckResult capture(const std::vector<DiffTestState *> &states);
   CheckResult before_commit(unsigned hart, unsigned port, DiffTestState &state, RefProxy &reference);
   CheckResult after_commit(unsigned hart, RefProxy &reference);
@@ -56,6 +128,8 @@ private:
     unsigned source_id = 0;
     uint64_t source_sequence = 0;
     uint64_t source_cycle = 0;
+    bool qualified_uc = false;
+    std::shared_ptr<const UcJoinedEffect> external_effect;
     std::string coverage_reason;
   };
   struct Store {
@@ -63,8 +137,11 @@ private:
     MemoryStore memory;
     MemoryOperation operation;
     std::vector<uint8_t> audited;
+    bool effect_recorded = false;
     bool recorded = false;
     bool verified = false;
+    bool qualified_uc = false;
+    std::shared_ptr<const UcJoinedEffect> external_effect;
     bool excluded_io = false;
     uint64_t excluded_io_address = 0;
     uint64_t excluded_io_cycle = 0;
@@ -113,6 +190,7 @@ private:
     unsigned hart;
     uint64_t address;
     std::vector<uint8_t> mask;
+    bool qualified_uc = false;
   };
   struct CheckedFusedRetirement {
     unsigned hart;
@@ -130,11 +208,16 @@ private:
     RetiredInstruction instruction;
     std::shared_ptr<Load> load;
     bool reader = false;
+    bool qualified_uc = false;
+    std::shared_ptr<const UcJoinedEffect> uc_store_effect;
     std::shared_ptr<Atomic> atomic;
     unsigned instruction_count = 1;
     bool is_rvc = false;
     std::vector<std::pair<uint64_t, uint32_t>> reference_instructions;
     std::optional<CheckedFusedRetirement> checked_fused_retirement;
+    uint64_t retirement_source_cycle = 0;
+    unsigned retirement_source_id = 0;
+    uint64_t retirement_source_sequence = 0;
   };
   struct Hart {
     uint64_t next_uid = 1;
@@ -142,6 +225,8 @@ private:
     uint64_t frame_ref_steps = 0;
     uint64_t arch_compares = 0;
     uint64_t last_retired_uid = 0;
+    uint64_t semantic_retirement_ordinal = 0;
+    uint64_t accepted_retirement_instructions = 0;
     uint64_t last_store_uid = 0;
     std::map<uint16_t, OperationId> allocations;
     std::map<uint64_t, Store> stores;
@@ -157,6 +242,23 @@ private:
     uint64_t end_uid = 0;
     int exit_code = 0;
   };
+  struct SemanticRetirement {
+    OperationId id;
+    uint64_t pc;
+    uint32_t instruction;
+    uint64_t source_cycle;
+    unsigned source_id;
+    uint64_t source_sequence;
+    uint64_t program_order;
+  };
+  struct SemanticRetiredMemory {
+    uint64_t pc;
+    uint32_t instruction;
+    uint64_t retirement_source_cycle;
+    uint32_t attempt;
+    uint64_t address;
+    uint64_t byte_mask;
+  };
   struct SemanticLoad {
     OperationId id;
     uint32_t attempt;
@@ -165,6 +267,7 @@ private:
     uint64_t source_sequence;
     uint64_t address;
     uint64_t byte_mask;
+    std::shared_ptr<const UcJoinedEffect> external_effect;
   };
   struct SemanticGroup {
     unsigned hart;
@@ -175,6 +278,10 @@ private:
     uint64_t address;
     uint64_t byte_mask;
     std::vector<OperationId> members;
+    // Only bytes whose final physical writer is this dynamic store are
+    // externally visible in this coalesced publication.
+    std::map<OperationId, uint64_t> visible_member_masks;
+    std::shared_ptr<const UcJoinedEffect> external_effect;
   };
   struct ExcludedDeviceStore {
     OperationId id;
@@ -191,8 +298,14 @@ private:
     uint64_t address;
     uint64_t byte_mask;
   };
+  struct UcTransaction {
+    UcRequest request;
+    OperationId allocation;
+    std::shared_ptr<const UcBoundRequest> external_request;
+  };
   // Queue phases are separate from AtomicMemoryEvent lifecycle phases:
-  // 1 data-read sample, 2 Sbuffer write, 3 indivisible AMO write point.
+  // 1 data-read sample, 2 Sbuffer write, 3 indivisible AMO write point,
+  // 4 qualified UC single-store effect. Phase numbers do not certify tie order.
   // Overlapping cross-hart writes still require qualified hardware arbitration.
   using EventKey = std::tuple<uint64_t, unsigned, uint64_t, unsigned>;
   std::vector<Hart> harts_;
@@ -221,6 +334,8 @@ private:
   bool semantic_export_enabled_ = false;
   bool semantic_export_overflow_ = false;
   bool checked_fused_retirements_overflow_ = false;
+  bool semantic_retirements_incomplete_ = false;
+  std::vector<SemanticRetirement> semantic_retirements_;
   size_t checked_fused_instruction_count_ = 0;
   std::vector<CheckedFusedRetirement> checked_fused_retirements_;
   bool semantic_excluded_device_store_ = false;
@@ -228,17 +343,46 @@ private:
   uint64_t excluded_atomic_effect_count_ = 0;
   std::vector<SemanticAtomicEffect> semantic_atomic_effects_;
   std::vector<SemanticLoad> semantic_loads_;
+  std::map<OperationId, SemanticRetiredMemory> semantic_retired_memories_;
   std::vector<SemanticGroup> semantic_groups_;
   std::set<OperationId> retired_semantic_stores_;
   std::set<OperationId> audited_semantic_stores_;
   std::string ordering_pending_;
+  UcRamProfile uc_profile_;
+  bool uc_memory_initialized_ = false;
+  bool native_uc_startup_logged_ = false;
+  uint64_t native_bound_requests_ = 0;
+  uint64_t native_queued_effects_ = 0;
+  std::deque<std::variant<UcRequest, UcCompletion>> uc_inputs_;
+  std::map<std::pair<unsigned, uint64_t>, UcTransaction> uc_transactions_;
+  std::map<std::pair<unsigned, unsigned>, uint64_t> uc_source_sequences_;
+  std::set<std::pair<unsigned, uint64_t>> uc_seen_transactions_;
+  CheckResult initialize_uc_profile();
+  CheckResult seed_uc_zero_pages();
+  CheckResult capture_native_uc(const std::vector<DiffTestState *> &states);
+  CheckResult consume_native_uc_request(const UcBoundRequest &request);
+  CheckResult consume_native_uc_effect(const UcJoinedEffect &effect);
+  CheckResult audit_native_uc_store(unsigned hart, const Active &active, RefProxy &reference);
+  CheckResult record_uc_request(const UcRequest &request,
+                                std::shared_ptr<const UcBoundRequest> external_request = {});
+  CheckResult enqueue_uc_completion(const UcCompletion &completion,
+                                    std::shared_ptr<const UcJoinedEffect> external_effect = {});
+  std::optional<uint64_t> uc_effective_watermark(std::optional<uint64_t> legacy) const;
+  CheckResult validate_uc_source(unsigned hart, const UcSourcePosition &source, const std::set<unsigned> &allowed);
+  CheckResult capture_uc_inputs();
+  CheckResult bind_uc_request(const UcRequest &request);
+  CheckResult capture_uc_completion(const UcCompletion &completion);
+  CheckResult publish_uc_store(const UcTransaction &transaction, const UcCompletion &completion,
+                               ObservationTime time, std::shared_ptr<const UcJoinedEffect> external_effect = {});
+  bool uc_word_is_declared(uint64_t address) const;
   CheckResult unsupported(const std::string &reason);
   CheckResult advance(uint64_t watermark);
   CheckResult observe(const std::shared_ptr<Load> &load, ObservationTime time);
   CheckResult complete_group(Group &group, ObservationTime time);
   CheckResult observe_atomic(unsigned hart, const std::shared_ptr<Atomic> &atomic, ObservationTime time);
   CheckResult capture_atomics(unsigned hart, DiffTestState &state);
-  void observe_write(uint64_t cycle, unsigned hart, uint64_t address, const std::vector<uint8_t> &mask);
+  void observe_write(uint64_t cycle, unsigned hart, uint64_t address, const std::vector<uint8_t> &mask,
+                     bool qualified_uc = false);
   CheckResult allocate(unsigned hart, uint16_t rob);
   void collect_released_stores();
   void record_checked_fused_retirement(Active &active);

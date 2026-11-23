@@ -4,7 +4,11 @@
 #include "logical_store_mask.h"
 #include "source_boundary.h"
 #include "sha256.h"
+#ifdef DIFFTEST_S_UC_NATIVE_V1
+#include "uc_bridge.h"
+#endif
 #include <algorithm>
+#include <charconv>
 #include <cerrno>
 #include <cctype>
 #include <cstdio>
@@ -13,6 +17,7 @@
 #include <fcntl.h>
 #include <limits>
 #include <sstream>
+#include <type_traits>
 #include <unistd.h>
 #include <utility>
 
@@ -131,6 +136,19 @@ void json_string(std::ostream &output, const char *value) {
 std::string source_producer_name(unsigned hart, unsigned source_id) {
   return std::to_string(hart) + ':' + std::to_string(source_id);
 }
+#ifdef DIFFTEST_S_UC_NATIVE_V1
+std::string external_producer_name(const UcRawProducer &producer) {
+  return "uc:" + std::to_string(producer.name_space) + ':' +
+      (producer.hart == SFUZZ_UC_GLOBAL_HART ? "global" : std::to_string(producer.hart)) + ':' +
+      std::to_string(producer.source_id);
+}
+void write_external_identity(std::ostream &output, const UcRawProducer &producer) {
+  output << "\"namespace\":" << producer.name_space << ",\"owner_hart\":";
+  if (producer.hart == SFUZZ_UC_GLOBAL_HART) output << "null";
+  else output << producer.hart;
+  output << ",\"source_id\":" << producer.source_id << ",\"role\":" << producer.role;
+}
+#endif
 bool create_semantic_sidecar(const char *path, const std::string &json, std::string &artifact_hash) {
   if (!path || *path != '/')
     return false;
@@ -176,7 +194,62 @@ bool create_semantic_sidecar(const char *path, const std::string &json, std::str
 }
 } // namespace
 
-Runtime::Runtime(unsigned harts)
+CheckResult native_uc_profile_from_environment(UcRamProfile &profile) {
+  profile = {};
+  const char *enabled = std::getenv("DIFFTEST_S_UC_NATIVE");
+  if (!enabled || std::strcmp(enabled, "0") == 0)
+    return {};
+  if (std::strcmp(enabled, "1") != 0)
+    return invalid("DIFFTEST_S_UC_NATIVE must be 0 or 1");
+#ifdef DIFFTEST_S_UC_NATIVE_V1
+  const char *pages = std::getenv("DIFFTEST_S_UC_ZERO_PAGES");
+  if (!pages || !*pages)
+    return invalid("native UC requires DIFFTEST_S_UC_ZERO_PAGES");
+  const std::string text(pages);
+  size_t first = 0;
+  while (first < text.size()) {
+    const size_t comma = text.find(',', first);
+    const size_t end = comma == std::string::npos ? text.size() : comma;
+    size_t digits = first;
+    int base = 10;
+    if (end - first >= 2 && text[first] == '0' && (text[first + 1] == 'x' || text[first + 1] == 'X')) {
+      digits += 2;
+      base = 16;
+    }
+    uint64_t page = 0;
+    const auto parsed = std::from_chars(text.data() + digits, text.data() + end, page, base);
+    if (digits == end || parsed.ec != std::errc{} || parsed.ptr != text.data() + end ||
+        page < UINT64_C(0x30000000000) || page >= UINT64_C(0x40000000000) || page % 4096 ||
+        profile.zero_pages.size() == 64 ||
+        std::find(profile.zero_pages.begin(), profile.zero_pages.end(), page) != profile.zero_pages.end())
+      return invalid("UC zero pages must be distinct complete aligned extraMem physical addresses");
+    profile.zero_pages.push_back(page);
+    if (comma == std::string::npos)
+      break;
+    first = comma + 1;
+    if (first == text.size())
+      return invalid("UC zero-page list has an empty trailing entry");
+  }
+  UcBridgeConfig configuration;
+  configuration.enabled = configuration.common_clock_verified = true;
+  configuration.layout = UcBridgeLayout::PmaLite17;
+  configuration.zero_pages = profile.zero_pages;
+  for (unsigned hart = 0; hart < 4; ++hart) {
+    configuration.producers.push_back({1, hart, 0, SFUZZ_UC_CORE});
+    configuration.producers.push_back({1, hart, 16, SFUZZ_UC_MMIO});
+  }
+  for (unsigned slot = 0; slot < 8; ++slot)
+    configuration.producers.push_back({2, SFUZZ_UC_GLOBAL_HART, slot, SFUZZ_UC_AXI});
+  configuration.producers.push_back({2, SFUZZ_UC_GLOBAL_HART, 32, SFUZZ_UC_ENDPOINT});
+  profile.kind = UcRamProfileKind::LinkNanExtraMemNative;
+  profile.native_bridge = std::make_shared<UcBridge>(configuration);
+  return profile.native_bridge->snapshot().status;
+#else
+  return {CheckStatus::Unsupported, 0, "native UC is not compiled into this build"};
+#endif
+}
+
+Runtime::Runtime(unsigned harts, UcRamProfile uc_profile)
     : harts_(harts), memory_(
           [](uint64_t address) {
             uint8_t byte = 0;
@@ -184,10 +257,505 @@ Runtime::Runtime(unsigned harts)
             return byte;
           },
           [](uint64_t address, uint8_t byte) { update_globalmem(address, &byte, 1, 1); }),
-      checker_(memory_) {
+      checker_(memory_), uc_profile_(std::move(uc_profile)) {
   const char *output = std::getenv("DIFFTEST_S_SEMANTIC_OUTPUT");
   const char *observed_prefix = std::getenv("DIFFTEST_S_OBSERVED_PREFIX");
   semantic_export_enabled_ = output && *output && observed_prefix && std::strcmp(observed_prefix, "1") == 0;
+  coverage_ = initialize_uc_profile();
+}
+
+CheckResult Runtime::initialize_uc_profile() {
+  if (uc_profile_.kind == UcRamProfileKind::Disabled)
+    return uc_profile_.zero_pages.empty() && uc_profile_.sources.empty() && !uc_profile_.native_bridge
+        ? CheckResult{} : invalid("disabled UC profile carries configuration");
+#if NUM_CORES > 1 && defined(CONFIG_DIFFTEST_SOURCEPREFIXEVENT)
+  const bool native = uc_profile_.kind == UcRamProfileKind::LinkNanExtraMemNative;
+  if ((!native && uc_profile_.kind != UcRamProfileKind::LinkNanExtraMemScalar) ||
+      (!native && (uc_profile_.sources.size() != harts_.size() || uc_profile_.native_bridge)) ||
+      (native && (harts_.size() != 4 || !uc_profile_.sources.empty() || !uc_profile_.native_bridge)) ||
+      uc_profile_.zero_pages.empty() ||
+      uc_profile_.zero_pages.size() > 64)
+    return invalid("UC profile requires a fixed hart roster and at most 64 explicit zero pages");
+  std::set<uint64_t> pages;
+  for (uint64_t page : uc_profile_.zero_pages) {
+    if (page < UINT64_C(0x30000000000) || page >= UINT64_C(0x40000000000) || page % 4096 ||
+        !pages.insert(page).second)
+      return invalid("UC zero page is duplicated, unaligned or outside independent extraMem");
+  }
+  for (const auto &sources : uc_profile_.sources) {
+    if (sources.request.empty())
+      return invalid("UC profile has no request producer");
+    for (const auto *role : {&sources.request, &sources.read_sample, &sources.write_effect})
+      if (!role->empty() && *role->rbegin() >= UcRamSources::absent)
+        return invalid("UC profile has an invalid producer ID");
+  }
+  // The typed prototype has no independent external-source proof. Native v2
+  // records retain the actual Bridge proof and pass its full export checks.
+  if (semantic_export_enabled_ && !native)
+    semantic_export_overflow_ = true;
+  if (native) {
+#ifdef DIFFTEST_S_UC_NATIVE_V1
+    const auto state = uc_profile_.native_bridge->snapshot();
+    if (!state.status)
+      return state.status;
+    if (state.expected_producers != 17)
+      return invalid("native RAM profile requires the pinned passive-raw-v2 producer contract");
+    if (!sfuzz_uc_raw_set_consumer_v1([](const SfuzzUcRawRecord *record, void *context) -> int {
+          return record && bool(static_cast<UcBridge *>(context)->ingest(*record));
+        }, uc_profile_.native_bridge.get()))
+      return invalid("native UC consumer registration requires an unused bootstrap-only transport");
+    return {}; // GlobalMem is initialized after difftest_init in the simulator.
+#else
+    return {CheckStatus::Unsupported, 0, "native UC profile requires the native build macro"};
+#endif
+  }
+  return seed_uc_zero_pages();
+#else
+  return {CheckStatus::Unsupported, 0, "UC profile requires source-prefix transport"};
+#endif
+}
+
+CheckResult Runtime::seed_uc_zero_pages() {
+  if (!global_memory().size())
+    return invalid("UC zero-page initialization requires initialized independent GlobalMem");
+  for (uint64_t page : uc_profile_.zero_pages)
+    for (unsigned byte = 0; byte < 4096; ++byte)
+      if (global_memory().contains(page + byte))
+        return invalid("UC zero-page registration would overwrite existing reference backing");
+  const std::array<uint8_t, 4096> zeros{};
+  for (uint64_t page : uc_profile_.zero_pages)
+    if (!global_memory().add_region(page, zeros.data(), zeros.size()))
+      return invalid("cannot seed independently declared UC zero page");
+  uc_memory_initialized_ = true;
+  return {};
+}
+
+bool Runtime::uc_word_is_declared(uint64_t address) const {
+  return address % 8 == 0 && std::find(uc_profile_.zero_pages.begin(), uc_profile_.zero_pages.end(),
+      address & ~UINT64_C(4095)) != uc_profile_.zero_pages.end();
+}
+
+CheckResult Runtime::submit_uc_request(const UcRequest &request) {
+  if (!coverage_)
+    return coverage_;
+  if (uc_profile_.kind != UcRamProfileKind::LinkNanExtraMemScalar)
+    return unsupported("typed UC request requires the legacy qualified profile, not native input");
+  if (uc_inputs_.size() == max_semantic_events)
+    return failure_ = invalid("UC input queue capacity exhausted");
+  finalized_ = false;
+  uc_inputs_.emplace_back(request);
+  return {};
+}
+
+CheckResult Runtime::submit_uc_completion(const UcCompletion &completion) {
+  if (!coverage_)
+    return coverage_;
+  if (uc_profile_.kind != UcRamProfileKind::LinkNanExtraMemScalar)
+    return unsupported("typed UC completion requires the legacy qualified profile, not native input");
+  if (uc_inputs_.size() == max_semantic_events)
+    return failure_ = invalid("UC input queue capacity exhausted");
+  finalized_ = false;
+  uc_inputs_.emplace_back(completion);
+  return {};
+}
+
+CheckResult Runtime::validate_uc_source(unsigned hart, const UcSourcePosition &position,
+                                       const std::set<unsigned> &allowed) {
+  if (!allowed.count(position.source_id))
+    return {CheckStatus::Unsupported, 0, "UC observation has no qualified profile producer"};
+  if (!position.sequence || !position.cycle || position.cycle == UINT64_MAX || position.cycle > latest_cycle_)
+    return invalid("UC source position is missing");
+  const auto boundary = source_boundary().snapshot();
+  if (!boundary.status)
+    return boundary.status;
+  if (!boundary.catalog_complete || !boundary.reset_epoch_verified)
+    return {CheckStatus::Incomplete, 0, "UC source catalog or reset epoch is not verified"};
+  const auto producers = source_boundary().producer_watermarks();
+  const auto producer = std::find_if(producers.begin(), producers.end(), [&](const auto &source) {
+    return source.hart == hart && source.source_id == position.source_id;
+  });
+  if (producer == producers.end() || producer->kind != 7 || producer->event_sequence < position.sequence)
+    return {CheckStatus::Incomplete, 0, "UC source event is not delivered by a registered memory producer"};
+  auto &last = uc_source_sequences_[{hart, position.source_id}];
+  if (position.sequence <= last || (transport_watermark_ && position.cycle <= *transport_watermark_))
+    return invalid("UC source sequence is reused or arrived behind the completed watermark");
+  last = position.sequence; // Raw diagnostic phases can leave valid sequence gaps.
+  return {};
+}
+
+CheckResult Runtime::bind_uc_request(const UcRequest &request) {
+  if (request.hart >= uc_profile_.sources.size())
+    return invalid("UC request names an unregistered legacy hart");
+  auto result = validate_uc_source(request.hart, request.source, uc_profile_.sources[request.hart].request);
+  return result ? record_uc_request(request) : result;
+}
+
+CheckResult Runtime::record_uc_request(const UcRequest &request,
+                                      std::shared_ptr<const UcBoundRequest> external_request) {
+  if (request.hart >= harts_.size() || !request.transaction_uid || !request.mask ||
+      !uc_word_is_declared(request.address) ||
+      (request.kind != UcAccessKind::Load && request.kind != UcAccessKind::Store))
+    return invalid("UC request has an invalid identity or undeclared RAM span");
+  auto &hart = harts_[request.hart];
+  const auto allocation = hart.allocations.find(request.robidx);
+  if (hart.done || allocation == hart.allocations.end() || !request.allocation_uid ||
+      allocation->second.uid != request.allocation_uid)
+    return invalid("UC request lacks its live instruction allocation");
+  const auto key = std::make_pair(request.hart, request.transaction_uid);
+  if (uc_seen_transactions_.count(key) || uc_seen_transactions_.size() == max_semantic_events)
+    return invalid("UC transaction identity was reused or capacity exhausted");
+  if (request.kind == UcAccessKind::Store) {
+    const auto store = hart.stores.find(request.store_uid);
+    if (!request.store_uid || store == hart.stores.end() || store->second.id != allocation->second)
+      return invalid("UC request store UID does not identify the bound allocation");
+  } else if (request.store_uid) {
+    return invalid("UC load request unexpectedly names a store UID");
+  }
+  uc_seen_transactions_.insert(key);
+  uc_transactions_.emplace(key, UcTransaction{request, allocation->second, std::move(external_request)});
+  timestamp(request.source.cycle);
+  return {};
+}
+
+CheckResult Runtime::publish_uc_store(const UcTransaction &transaction, const UcCompletion &completion,
+                                      ObservationTime time, std::shared_ptr<const UcJoinedEffect> external_effect) {
+  auto &stores = harts_[completion.hart].stores;
+  const auto found = stores.find(transaction.request.store_uid);
+  if (found == stores.end() || found->second.id != transaction.allocation)
+    return invalid("UC publication lost its bound StoreLocal identity");
+  auto &store = found->second;
+  if (!store.recorded && !store.effect_recorded) {
+#ifdef DIFFTEST_S_UC_NATIVE_V1
+    if (!external_effect || !external_effect->request.device || completion.mask != 0xff ||
+        !uc_word_is_declared(completion.address))
+      return pending("UC publication awaits the bound StoreLocal record");
+    // The physical RAM write is an observed provisional store. Its later
+    // StoreLocal and independent REF execution remain separate obligations.
+    store.memory.po = store.id.uid;
+    store.memory.address = completion.address & ~UINT64_C(15);
+    const auto offset = completion.address - store.memory.address;
+    store.memory.bytes.assign(16, 0);
+    std::copy(completion.bytes.begin(), completion.bytes.end(), store.memory.bytes.begin() + offset);
+    store.memory.mask = mask_bytes(uint64_t(completion.mask) << offset, 16);
+    auto result = checker_.memory_writer(store.id, store.memory.writer);
+    if (!result) return result;
+    store.operation.id = store.id;
+    store.operation.store = true;
+    store.operation.address = store.memory.address;
+    store.operation.byte_mask = store.memory.mask;
+    result = checker_.record_store(store.memory, store.operation, StoreVerification::Provisional);
+    if (!accepted(result)) return result;
+    store.effect_recorded = true;
+#else
+    return pending("UC publication awaits the bound StoreLocal record");
+#endif
+  }
+  const auto mask = mask_bytes(completion.mask, 8);
+  for (size_t byte = 0; byte < store.memory.mask.size(); ++byte) {
+    const uint64_t address = store.memory.address + byte;
+    const bool enabled = address >= completion.address && address - completion.address < 8 &&
+                         mask[address - completion.address];
+    if (bool(store.memory.mask[byte]) != enabled ||
+        (enabled && store.memory.bytes[byte] != completion.bytes[address - completion.address]))
+      return {CheckStatus::Violation, 0, "UC publication differs from its bound StoreLocal bytes/mask"};
+  }
+  for (unsigned byte = 0; byte < 8; ++byte)
+    if (mask[byte] && (completion.address + byte < store.memory.address ||
+        completion.address + byte - store.memory.address >= store.memory.mask.size()))
+      return {CheckStatus::Violation, 0, "UC publication enables bytes outside its StoreLocal record"};
+  auto result = checker_.observe_global(completion.address,
+      {completion.bytes.begin(), completion.bytes.end()}, mask,
+      std::vector<MemoryWriter>(8, store.memory.writer), {store.memory.writer}, time);
+  if (accepted(result)) {
+    store.qualified_uc = true;
+    store.external_effect = external_effect;
+  }
+  if (result && semantic_export_enabled_ && external_effect && !semantic_export_overflow_) {
+    if (semantic_loads_.size() + semantic_groups_.size() == max_semantic_events) {
+      semantic_export_overflow_ = true;
+    } else {
+      SemanticGroup record{completion.hart, completion.transaction_uid, completion.source.cycle,
+          UcRamSources::absent, 0, completion.address, completion.mask, {store.id},
+          {{store.id, enabled_byte_mask(store.memory.mask)}}, std::move(external_effect)};
+      semantic_groups_.push_back(std::move(record));
+    }
+  }
+  return result;
+}
+
+CheckResult Runtime::audit_native_uc_store(unsigned hart, const Active &active, RefProxy &reference) {
+#ifdef DIFFTEST_S_UC_NATIVE_V1
+  if (!active.uc_store_effect || !active.uc_store_effect->request.device)
+    return {}; // Device=0 retains the existing StoreEvent audit queue.
+  const auto &effect = *active.uc_store_effect;
+  const auto proof = uc_profile_.native_bridge->validate_qualified_effect(effect.request.key, effect.proof.endpoint_effect);
+  if (!proof) return proof;
+  if (!effect.request.write || !uc_word_is_declared(effect.request.address) || effect.request.mask != 0xff ||
+      !harts_[hart].frame_ref_steps || effect.request.allocation.uid != active.instruction.uid ||
+      effect.sample_cycle > active.retirement_source_cycle)
+    return invalid("device-classified RAM store lacks its independent REF step and prior qualified effect");
+  const auto store = harts_[hart].stores.find(effect.request.store_uid);
+  if (store == harts_[hart].stores.end() || store->second.verified)
+    return invalid("native RAM store REF audit was duplicated or lost its StoreLocal record");
+  if (!reference.store_commit)
+    return {CheckStatus::Unsupported, 0, "reference lacks ordinary store-log audit"};
+  uint64_t address = effect.request.address;
+  uint64_t data = 0;
+  uint8_t mask = effect.request.mask;
+  for (unsigned byte = 0; byte < 8; ++byte) data |= uint64_t(effect.bytes[byte]) << (8 * byte);
+  // These are observed comparison inputs to the ordinary independent REF log,
+  // exactly as in Difftest::do_store_check. They never initialize expected RAM.
+  const int mismatch = reference.store_commit(&address, &data, &mask);
+  if (mismatch || address != effect.request.address || mask != effect.request.mask)
+    return {CheckStatus::Violation, 0, "independent REF store address/data/mask differs from device-classified RAM store"};
+  return verify_store(hart, effect.request.store_uid, address, data, mask);
+#else
+  (void)hart; (void)active; (void)reference;
+  return {};
+#endif
+}
+
+CheckResult Runtime::capture_uc_completion(const UcCompletion &completion) {
+  if (completion.hart >= uc_profile_.sources.size())
+    return invalid("UC completion names an unregistered legacy hart");
+  const auto &sources = uc_profile_.sources[completion.hart];
+  auto result = validate_uc_source(completion.hart, completion.source,
+      completion.observation == UcObservationKind::WriteEffect ? sources.write_effect : sources.read_sample);
+  return result ? enqueue_uc_completion(completion) : result;
+}
+
+CheckResult Runtime::enqueue_uc_completion(const UcCompletion &completion,
+                                          std::shared_ptr<const UcJoinedEffect> external_effect) {
+  const auto binding = uc_transactions_.find({completion.hart, completion.transaction_uid});
+  if (binding == uc_transactions_.end())
+    return invalid("UC completion has no unique request binding");
+  const auto transaction = binding->second;
+  if (bool(transaction.external_request) != bool(external_effect))
+    return invalid("legacy and native UC transaction proofs cannot be mixed");
+  const auto &request = transaction.request;
+  if (completion.observation == UcObservationKind::UnqualifiedGrant)
+    return {CheckStatus::Unsupported, 0, "raw UC grant has no read-sample or write-effect qualification"};
+  const bool store = request.kind == UcAccessKind::Store;
+  if (completion.observation != (store ? UcObservationKind::WriteEffect : UcObservationKind::ReadSample) ||
+      completion.denied || completion.corrupt)
+    return {CheckStatus::Unsupported, 0, "UC completion kind or error is outside scalar RAM coverage"};
+  if (completion.address != request.address || completion.mask != request.mask ||
+      completion.source.cycle < request.source.cycle)
+    return invalid("UC completion address, mask or time differs from its bound request");
+  if (transport_watermark_ && completion.source.cycle <= *transport_watermark_)
+    return invalid("UC physical effect arrived behind the effective memory watermark");
+  CheckResult result;
+  timestamp(completion.source.cycle);
+  auto &hart = harts_[completion.hart];
+  if (store) {
+    observe_write(completion.source.cycle, completion.hart, completion.address, mask_bytes(completion.mask, 8), true);
+    result = events_.emplace(EventKey{completion.source.cycle, 4, completion.transaction_uid, completion.hart},
+        [this, transaction, completion, external_effect](ObservationTime time) {
+#ifdef DIFFTEST_S_UC_NATIVE_V1
+          if (external_effect) {
+            const auto proof = uc_profile_.native_bridge->validate_memory_effect(
+                external_effect->request.key, external_effect->proof.endpoint_effect);
+            if (!proof) return proof;
+          }
+#endif
+          return publish_uc_store(transaction, completion, time, external_effect);
+        }).second ? CheckResult{} : invalid("duplicate UC publication ordering key");
+  } else {
+    const auto live = hart.allocations.find(request.robidx);
+    if (live == hart.allocations.end() || live->second != transaction.allocation || hart.done)
+      return invalid("UC read completion refers to a stale allocation generation");
+    if (hart.loads.count(transaction.allocation))
+      return invalid("UC read duplicates an existing final-attempt load sample");
+    auto load = std::make_shared<Load>();
+    load->operation.id = transaction.allocation;
+    load->operation.attempt = hart.attempts[transaction.allocation]++;
+    load->operation.address = completion.address & ~UINT64_C(15);
+    const size_t offset = completion.address - load->operation.address;
+    load->operation.byte_mask = mask_bytes(uint64_t(completion.mask) << offset, 16);
+    load->operation.load = true;
+    load->operation.source_kind = ReadSourceKind::ModeledWitness;
+    load->actual.resize(16);
+    std::copy(completion.bytes.begin(), completion.bytes.end(), load->actual.begin() + offset);
+    load->source_id = completion.source.source_id;
+    load->source_sequence = completion.source.sequence;
+    load->source_cycle = completion.source.cycle;
+    load->qualified_uc = true;
+    load->external_effect = std::move(external_effect);
+    hart.loads[transaction.allocation] = load;
+    loads_by_cycle_[completion.source.cycle].push_back(load);
+    result = events_.emplace(EventKey{completion.source.cycle, 1, transaction.allocation.uid, completion.hart},
+        [this, load](ObservationTime time) { return observe(load, time); }).second
+        ? CheckResult{} : invalid("duplicate UC read ordering key");
+  }
+  if (result)
+    uc_transactions_.erase(binding);
+  return result;
+}
+
+CheckResult Runtime::consume_native_uc_request(const UcBoundRequest &bound) {
+#ifdef DIFFTEST_S_UC_NATIVE_V1
+  auto result = uc_profile_.native_bridge->validate_position(bound.source);
+  if (!result) return result;
+  if (bound.source.producer.name_space != SFUZZ_UC_CORE_HART_EXTERNAL ||
+      bound.source.producer.role != SFUZZ_UC_CORE || bound.source.producer.hart != bound.key.hart ||
+      bound.key.epoch != bound.source.epoch)
+    return invalid("native request has a relabeled external source");
+  UcRequest request;
+  request.hart = bound.key.hart;
+  request.transaction_uid = bound.key.transaction_uid;
+  request.robidx = bound.robidx;
+  request.allocation_uid = bound.allocation.uid;
+  request.kind = bound.write ? UcAccessKind::Store : UcAccessKind::Load;
+  request.store_uid = bound.store_uid;
+  request.address = bound.address;
+  request.mask = bound.mask;
+  request.source.cycle = bound.source.cycle; // No legacy source ID is fabricated.
+  if (bound.allocation.hart != request.hart || bound.allocation.epoch || bound.allocation.subaccess)
+    return invalid("native request does not identify the scalar Runtime allocation");
+  result = record_uc_request(request, std::make_shared<UcBoundRequest>(bound));
+  if (result) ++native_bound_requests_;
+  return result;
+#else
+  (void)bound;
+  return {CheckStatus::Unsupported, 0, "native UC is not compiled"};
+#endif
+}
+
+CheckResult Runtime::consume_native_uc_effect(const UcJoinedEffect &effect) {
+#ifdef DIFFTEST_S_UC_NATIVE_V1
+  const auto &position = effect.proof.endpoint_effect;
+  auto result = uc_profile_.native_bridge->validate_memory_effect(effect.request.key, position);
+  if (!result) return result;
+  const auto binding = uc_transactions_.find({effect.request.key.hart, effect.request.key.transaction_uid});
+  if (binding == uc_transactions_.end() || !binding->second.external_request ||
+      binding->second.allocation != effect.request.allocation ||
+      !(binding->second.external_request->source == effect.request.source) ||
+      position.producer.name_space != SFUZZ_UC_GLOBAL_EXTERNAL ||
+      position.producer.hart != SFUZZ_UC_GLOBAL_HART || position.producer.role != SFUZZ_UC_ENDPOINT ||
+      effect.sample_cycle != position.cycle || effect.sample_edge != position.edge)
+    return invalid("native effect does not retain its joined allocation and global source position");
+  UcCompletion completion;
+  completion.hart = effect.request.key.hart;
+  completion.transaction_uid = effect.request.key.transaction_uid;
+  completion.observation = effect.request.write ? UcObservationKind::WriteEffect : UcObservationKind::ReadSample;
+  completion.address = effect.request.address;
+  completion.mask = effect.request.mask;
+  completion.bytes = effect.bytes;
+  completion.source.cycle = effect.sample_cycle;
+  result = enqueue_uc_completion(completion, std::make_shared<UcJoinedEffect>(effect));
+  if (result) ++native_queued_effects_;
+  return result;
+#else
+  (void)effect;
+  return {CheckStatus::Unsupported, 0, "native UC is not compiled"};
+#endif
+}
+
+CheckResult Runtime::capture_native_uc(const std::vector<DiffTestState *> &states) {
+  if (uc_profile_.kind != UcRamProfileKind::LinkNanExtraMemNative)
+    return {};
+#ifdef DIFFTEST_S_UC_NATIVE_V1
+  auto &bridge = *uc_profile_.native_bridge;
+  if (sfuzz_uc_raw_poisoned_v1() || !sfuzz_uc_raw_drain_v1()) {
+    const auto state = bridge.snapshot();
+    return state.status ? invalid("native UC raw transport is poisoned or failed to drain") : state.status;
+  }
+  std::vector<uint64_t> frames;
+  for (const auto *state : states) frames.push_back(state->memory_time.timestamp);
+  auto result = bridge.bind_frame(frames,
+      [this](unsigned hart, uint16_t rob, uint64_t store_uid, bool write, OperationId &allocation) -> CheckResult {
+        if (hart >= harts_.size() || harts_[hart].done)
+          return invalid("native request names an inactive hart");
+        const auto live = harts_[hart].allocations.find(rob);
+        if (live == harts_[hart].allocations.end())
+          return invalid("native request has no same-frame live allocation");
+        allocation = live->second;
+        if (write) {
+          const auto store = harts_[hart].stores.find(store_uid);
+          if (store == harts_[hart].stores.end() || store->second.id != allocation)
+            return invalid("native request StoreIdentity differs from its live allocation");
+        } else if (store_uid) {
+          return invalid("native read request carries a store UID");
+        }
+        return {};
+      });
+  if (!result) return result;
+  result = bridge.drain_requests([this](const UcBoundRequest &request) { return consume_native_uc_request(request); });
+  if (!result) return result;
+  // These sinks return Pass only after an actual Runtime obligation or effect
+  // has been recorded; Bridge may then release its semantic watermark hold.
+  result = bridge.drain_effects([this](const UcJoinedEffect &effect) { return consume_native_uc_effect(effect); });
+  if (!native_uc_startup_logged_) {
+    print_native_uc_diagnostics("first_capture");
+    native_uc_startup_logged_ = true;
+  }
+  return result;
+#else
+  (void)states;
+  return {CheckStatus::Unsupported, 0, "native UC is not compiled"};
+#endif
+}
+
+std::optional<uint64_t> Runtime::uc_effective_watermark(std::optional<uint64_t> legacy) const {
+#ifdef DIFFTEST_S_UC_NATIVE_V1
+  if (uc_profile_.kind == UcRamProfileKind::LinkNanExtraMemNative)
+    return uc_profile_.native_bridge->effective_watermark(legacy);
+#endif
+  return legacy;
+}
+
+void Runtime::print_native_uc_diagnostics(const char *phase) const {
+#ifdef DIFFTEST_S_UC_NATIVE_V1
+  if (uc_profile_.kind != UcRamProfileKind::LinkNanExtraMemNative || !uc_profile_.native_bridge)
+    return;
+  const auto state = uc_profile_.native_bridge->snapshot();
+  const auto producers = uc_profile_.native_bridge->producer_watermarks();
+  const auto verified = std::count_if(producers.begin(), producers.end(), [](const auto &producer) {
+    return producer.reset_verified;
+  });
+  const auto effective = uc_effective_watermark(source_boundary().snapshot().closed_through);
+  std::ostringstream output;
+  output << "UC_NATIVE_STATE_V1 {\"phase\":";
+  json_string(output, phase);
+  output << ",\"external_producers\":" << producers.size() << ",\"reset_verified\":" << verified
+         << ",\"bound_requests\":" << native_bound_requests_ << ",\"queued_effects\":" << native_queued_effects_
+         << ",\"pending_records\":" << state.pending_records << ",\"pending_transactions\":" << state.pending_transactions
+         << ",\"pending_prefixes\":" << state.pending_prefixes
+         << ",\"unacknowledged_requests\":" << state.unacknowledged_requests
+         << ",\"unacknowledged_effects\":" << state.unacknowledged_effects;
+  const auto watermark = [&](const char *name, std::optional<uint64_t> cycle) {
+    output << ",\"" << name << "\":";
+    if (cycle) output << *cycle;
+    else output << "null";
+  };
+  watermark("raw_closed", state.raw_closed_through);
+  watermark("joined_closed", state.fully_joined_closed_through);
+  watermark("effective_closed", effective);
+  output << '}';
+  std::puts(output.str().c_str());
+  std::fflush(stdout);
+#else
+  (void)phase;
+#endif
+}
+
+CheckResult Runtime::capture_uc_inputs() {
+  while (!uc_inputs_.empty()) {
+    const auto result = std::visit([this](const auto &event) -> CheckResult {
+      if constexpr (std::is_same_v<std::decay_t<decltype(event)>, UcRequest>)
+        return bind_uc_request(event);
+      else
+        return capture_uc_completion(event);
+    }, uc_inputs_.front());
+    if (!result)
+      return failure_ = result;
+    uc_inputs_.pop_front();
+  }
+  return {};
+}
+
+bool Runtime::independently_execute_skipped_uc(unsigned hart) const {
+  return coverage_ && failure_ && hart < harts_.size() && harts_[hart].active && harts_[hart].active->qualified_uc;
 }
 
 bool Runtime::read_reference_memory(unsigned hart, uint64_t address, size_t size, uint8_t *bytes) const {
@@ -229,6 +797,8 @@ CheckResult Runtime::allocate(unsigned hart, uint16_t rob) {
       for (auto uid = uids.begin(); uid != uids.end();) {
         auto store = h.stores.find(*uid);
         if (store != h.stores.end() && !store->second.recorded) {
+          if (store->second.effect_recorded)
+            return invalid("physically published RAM store allocation reused before StoreLocal");
           store_uids_.erase(store->second.id);
           h.stores.erase(store);
           uid = uids.erase(uid);
@@ -261,6 +831,14 @@ CheckResult Runtime::allocate(unsigned hart, uint16_t rob) {
 CheckResult Runtime::observe(const std::shared_ptr<Load> &load, ObservationTime time) {
   if (load->cancelled)
     return {};
+#ifdef DIFFTEST_S_UC_NATIVE_V1
+  if (load->external_effect) {
+    const auto &effect = *load->external_effect;
+    const auto proof = uc_profile_.native_bridge->validate_memory_effect(effect.request.key,
+                                                                       effect.proof.endpoint_effect);
+    if (!proof) return proof;
+  }
+#endif
   load->operation.read_time = time;
   // Physical tags remain diagnostics. The read-value witness is derived from
   // the fixed-order LocalMem/GlobalMem model, including late local stores.
@@ -332,9 +910,29 @@ CheckResult Runtime::complete_group(Group &group, ObservationTime time) {
       } else if (!semantic_export_overflow_) {
         SemanticGroup record{group.hart, group.id, group.cycle, group.source_id, group.source_sequence,
                              group.address, enabled_byte_mask(architectural_mask), {}};
-        for (const auto &member : ordered_members)
+        for (const auto &member : ordered_members) {
           record.members.push_back(member.first);
-        semantic_groups_.push_back(std::move(record));
+          record.visible_member_masks.emplace(member.first, 0);
+        }
+        for (size_t byte = 0; byte < architectural_mask.size(); ++byte) {
+          if (!architectural_mask[byte])
+            continue;
+          const auto writer = h.stores.find(group.writers[byte]);
+          if (writer == h.stores.end() || !record.visible_member_masks.count(writer->second.id)) {
+            semantic_export_overflow_ = true;
+            break;
+          }
+          const auto &logical = writer->second.operation;
+          const uint64_t address = group.address + byte;
+          if (address < logical.address || address - logical.address >= logical.byte_mask.size() ||
+              !logical.byte_mask[address - logical.address] || address - logical.address >= 64) {
+            semantic_export_overflow_ = true;
+            break;
+          }
+          record.visible_member_masks.at(writer->second.id) |= UINT64_C(1) << (address - logical.address);
+        }
+        if (!semantic_export_overflow_)
+          semantic_groups_.push_back(std::move(record));
       }
     }
     ranks_consumed_ = completed.size();
@@ -342,12 +940,17 @@ CheckResult Runtime::complete_group(Group &group, ObservationTime time) {
   }
   return result;
 }
-void Runtime::observe_write(uint64_t cycle, unsigned hart, uint64_t address, const std::vector<uint8_t> &mask) {
+void Runtime::observe_write(uint64_t cycle, unsigned hart, uint64_t address, const std::vector<uint8_t> &mask,
+                            bool qualified_uc) {
   auto &writes = writes_by_cycle_[cycle];
   for (const auto &other : writes)
-    if (other.hart != hart && overlap(address, mask, other.address, other.mask))
-      unsupported("INCOMPLETE_ORDER: simultaneous cross-hart writes lack arbitration order");
-  writes.push_back({hart, address, mask});
+    if (overlap(address, mask, other.address, other.mask)) {
+      if (qualified_uc || other.qualified_uc)
+        unsupported("INCOMPLETE_ORDER: overlapping same-cycle UC writes lack arbitration order");
+      else if (other.hart != hart)
+        unsupported("INCOMPLETE_ORDER: simultaneous cross-hart writes lack arbitration order");
+    }
+  writes.push_back({hart, address, mask, qualified_uc});
 }
 
 CheckResult Runtime::observe_atomic(unsigned hart, const std::shared_ptr<Atomic> &atomic, ObservationTime time) {
@@ -628,6 +1231,10 @@ CheckResult Runtime::capture(const std::vector<DiffTestState *> &states) {
     return failure_;
   if (!covered())
     return coverage_;
+  if (uc_profile_.kind == UcRamProfileKind::LinkNanExtraMemNative && !uc_memory_initialized_) {
+    const auto initialized = seed_uc_zero_pages();
+    if (!initialized) return failure_ = initialized;
+  }
 #ifdef CONFIG_DIFFTEST_SOURCEPREFIXEVENT
   const auto source = source_boundary().snapshot();
   if (!source.status)
@@ -722,6 +1329,16 @@ CheckResult Runtime::capture(const std::vector<DiffTestState *> &states) {
         return invalid("local commit arrived behind completed transport watermark");
       if (store.recorded)
         return invalid("duplicate local store commit");
+      if (store.effect_recorded) {
+        const auto local_mask = mask_bytes(event.mask, 16);
+        if (store.memory.address != event.addr || store.memory.mask != local_mask)
+          return {CheckStatus::Violation, 0, "late StoreLocal address/mask differs from its physical RAM effect"};
+        for (size_t byte = 0; byte < local_mask.size(); ++byte)
+          if (local_mask[byte] && store.memory.bytes[byte] != event.data[byte])
+            return {CheckStatus::Violation, 0, "late StoreLocal bytes differ from its physical RAM effect"};
+        store.recorded = true;
+        continue;
+      }
       store.memory.po = store.id.uid;
       store.memory.address = event.addr;
       store.memory.bytes.assign(event.data, event.data + 16);
@@ -841,6 +1458,12 @@ CheckResult Runtime::capture(const std::vector<DiffTestState *> &states) {
     if (!atomic_result)
       return atomic_result;
   }
+  auto uc_result = capture_native_uc(states);
+  if (!uc_result)
+    return failure_ = uc_result;
+  uc_result = capture_uc_inputs();
+  if (!uc_result)
+    return uc_result;
   // Audit after collecting every hart: the result must not depend on which
   // hart's packet happened to be visited first in this capture.
   for (uint64_t cycle : touched_cycles_) {
@@ -853,9 +1476,12 @@ CheckResult Runtime::capture(const std::vector<DiffTestState *> &states) {
       if (loads != loads_by_cycle_.end())
         for (const auto &weak : loads->second) {
           auto load = weak.lock();
-          if (load && load->operation.id.hart != write.hart && !load->cancelled &&
+          if (load && (load->operation.id.hart != write.hart || load->qualified_uc || write.qualified_uc) &&
+              !load->cancelled &&
               overlap(write.address, write.mask, load->operation.address, load->operation.byte_mask))
-            load->coverage_reason = "INCOMPLETE_ORDER: simultaneous cross-hart read/write lacks arbitration order";
+            load->coverage_reason = (load->qualified_uc || write.qualified_uc)
+                ? "INCOMPLETE_ORDER: overlapping same-cycle UC read/write lacks arbitration order"
+                : "INCOMPLETE_ORDER: simultaneous cross-hart read/write lacks arbitration order";
         }
       if (reserved != reserved_reads_by_cycle_.end())
         for (const auto &weak : reserved->second) {
@@ -873,9 +1499,10 @@ CheckResult Runtime::capture(const std::vector<DiffTestState *> &states) {
 #ifdef CONFIG_DIFFTEST_SOURCEPREFIXEVENT
   // The slowest actual producer prefix determines closure, including gated
   // clocks and delivery counts. No host callback order supplies a memory rank.
-  if (!source.closed_through)
+  const auto memory_closed = uc_effective_watermark(source.closed_through);
+  if (!memory_closed)
     return {};
-  auto result = advance(*source.closed_through);
+  auto result = advance(*memory_closed);
 #else
   // Older event producers cannot earn a certified final source boundary.
   auto result = advance(latest_cycle_ > 3 ? latest_cycle_ - 3 : 0);
@@ -914,7 +1541,21 @@ CheckResult Runtime::before_commit(unsigned hart, unsigned port, DiffTestState &
       excluded_io = store != h.stores.end() && store->second.excluded_io;
     }
   }
-  if ((commit.skip && !excluded_io) || commit.special ||
+  bool qualified_uc = false;
+  if (commit.skip && uc_profile_.kind != UcRamProfileKind::Disabled) {
+    if (commit.isLoad) {
+      const auto load = h.loads.find(allocation->second);
+      qualified_uc = load != h.loads.end() && load->second->qualified_uc;
+    } else if (commit.isStore) {
+      const auto members = h.instruction_stores.find(allocation->second);
+      if (members != h.instruction_stores.end() && members->second.size() == 1) {
+        const auto store = h.stores.find(members->second.front());
+        qualified_uc = store != h.stores.end() && store->second.qualified_uc;
+      }
+    }
+  }
+  if ((commit.skip && !excluded_io && !qualified_uc) || commit.special ||
+      (qualified_uc && (commit.fpwen || commit.vecwen || commit.v0wen || is_atomic)) ||
       (commit.nFused && (commit.skip || commit.isLoad || commit.isStore || !scalar_alu(commit.instr))))
     return unsupported("retirement lacks complete semantics: pc=" + std::to_string(commit.pc) +
                        " instr=" + std::to_string(commit.instr) + " skip=" + std::to_string(commit.skip) +
@@ -924,10 +1565,16 @@ CheckResult Runtime::before_commit(unsigned hart, unsigned port, DiffTestState &
   if (unsupported_instruction != h.unsupported_allocations.end())
     return unsupported(unsupported_instruction->second);
   Active active;
+  active.qualified_uc = qualified_uc;
   active.instruction.hart = hart;
   active.instruction.uid = allocation->second.uid;
   active.instruction.pc = commit.pc;
   active.instruction.instruction = commit.instr;
+#ifdef CONFIG_DIFFTEST_SOURCEPREFIXEVENT
+  active.retirement_source_cycle = commit.timestamp;
+  active.retirement_source_id = commit.sourceId;
+  active.retirement_source_sequence = commit.sourceSequence;
+#endif
   // The simulator's explicit exit marker is not an ISA memory operation.
   const bool exit_marker = (commit.instr & 0x7f) == 0x6b && state.trap.hasTrap && state.trap.pc == commit.pc;
   if (exit_marker) {
@@ -1024,20 +1671,45 @@ CheckResult Runtime::before_commit(unsigned hart, unsigned port, DiffTestState &
     return invalid("scalar retirement unexpectedly combines load and store effects");
   if (load_event.valid && (load_event.isAtomic || load_event.isVLoad || commit.fpwen))
     return unsupported("atomic, floating-point or vector memory instruction lacks runtime coverage");
-  if (load_event.valid && load_event.isLoad) {
+  // The actual ROB suppresses LoadEvent.valid for skipped loads, while its
+  // commit.isLoad classification remains present. Only qualified RV64 LD can
+  // obtain its access from the exact bound sample in that ABI case.
+  const bool uc_ld_without_metadata = qualified_uc && commit.skip && commit.isLoad && !load_event.valid;
+  if (uc_ld_without_metadata && (commit.isRVC || (commit.instr & 0x707f) != 0x3003))
+    return unsupported("skipped UC load without legacy metadata requires an uncompressed RV64 LD");
+  if ((load_event.valid && load_event.isLoad) || uc_ld_without_metadata) {
     auto sample = h.loads.find(allocation->second);
     if (sample == h.loads.end() || !sample->second->observed)
       return pending("retired load awaits ordered final-attempt sample: hart=" + std::to_string(hart) +
                      " pc=" + std::to_string(commit.pc) + " rob=" + std::to_string(commit.tlbId) + " uid=" +
                      std::to_string(allocation->second.uid) + " present=" + std::to_string(sample != h.loads.end()) +
+                     " sampleCycle=" + (sample == h.loads.end() ? "absent" : std::to_string(sample->second->source_cycle)) +
+                     " memoryClosed=" + (transport_watermark_ ? std::to_string(*transport_watermark_) : "absent") +
                      " sourceClock=" + std::to_string(latest_cycle_) + " pending=" + ordering_pending_);
     auto load = sample->second;
+#ifdef DIFFTEST_S_UC_NATIVE_V1
+    if (load->external_effect) {
+      const auto &effect = *load->external_effect;
+      const auto proof = uc_profile_.native_bridge->validate_qualified_effect(effect.request.key,
+                                                                           effect.proof.endpoint_effect);
+      if (!proof) return proof;
+    }
+#endif
     if (!load->coverage_reason.empty())
       return unsupported(load->coverage_reason);
-    if (load_event.opType > 6 || (load_event.opType & 3) > 3 || load_event.paddr2Valid)
+    if (!uc_ld_without_metadata &&
+        (load_event.opType > 6 || (load_event.opType & 3) > 3 || load_event.paddr2Valid))
       return unsupported("scalar load operation or split access lacks runtime coverage");
-    const size_t size = size_t(1) << (load_event.opType & 3);
-    const uint64_t address = load_event.paddr;
+    const size_t size = uc_ld_without_metadata ? 8 : size_t(1) << (load_event.opType & 3);
+    uint64_t address = uc_ld_without_metadata ? 0 : load_event.paddr;
+    if (uc_ld_without_metadata) {
+      if (load->operation.byte_mask.size() != 16 || load->operation.address % 16 != 0)
+        return invalid("qualified UC LD sample has an invalid physical block");
+      const uint64_t mask = enabled_byte_mask(load->operation.byte_mask);
+      if (mask != 0x00ff && mask != 0xff00)
+        return invalid("qualified UC LD sample must cover exactly one aligned eight-byte access");
+      address = load->operation.address + (mask == 0xff00 ? 8 : 0);
+    }
     if (address < load->operation.address || address - load->operation.address + size > 16 || address % size != 0 ||
         !in_pmem(address) || !in_pmem(address + size - 1))
       return unsupported("scalar load range is unaligned, split or outside modeled memory");
@@ -1072,6 +1744,19 @@ CheckResult Runtime::before_commit(unsigned hart, unsigned port, DiffTestState &
     auto &store = h.stores.at(found->second.front());
     if (!store.recorded)
       return pending("retired store awaits its local commit observation");
+    if (store.external_effect) {
+#ifdef DIFFTEST_S_UC_NATIVE_V1
+      if (store.external_effect->request.device) {
+        if (commit.isRVC || (commit.instr & 0x707f) != 0x3023)
+          return unsupported("device-classified ordinary RAM store requires an uncompressed RV64 SD");
+        const auto &effect = *store.external_effect;
+        const auto proof = uc_profile_.native_bridge->validate_qualified_effect(effect.request.key,
+                                                                             effect.proof.endpoint_effect);
+        if (!proof) return proof;
+        active.uc_store_effect = store.external_effect;
+      }
+#endif
+    }
     active.instruction.memory.push_back(store.operation);
   }
   active.instruction_count = unsigned(commit.nFused) + 1;
@@ -1173,6 +1858,9 @@ CheckResult Runtime::after_commit(unsigned hart, RefProxy &reference) {
     if (!result)
       return result;
   }
+  const auto native_store_audit = audit_native_uc_store(hart, active, reference);
+  if (!native_store_audit)
+    return native_store_audit;
   if (active.atomic && active.atomic->write_seen) {
     auto atomic = active.atomic;
     uint64_t address = atomic->address;
@@ -1247,6 +1935,44 @@ CheckResult Runtime::after_commit(unsigned hart, RefProxy &reference) {
     h.last_retired_uid = instruction.uid;
   }
   if (semantic_export_enabled_) {
+    const size_t accepted_instructions = 1 + fused_tail.size();
+    if (accepted_instructions > UINT64_MAX - h.accepted_retirement_instructions)
+      semantic_retirements_incomplete_ = true;
+    else
+      h.accepted_retirement_instructions += accepted_instructions;
+    // Record every successfully checked instruction, including fused scalar
+    // tails verified against the independent REF observer. The one physical
+    // commit packet remains the source position of each fused instruction.
+    const auto record_retirement = [&](const RetiredInstruction &instruction) {
+      if (semantic_retirements_incomplete_)
+        return;
+      if (!active.retirement_source_cycle || !active.retirement_source_sequence ||
+          semantic_retirements_.size() >= max_semantic_events ||
+          h.semantic_retirement_ordinal == UINT64_MAX) {
+        semantic_retirements_incomplete_ = true;
+        return;
+      }
+      semantic_retirements_.push_back({{instruction.hart, 0, instruction.uid, 0},
+          instruction.pc, instruction.instruction, active.retirement_source_cycle,
+          active.retirement_source_id, active.retirement_source_sequence,
+          h.semantic_retirement_ordinal++});
+    };
+    record_retirement(active.instruction);
+    for (const auto &tail : fused_tail)
+      record_retirement(tail);
+    // This PC and byte footprint come from the independently accepted retired
+    // instruction, not from a nearby retirement cycle or DUT load data.
+    for (const auto &operation : active.instruction.memory) {
+      if (operation.atomic || operation.lr || operation.sc ||
+          operation.load == operation.store || semantic_export_overflow_)
+        continue;
+      if (semantic_retired_memories_.size() >= max_semantic_events ||
+          !semantic_retired_memories_.emplace(operation.id, SemanticRetiredMemory{
+              active.instruction.pc, active.instruction.instruction,
+              active.retirement_source_cycle, operation.attempt, operation.address,
+              enabled_byte_mask(operation.byte_mask)}).second)
+        semantic_export_overflow_ = true;
+    }
     if (active.load && !active.atomic && active.load->observed && !active.load->cancelled) {
       if (semantic_loads_.size() + semantic_groups_.size() == max_semantic_events) {
         semantic_export_overflow_ = true;
@@ -1254,7 +1980,7 @@ CheckResult Runtime::after_commit(unsigned hart, RefProxy &reference) {
         const auto &load = *active.load;
         semantic_loads_.push_back({load.operation.id, load.operation.attempt, load.source_cycle, load.source_id,
                                    load.source_sequence, load.operation.address,
-                                   enabled_byte_mask(load.operation.byte_mask)});
+                                   enabled_byte_mask(load.operation.byte_mask), load.external_effect});
       }
     }
     for (const auto &operation : active.instruction.memory)
@@ -1287,6 +2013,35 @@ void Runtime::record_checked_fused_retirement(Active &active) {
   checked_fused_instruction_count_ += record.reference_instructions.size();
   checked_fused_retirements_.push_back(std::move(record));
 }
+bool Runtime::native_uc_store_audit_pending(unsigned hart) const {
+#ifdef DIFFTEST_S_UC_NATIVE_V1
+  const auto &active = harts_.at(hart).active;
+  return uc_profile_.kind == UcRamProfileKind::LinkNanExtraMemNative && active &&
+         active->uc_store_effect && active->uc_store_effect->request.device;
+#else
+  (void)hart;
+  return false;
+#endif
+}
+
+CheckResult Runtime::legacy_store_reference_ready(unsigned hart, uint64_t uid) const {
+  if (uc_profile_.kind != UcRamProfileKind::LinkNanExtraMemNative)
+    return {};
+  if (!covered())
+    return coverage_;
+  const auto &h = harts_.at(hart);
+  const auto found = h.stores.find(uid);
+  if (found == h.stores.end())
+    return invalid("legacy store audit lacks an exact StoreIdentity");
+  const auto &store = found->second;
+  if (store.verified)
+    return invalid("duplicate legacy REF store audit");
+  if (!store.recorded || store.id.uid > h.last_retired_uid ||
+      (native_uc_store_audit_pending(hart) && store.id.uid >= h.active->instruction.uid))
+    return pending("legacy store has not yet retired in independent REF");
+  return {};
+}
+
 CheckResult Runtime::verify_store(unsigned hart, uint64_t uid, uint64_t address, uint64_t data, uint8_t mask) {
   if (!covered())
     return coverage_;
@@ -1349,6 +2104,16 @@ CheckResult Runtime::finish() {
     return pending("INCOMPLETE_RUN: not every participating hart has terminated");
   if (!covered())
     return coverage_;
+  if (!uc_inputs_.empty() || !uc_transactions_.empty())
+    return pending("INCOMPLETE_RUN: UC requests await qualified completions");
+#ifdef DIFFTEST_S_UC_NATIVE_V1
+  if (uc_profile_.kind == UcRamProfileKind::LinkNanExtraMemNative) {
+    if (sfuzz_uc_raw_poisoned_v1())
+      return invalid("native UC raw transport is poisoned");
+    const auto complete = uc_profile_.native_bridge->finish();
+    if (!complete) return complete;
+  }
+#endif
 #ifdef CONFIG_DIFFTEST_SOURCEPREFIXEVENT
   const auto source = source_boundary().snapshot();
   if (!source.status)
@@ -1368,7 +2133,9 @@ CheckResult Runtime::finish() {
   }
   for (const auto &h: harts_)
     for (const auto &entry: h.stores)
-      if (entry.second.recorded && entry.second.id.uid > h.end_uid)
+      if (entry.second.effect_recorded && !entry.second.recorded)
+        return pending("INCOMPLETE_RUN: physical RAM write still awaits its bound StoreLocal");
+      else if (entry.second.recorded && entry.second.id.uid > h.end_uid)
         return {CheckStatus::Unsupported, 0, "local store beyond the selected hart termination prefix"};
   for (auto &h: harts_)
     for (auto &entry: h.loads) {
@@ -1385,7 +2152,10 @@ CheckResult Runtime::finish() {
   // Hart retirement does not end memory execution: cache misses may still
   // complete later. Never close future source cycles while stores are pending.
 #ifdef CONFIG_DIFFTEST_SOURCEPREFIXEVENT
-  auto result = advance(*source.closed_through);
+  const auto memory_closed = uc_effective_watermark(source.closed_through);
+  if (!memory_closed || *memory_closed < last_effect_cycle_)
+    return pending("INCOMPLETE_RUN: native/legacy source or joined effect prefixes remain open");
+  auto result = advance(*memory_closed);
 #else
   auto result = advance(latest_cycle_ > 3 ? latest_cycle_ - 3 : 0);
 #endif
@@ -1413,6 +2183,7 @@ bool Runtime::print_final_statistics() {
   if (!finalized_ || !failure_ || !covered() || statistics_emitted_)
     return false;
   statistics_emitted_ = true;
+  print_native_uc_diagnostics("final");
   const auto &memory_statistics = checker_.memory_statistics();
   const auto &ppo_statistics = checker_.ppo_statistics();
   for (unsigned hart = 0; hart < harts_.size(); ++hart) {
@@ -1464,6 +2235,9 @@ bool Runtime::print_observed_prefix_final() {
   if (!source.status || !source.catalog_complete || !source.closed_through ||
       *source.closed_through < last_effect_cycle_)
     return false;
+  const auto certified_closed = uc_effective_watermark(source.closed_through);
+  if (!certified_closed || *certified_closed < last_effect_cycle_)
+    return false;
   const size_t pending_events = events_.size() + source.pending_prefixes;
   const size_t pending_retirements = checker_.pending_retirements();
   const size_t pending_loads = checker_.pending_loads();
@@ -1481,7 +2255,7 @@ bool Runtime::print_observed_prefix_final() {
     marker << "{\"hart\":" << hart << ",\"arch_compares\":" << harts_[hart].arch_compares
            << ",\"ref_instructions\":" << harts_[hart].ref_instructions << '}';
   }
-  marker << "],\"watermarked\":1,\"closed_through\":" << *source.closed_through
+  marker << "],\"watermarked\":1,\"closed_through\":" << *certified_closed
          << ",\"last_effect_cycle\":" << last_effect_cycle_
          << ",\"pending_events\":" << pending_events
          << ",\"pending_retirements\":" << pending_retirements
@@ -1519,15 +2293,35 @@ bool Runtime::export_semantic_observed_prefix() const {
       std::all_of(producers.begin(), producers.end(), [&](const SourceProducerWatermark &producer) {
         return producer.closed_through && *producer.closed_through >= last_effect_cycle_;
       });
+  const bool native = uc_profile_.kind == UcRamProfileKind::LinkNanExtraMemNative;
+  const auto certified_closed = uc_effective_watermark(source.closed_through);
+  bool complete_external = !native;
+#ifdef DIFFTEST_S_UC_NATIVE_V1
+  std::vector<UcRawWatermark> external_producers;
+  if (native) {
+    external_producers = uc_profile_.native_bridge->producer_watermarks();
+    const auto boundary = uc_profile_.native_bridge->snapshot();
+    complete_external = bool(uc_profile_.native_bridge->finish()) && boundary.catalog_complete &&
+        certified_closed && *certified_closed >= last_effect_cycle_ &&
+        external_producers.size() == boundary.expected_producers &&
+        producers.size() == 4 * 124 && std::all_of(external_producers.begin(), external_producers.end(),
+            [&](const UcRawWatermark &entry) {
+              return entry.reset_verified && entry.closed_through &&
+                     *entry.closed_through >= *certified_closed;
+            });
+  }
+#endif
   const unsigned epoch = source.reset_epoch_verified ? 1 : 0;
   bool invalid_event_source = false;
   bool invalid_physical_address = false;
   bool duplicate_logical_identity = false;
   bool missing_checked_store = false;
+  bool missing_retirement_origin = false;
   bool invalid_checked_fused_source = false;
   std::set<std::tuple<unsigned, unsigned, uint64_t>> used_source_positions;
+  std::set<std::pair<std::string, uint64_t>> used_external_positions;
   std::set<std::tuple<unsigned, uint64_t, uint32_t, uint32_t>> used_load_ids;
-  std::set<std::pair<unsigned, uint64_t>> used_group_ids;
+  std::set<std::tuple<bool, unsigned, uint64_t>> used_group_ids;
   std::vector<const SemanticLoad *> checked_loads;
   std::vector<const SemanticGroup *> checked_groups;
   std::vector<const CheckedFusedRetirement *> checked_fused_retirements;
@@ -1539,6 +2333,29 @@ bool Runtime::export_semantic_observed_prefix() const {
            found->closed_through && cycle <= *found->closed_through &&
            used_source_positions.emplace(hart, id, sequence).second;
   };
+  [[maybe_unused]] const auto external_source_is_recorded = [&](const std::shared_ptr<const UcJoinedEffect> &effect) {
+#ifdef DIFFTEST_S_UC_NATIVE_V1
+    if (!native || !effect || !complete_external)
+      return false;
+    const auto &position = effect->proof.endpoint_effect;
+    const auto mark = std::find_if(external_producers.begin(), external_producers.end(), [&](const auto &entry) {
+      return entry.producer == position.producer;
+    });
+    return bool(uc_profile_.native_bridge->validate_qualified_effect(effect->request.key, position)) &&
+        position.producer.name_space == SFUZZ_UC_GLOBAL_EXTERNAL &&
+        position.producer.hart == SFUZZ_UC_GLOBAL_HART && position.producer.role == SFUZZ_UC_ENDPOINT &&
+        position.epoch == 1 && effect->request.key.epoch == 1 &&
+        effect->sample_cycle == position.cycle && effect->sample_edge == position.edge &&
+        effect->sample_edge == (effect->request.write ? 0u : 1u) &&
+        effect->request.mask == 0xff && uc_word_is_declared(effect->request.address) &&
+        mark != external_producers.end() && mark->event_sequence >= position.sequence &&
+        mark->closed_through && *mark->closed_through >= position.cycle &&
+        used_external_positions.emplace(external_producer_name(position.producer), position.sequence).second;
+#else
+    (void)effect;
+    return false;
+#endif
+  };
   const auto physical_span_is_valid = [](uint64_t address, uint64_t mask) {
     if (!mask || address > std::numeric_limits<uint64_t>::max() - 63)
       return false;
@@ -1548,7 +2365,20 @@ bool Runtime::export_semantic_observed_prefix() const {
     return true;
   };
   for (const auto &load : semantic_loads_) {
-    if (!source_is_recorded(load.id.hart, load.source_id, load.source_sequence, load.source_cycle)) {
+    bool valid_source = false;
+    if (load.external_effect) {
+#ifdef DIFFTEST_S_UC_NATIVE_V1
+      const auto &effect = *load.external_effect;
+      valid_source = external_source_is_recorded(load.external_effect) && !effect.request.write &&
+          effect.request.allocation == load.id &&
+          load.address == (effect.request.address & ~UINT64_C(15)) &&
+          load.byte_mask == (UINT64_C(0xff) << (effect.request.address % 16));
+#endif
+    } else {
+      valid_source = source_is_recorded(load.id.hart, load.source_id, load.source_sequence, load.source_cycle) &&
+          !(native && uc_word_is_declared(load.address & ~UINT64_C(7)));
+    }
+    if (!valid_source) {
       invalid_event_source = true;
       continue;
     }
@@ -1560,10 +2390,29 @@ bool Runtime::export_semantic_observed_prefix() const {
       duplicate_logical_identity = true;
       continue;
     }
+    const auto origin = semantic_retired_memories_.find(load.id);
+    if (origin == semantic_retired_memories_.end() ||
+        origin->second.attempt != load.attempt || origin->second.address != load.address ||
+        origin->second.byte_mask != load.byte_mask || !origin->second.retirement_source_cycle)
+      missing_retirement_origin = true;
     checked_loads.push_back(&load);
   }
   for (const auto &group : semantic_groups_) {
-    if (!source_is_recorded(group.hart, group.source_id, group.source_sequence, group.source_cycle)) {
+    bool valid_source = false;
+    if (group.external_effect) {
+#ifdef DIFFTEST_S_UC_NATIVE_V1
+      const auto &effect = *group.external_effect;
+      valid_source = external_source_is_recorded(group.external_effect) && effect.request.write &&
+          group.transaction_id == effect.request.key.transaction_uid &&
+          group.hart == effect.request.key.hart && group.members.size() == 1 &&
+          group.members.front() == effect.request.allocation &&
+          group.address == effect.request.address && group.byte_mask == effect.request.mask;
+#endif
+    } else {
+      valid_source = source_is_recorded(group.hart, group.source_id, group.source_sequence, group.source_cycle) &&
+          !(native && uc_word_is_declared(group.address & ~UINT64_C(7)));
+    }
+    if (!valid_source) {
       invalid_event_source = true;
       continue;
     }
@@ -1578,9 +2427,26 @@ bool Runtime::export_semantic_observed_prefix() const {
       missing_checked_store = true;
       continue;
     }
-    if (!used_group_ids.emplace(group.hart, group.transaction_id).second) {
+    if (!used_group_ids.emplace(bool(group.external_effect), group.hart, group.transaction_id).second) {
       duplicate_logical_identity = true;
       continue;
+    }
+    for (const auto &member : group.members) {
+      const auto origin = semantic_retired_memories_.find(member);
+      const auto visible = group.visible_member_masks.find(member);
+      if (origin == semantic_retired_memories_.end() || !origin->second.retirement_source_cycle ||
+          !origin->second.byte_mask || origin->second.address > UINT64_MAX - 63 ||
+          visible == group.visible_member_masks.end() ||
+          (visible->second & ~origin->second.byte_mask))
+        missing_retirement_origin = true;
+      else
+        for (unsigned byte = 0; byte < 64; ++byte)
+          if ((visible->second >> byte) & 1) {
+            const uint64_t address = origin->second.address + byte;
+            if (address < group.address || address >= group.address + 64 ||
+                !((group.byte_mask >> (address - group.address)) & 1))
+              missing_retirement_origin = true;
+          }
     }
     checked_groups.push_back(&group);
   }
@@ -1600,6 +2466,35 @@ bool Runtime::export_semantic_observed_prefix() const {
     }
     checked_fused_retirements.push_back(&retirement);
   }
+  bool retirement_trace_complete = !semantic_retirements_incomplete_ && !semantic_retirements_.empty();
+  std::array<uint64_t, NUM_CORES> retired_counts{};
+  std::set<std::pair<unsigned, uint64_t>> retirement_uids;
+  std::map<std::tuple<unsigned, unsigned, uint64_t>, uint64_t> source_packets;
+  for (const auto &retirement : semantic_retirements_) {
+    const auto producer = std::find_if(producers.begin(), producers.end(), [&](const SourceProducerWatermark &item) {
+      return item.hart == retirement.id.hart && item.source_id == retirement.source_id;
+    });
+    const auto packet = std::make_tuple(retirement.id.hart, retirement.source_id,
+                                        retirement.source_sequence);
+    const auto inserted = source_packets.emplace(packet, retirement.source_cycle);
+    if (retirement.id.hart >= retired_counts.size() || !retirement.id.uid ||
+        !retirement_uids.insert({retirement.id.hart, retirement.id.uid}).second ||
+        producer == producers.end() || producer->kind != 1 ||
+        retirement.source_sequence > producer->event_sequence ||
+        !producer->closed_through || retirement.source_cycle > *producer->closed_through ||
+        (!inserted.second && inserted.first->second != retirement.source_cycle) ||
+        retirement.program_order != retired_counts[retirement.id.hart])
+      retirement_trace_complete = false;
+    if (retirement.id.hart < retired_counts.size())
+      ++retired_counts[retirement.id.hart];
+  }
+  for (unsigned hart = 0; hart < harts_.size(); ++hart)
+    if (!retired_counts[hart] ||
+        retired_counts[hart] != harts_[hart].accepted_retirement_instructions ||
+        retired_counts[hart] < harts_[hart].arch_compares)
+      retirement_trace_complete = false;
+  if (!source.reset_epoch_verified || !complete_roster)
+    retirement_trace_complete = false;
   // Aggregate the enabled bytes by source cycle and physical line. A
   // scalar effect then needs one logarithmic lookup, even with many atomics.
   std::map<std::pair<uint64_t, uint64_t>, uint64_t> atomic_mask_by_cycle_line;
@@ -1623,19 +2518,34 @@ bool Runtime::export_semantic_observed_prefix() const {
       }) || std::any_of(checked_groups.begin(), checked_groups.end(), [&](const SemanticGroup *group) {
         return overlaps_excluded_atomic(group->source_cycle, group->address, group->byte_mask);
       });
-  const bool complete = source.reset_epoch_verified && complete_roster && !semantic_export_overflow_ &&
+  const bool complete = source.reset_epoch_verified && complete_roster && complete_external && !semantic_export_overflow_ &&
                         !checked_fused_retirements_overflow_ && !invalid_checked_fused_source &&
                         !semantic_excluded_device_store_ && !atomic_scalar_overlap && !invalid_atomic_span &&
                         !invalid_event_source && !invalid_physical_address &&
-                        !duplicate_logical_identity && !missing_checked_store;
+                        !duplicate_logical_identity && !missing_checked_store &&
+                        !missing_retirement_origin;
   std::ostringstream json;
-  json << "{\"schema_version\":1,\"kind\":\"difftest-s-observed-prefix.v1\",\"scope\":\"observed_prefix_only\","
+  json << "{\"schema_version\":" << (native ? 2 : 1)
+       << ",\"kind\":\"difftest-s-observed-prefix.v" << (native ? 2 : 1)
+       << "\",\"scope\":\"observed_prefix_only\","
           "\"operation_scope\":\"scalar_load_store_only\",\"excluded_atomic_effect_count\":"
        << excluded_atomic_effect_count_ << ",\"excluded_device_store_count\":"
        << semantic_excluded_device_stores_.size() << ",\"certification_status\":\""
        << (complete ? "Complete" : "Incomplete")
        << "\",\"complete\":" << (complete ? "true" : "false")
        << ",\"physical_drain_certified\":false,\"source_clock\":\"difftest-source-cycle\",\"epoch\":" << epoch;
+  json << ",\"retirement_source_diagnostic\":{\"records\":" << semantic_retirements_.size()
+       << ",\"capture_incomplete\":" << (semantic_retirements_incomplete_ ? "true" : "false")
+       << ",\"hart_records\":[";
+  for (unsigned hart = 0; hart < harts_.size(); ++hart)
+    json << (hart ? "," : "") << retired_counts[hart];
+  json << "],\"accepted_retirements\":[";
+  for (unsigned hart = 0; hart < harts_.size(); ++hart)
+    json << (hart ? "," : "") << harts_[hart].accepted_retirement_instructions;
+  json << "],\"architecture_compared\":[";
+  for (unsigned hart = 0; hart < harts_.size(); ++hart)
+    json << (hart ? "," : "") << harts_[hart].arch_compares;
+  json << "]}";
   json << ",\"case_id\":";
   json_string(json, case_id);
   json << ",\"run_id\":";
@@ -1646,14 +2556,20 @@ bool Runtime::export_semantic_observed_prefix() const {
   json_string(json, backend_hash);
   json << ",\"layout_sha256\":";
   json_string(json, layout_hash);
-  json << ",\"closed_through\":" << *source.closed_through
-       << ",\"closed_through_cycle\":" << *source.closed_through
+  json << ",\"closed_through\":" << certified_closed.value_or(0)
+       << ",\"closed_through_cycle\":" << certified_closed.value_or(0)
        << ",\"last_effect_cycle\":" << last_effect_cycle_ << ",\"required_producers\":[";
   for (size_t index = 0; index < producers.size(); ++index) {
     if (index)
       json << ',';
     json_string(json, source_producer_name(producers[index].hart, producers[index].source_id).c_str());
   }
+#ifdef DIFFTEST_S_UC_NATIVE_V1
+  for (const auto &producer : external_producers) {
+    json << ',';
+    json_string(json, external_producer_name(producer.producer).c_str());
+  }
+#endif
   json << "],\"producer_watermarks\":{";
   for (size_t index = 0; index < producers.size(); ++index) {
     if (index)
@@ -1670,7 +2586,42 @@ bool Runtime::export_semantic_observed_prefix() const {
     json << ",\"complete\":" << (producer.closed_through ? "true" : "false")
          << ",\"lossless\":" << (producer.closed_through ? "true" : "false") << '}';
   }
-  json << "},\"events\":[";
+#ifdef DIFFTEST_S_UC_NATIVE_V1
+  for (const auto &producer : external_producers) {
+    json << ',';
+    json_string(json, external_producer_name(producer.producer).c_str());
+    json << ":{";
+    write_external_identity(json, producer.producer);
+    json << ",\"epoch\":" << producer.epoch << ",\"source_clock\":\"difftest-source-cycle\",\"event_sequence\":"
+         << producer.event_sequence << ",\"closed_through_cycle\":";
+    if (producer.closed_through) json << *producer.closed_through;
+    else json << "null";
+    const bool closed = producer.reset_verified && producer.closed_through.has_value();
+    json << ",\"complete\":" << (closed ? "true" : "false")
+         << ",\"lossless\":" << (closed ? "true" : "false") << '}';
+  }
+  if (native) {
+    json << "},\"external_producers\":[";
+    for (size_t index = 0; index < external_producers.size(); ++index) {
+      if (index) json << ',';
+      const auto &producer = external_producers[index].producer;
+      json << "{\"producer_id\":";
+      json_string(json, external_producer_name(producer).c_str());
+      json << ',';
+      write_external_identity(json, producer);
+      json << '}';
+    }
+    json << "],\"uc_zero_pages\":[";
+    for (size_t index = 0; index < uc_profile_.zero_pages.size(); ++index) {
+      if (index) json << ',';
+      json << uc_profile_.zero_pages[index];
+    }
+    json << "],\"uc_source_layout\":\"linknan-uc-passive-raw-v2\","
+            "\"uc_route_proof_verified\":true,\"common_effect_phase_verified\":true";
+  } else
+#endif
+    json << '}';
+  json << ",\"events\":[";
   bool wrote_event = false;
   const auto write_source = [&](unsigned hart, unsigned id, uint64_t sequence, uint64_t cycle, uint64_t address,
                                 uint64_t mask) {
@@ -1685,26 +2636,78 @@ bool Runtime::export_semantic_observed_prefix() const {
          << address << ",\"address_is_physical\":true,\"byte_mask\":" << mask
          << ",\"final_attempt\":true";
   };
+#ifdef DIFFTEST_S_UC_NATIVE_V1
+  const auto write_uc_source = [&](unsigned hart, const UcJoinedEffect &effect) {
+    if (wrote_event) json << ',';
+    wrote_event = true;
+    const auto &position = effect.proof.endpoint_effect;
+    json << "{\"hart\":" << hart << ",\"epoch\":" << epoch
+         << ",\"source_clock\":\"difftest-source-cycle\",\"source_cycle\":" << position.cycle
+         << ",\"producer_id\":";
+    json_string(json, external_producer_name(position.producer).c_str());
+    json << ',';
+    write_external_identity(json, position.producer);
+    json << ",\"producer_sequence\":" << position.sequence
+         << ",\"physical_address\":" << effect.request.address
+         << ",\"address_is_physical\":true,\"byte_mask\":" << unsigned(effect.request.mask)
+         << ",\"final_attempt\":true,\"sample_cycle\":" << effect.sample_cycle
+         << ",\"sample_edge\":" << effect.sample_edge
+         << ",\"transaction_namespace\":\"uc\",\"transaction_id\":" << effect.request.key.transaction_uid
+         << ",\"allocation_uid\":" << effect.request.allocation.uid
+         << ",\"route_proof\":{\"complete\":true,\"transaction_owner_hart\":" << effect.request.key.hart
+         << ",\"transaction_epoch\":" << effect.request.key.epoch
+         << ",\"transaction_uid\":" << effect.request.key.transaction_uid
+         << ",\"allocation_uid\":" << effect.request.allocation.uid << '}';
+  };
+#endif
   for (const auto *observed : checked_loads) {
     const auto &load = *observed;
-    write_source(load.id.hart, load.source_id, load.source_sequence, load.source_cycle,
-                 load.address, load.byte_mask);
+#ifdef DIFFTEST_S_UC_NATIVE_V1
+    if (load.external_effect) write_uc_source(load.id.hart, *load.external_effect);
+    else
+#endif
+      write_source(load.id.hart, load.source_id, load.source_sequence, load.source_cycle, load.address, load.byte_mask);
     json << ",\"kind\":\"retired_load_sample\",\"uid\":" << load.id.uid
          << ",\"attempt\":" << load.attempt << ",\"subaccess\":" << load.id.subaccess
-         << ",\"retired\":true}";
+         << ",\"retired\":true";
+    const auto origin = semantic_retired_memories_.find(load.id);
+    if (origin != semantic_retired_memories_.end())
+      json << ",\"pc\":" << origin->second.pc
+           << ",\"instruction\":" << origin->second.instruction
+           << ",\"retirement_source_cycle\":" << origin->second.retirement_source_cycle;
+    json << '}';
   }
   for (const auto *observed : checked_groups) {
     const auto &group = *observed;
-    write_source(group.hart, group.source_id, group.source_sequence, group.source_cycle,
-                 group.address, group.byte_mask);
-    json << ",\"kind\":\"store_publish_group\",\"transaction_id\":" << group.transaction_id
-         << ",\"allocation_generation\":" << epoch << ",\"retired_members\":[";
+    uint64_t generation = epoch;
+#ifdef DIFFTEST_S_UC_NATIVE_V1
+    if (group.external_effect) {
+      write_uc_source(group.hart, *group.external_effect);
+      generation = group.external_effect->request.allocation.uid;
+    } else
+#endif
+    {
+      write_source(group.hart, group.source_id, group.source_sequence, group.source_cycle, group.address, group.byte_mask);
+      json << ",\"transaction_id\":" << group.transaction_id;
+      if (native) json << ",\"transaction_namespace\":\"sbuffer\"";
+    }
+    json << ",\"kind\":\"store_publish_group\",\"allocation_generation\":" << generation << ",\"retired_members\":[";
     for (size_t index = 0; index < group.members.size(); ++index) {
       if (index)
         json << ',';
       const auto &member = group.members[index];
+      const auto origin = semantic_retired_memories_.find(member);
       json << "{\"hart\":" << member.hart << ",\"uid\":" << member.uid
-           << ",\"attempt\":0,\"subaccess\":" << member.subaccess << ",\"retired\":true}";
+           << ",\"attempt\":" << (origin == semantic_retired_memories_.end() ? 0 : origin->second.attempt)
+           << ",\"subaccess\":" << member.subaccess << ",\"retired\":true";
+      if (origin != semantic_retired_memories_.end())
+        json << ",\"pc\":" << origin->second.pc
+             << ",\"instruction\":" << origin->second.instruction
+             << ",\"retirement_source_cycle\":" << origin->second.retirement_source_cycle
+             << ",\"physical_address\":" << origin->second.address
+             << ",\"byte_mask\":" << group.visible_member_masks.at(member)
+             << ",\"byte_provenance_verified\":true";
+      json << '}';
     }
     json << "]}";
   }
@@ -1729,7 +2732,30 @@ bool Runtime::export_semantic_observed_prefix() const {
     }
     json << "]}";
   }
-  json << "],\"excluded_device_stores\":[";
+  json << "],\"retirement_trace_complete\":" << (retirement_trace_complete ? "true" : "false");
+  if (retirement_trace_complete) {
+    json << ",\"retirement_accepted_counts\":[";
+    for (unsigned hart = 0; hart < harts_.size(); ++hart)
+      json << (hart ? "," : "") << harts_[hart].accepted_retirement_instructions;
+    json << ']' << ",\"retirement_source_clock\":\"difftest-source-cycle\""
+         << ",\"retirement_closed_through_cycle\":" << *source.closed_through
+         << ",\"retirements\":[";
+    for (size_t index = 0; index < semantic_retirements_.size(); ++index) {
+      if (index)
+        json << ',';
+      const auto &retirement = semantic_retirements_[index];
+      json << "{\"hart\":" << retirement.id.hart << ",\"epoch\":" << epoch
+           << ",\"uid\":" << retirement.id.uid << ",\"pc\":" << retirement.pc
+           << ",\"instruction\":" << retirement.instruction
+           << ",\"source_cycle\":" << retirement.source_cycle
+           << ",\"producer_id\":";
+      json_string(json, source_producer_name(retirement.id.hart, retirement.source_id).c_str());
+      json << ",\"producer_sequence\":" << retirement.source_sequence
+           << ",\"program_order\":" << retirement.program_order << '}';
+    }
+    json << ']';
+  }
+  json << ",\"excluded_device_stores\":[";
   for (size_t index = 0; index < semantic_excluded_device_stores_.size(); ++index) {
     if (index)
       json << ',';
@@ -1753,6 +2779,8 @@ bool Runtime::export_semantic_observed_prefix() const {
     add_reason("source_reset_epoch_unverified");
   if (!complete_roster)
     add_reason("producer_roster_incomplete");
+  if (!complete_external)
+    add_reason("external_uc_source_or_route_prefix_incomplete");
   if (semantic_export_overflow_)
     add_reason("semantic_event_limit_exceeded");
   if (checked_fused_retirements_overflow_)
@@ -1771,6 +2799,8 @@ bool Runtime::export_semantic_observed_prefix() const {
     add_reason("event_source_identity_unverified");
   if (missing_checked_store)
     add_reason("store_retirement_or_ref_audit_missing");
+  if (missing_retirement_origin)
+    add_reason("retired_memory_pc_or_byte_provenance_missing");
   if (invalid_physical_address)
     add_reason("physical_address_unverified");
   json << "]}\n";
@@ -1780,7 +2810,8 @@ bool Runtime::export_semantic_observed_prefix() const {
     return false;
   }
   std::ostringstream marker;
-  marker << "RVWMO_SEMANTIC_EXPORT_V1 {\"kind\":\"difftest-s-observed-prefix.v1\","
+  marker << "RVWMO_SEMANTIC_EXPORT_V1 {\"kind\":\"difftest-s-observed-prefix.v" << (native ? 2 : 1)
+         << "\","
             "\"scope\":\"observed_prefix_only\",\"operation_scope\":\"scalar_load_store_only\","
             "\"excluded_atomic_effect_count\":" << excluded_atomic_effect_count_
          << ",\"excluded_device_store_count\":" << semantic_excluded_device_stores_.size()
@@ -1797,7 +2828,7 @@ bool Runtime::export_semantic_observed_prefix() const {
   marker << ",\"artifact_sha256\":";
   json_string(marker, artifact_hash.c_str());
   marker << ",\"complete\":" << (complete ? "true" : "false")
-         << ",\"closed_through_cycle\":" << *source.closed_through
+         << ",\"closed_through_cycle\":" << certified_closed.value_or(0)
          << ",\"physical_drain_certified\":false}";
   std::puts(marker.str().c_str());
   std::fflush(stdout);
