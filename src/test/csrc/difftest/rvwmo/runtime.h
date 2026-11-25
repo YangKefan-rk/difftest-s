@@ -85,13 +85,10 @@ public:
   CheckResult submit_uc_request(const UcRequest &request);
   CheckResult submit_uc_completion(const UcCompletion &completion);
   bool independently_execute_skipped_uc(unsigned hart) const;
-  bool native_uc_store_audit_pending(unsigned hart) const;
-  // A native device RAM store shares REF's FIFO with legacy StoreEvents.
-  // Only events whose allocation has already retired in REF may consume it.
-  CheckResult legacy_store_reference_ready(unsigned hart, uint64_t store_uid) const;
   void print_native_uc_diagnostics(const char *phase) const;
   CheckResult capture(const std::vector<DiffTestState *> &states);
   CheckResult before_commit(unsigned hart, unsigned port, DiffTestState &state, RefProxy &reference);
+  CheckResult execute_reference(unsigned hart, RefProxy &reference);
   CheckResult after_commit(unsigned hart, RefProxy &reference);
   CheckResult note_reference_step(unsigned hart);
   CheckResult note_arch_compare(unsigned hart, uint64_t retired_instructions);
@@ -100,7 +97,7 @@ public:
   bool print_observed_prefix_final();
   bool export_semantic_observed_prefix() const;
 #endif
-  CheckResult verify_store(unsigned hart, uint64_t store_uid, uint64_t address, uint64_t data, uint8_t mask);
+  CheckResult check_store_event(unsigned hart, uint64_t store_uid, uint64_t address, uint64_t data, uint8_t mask);
   CheckResult note_done(unsigned hart, int code);
   CheckResult finish();
   bool read_reference_memory(unsigned hart, uint64_t address, size_t size, uint8_t *bytes) const;
@@ -132,14 +129,20 @@ private:
     std::shared_ptr<const UcJoinedEffect> external_effect;
     std::string coverage_reason;
   };
+  struct StoreTrace {
+    uint64_t address = 0;
+    uint64_t data = 0;
+    uint8_t mask = 0;
+  };
   struct Store {
     OperationId id;
     MemoryStore memory;
     MemoryOperation operation;
-    std::vector<uint8_t> audited;
+    std::optional<StoreTrace> reference;
     bool effect_recorded = false;
     bool recorded = false;
-    bool verified = false;
+    bool store_event_checked = false;
+    bool checker_released = false;
     bool qualified_uc = false;
     std::shared_ptr<const UcJoinedEffect> external_effect;
     bool excluded_io = false;
@@ -210,6 +213,8 @@ private:
     bool reader = false;
     bool qualified_uc = false;
     std::shared_ptr<const UcJoinedEffect> uc_store_effect;
+    uint64_t store_uid = 0;
+    std::optional<StoreTrace> reference_store;
     std::shared_ptr<Atomic> atomic;
     unsigned instruction_count = 1;
     bool is_rvc = false;
@@ -362,7 +367,8 @@ private:
   CheckResult capture_native_uc(const std::vector<DiffTestState *> &states);
   CheckResult consume_native_uc_request(const UcBoundRequest &request);
   CheckResult consume_native_uc_effect(const UcJoinedEffect &effect);
-  CheckResult audit_native_uc_store(unsigned hart, const Active &active, RefProxy &reference);
+  CheckResult validate_native_uc_store(const Active &active) const;
+  CheckResult confirm_reference_store(Hart &hart, const Active &active);
   CheckResult record_uc_request(const UcRequest &request,
                                 std::shared_ptr<const UcBoundRequest> external_request = {});
   CheckResult enqueue_uc_completion(const UcCompletion &completion,
@@ -384,6 +390,7 @@ private:
   void observe_write(uint64_t cycle, unsigned hart, uint64_t address, const std::vector<uint8_t> &mask,
                      bool qualified_uc = false);
   CheckResult allocate(unsigned hart, uint16_t rob);
+  void release_store(Hart &hart, uint64_t uid);
   void collect_released_stores();
   void record_checked_fused_retirement(Active &active);
   size_t pending_atomics() const;

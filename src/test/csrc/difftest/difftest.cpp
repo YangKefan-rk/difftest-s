@@ -239,6 +239,8 @@ int difftest_state() {
   }
 #if NUM_CORES > 1
   if (multicore_runtime().all_done()) {
+    for (int i = 0; i < NUM_CORES; i++)
+      if (difftest[i]->drain_store_checks()) return STATE_ABORT;
     const auto result = multicore_runtime().finish();
     if (result.status == rvwmo::CheckStatus::Pending) return -1;
     if (runtime_error(result, "all-hart finalization")) return STATE_ABORT;
@@ -550,8 +552,6 @@ inline int Difftest::check_all() {
   }
   do_first_instr_commit();
 
-  // Each cycle is checked for an store event, and recorded in queue.
-  // It is checked every time an instruction is committed and queue has content.
 #ifdef CONFIG_DIFFTEST_STOREEVENT
   store_event_record();
 #endif
@@ -678,15 +678,23 @@ inline int Difftest::check_all() {
 #endif
 #ifndef CONFIG_DIFFTEST_SQUASH
         load_mismatch |= do_load_check(i);
+#if NUM_CORES == 1
         if (do_store_check()) {
           return 1;
         }
+#endif
 #endif // CONFIG_DIFFTEST_SQUASH
         dut->commit[i].valid = 0;
         num_commit += 1 + dut->commit[i].nFused;
       }
     }
   }
+
+#if NUM_CORES > 1 && !defined(CONFIG_DIFFTEST_SQUASH)
+  // StoreEvents can arrive in cycles without retirement.
+  if (do_store_check())
+    return 1;
+#endif
 
   if (update_delayed_writeback()) {
     return 1;
@@ -964,9 +972,6 @@ int Difftest::do_instr_commit(int i) {
   if (DEBUG_MODE_SKIP(dut->commit[i].valid, dut->commit[i].pc, dut->commit[i].inst))
     multicore_runtime().exclude("debug-mode skipped instruction lacks complete RVWMO semantics");
   if (runtime_error(multicore_runtime().before_commit(id, i, *dut, *proxy), "reference preparation")) return 1;
-  // Mature StoreEvents can accumulate during idle frames. Retire their older
-  // REF FIFO entries before this device RAM store adds and audits its own.
-  if (multicore_runtime().native_uc_store_audit_pending(id) && do_store_check()) return 1;
   if ((commit_instr & 0x7f) == 0x6b && dut->trap.hasTrap && dut->trap.pc == commit_pc) {
     proxy->skip_one(dut->commit[i].isRVC, false, false, false, 0, 0, dut);
     return runtime_error(multicore_runtime().after_commit(id, *proxy), "termination retirement");
@@ -1041,9 +1046,16 @@ int Difftest::do_instr_commit(int i) {
       }
     } else
 #endif
-    proxy->ref_exec(1);
 #if NUM_CORES > 1
+    {
+      if (runtime_error(multicore_runtime().execute_reference(id, *proxy), "independent REF execution")) {
+        result = 1;
+        break;
+      }
+    }
     if (runtime_error(multicore_runtime().note_reference_step(id), "independent REF execution")) return 1;
+#else
+    proxy->ref_exec(1);
 #endif
 #if NUM_CORES > 1 && defined(CONFIG_DIFFTEST_TLBEVENT) && !defined(CONFIG_DIFFTEST_SQUASH)
     if (tlb_mismatch) {
@@ -1088,7 +1100,7 @@ int Difftest::do_instr_commit(int i) {
 #endif
 
 #if NUM_CORES > 1
-  if (runtime_error(multicore_runtime().after_commit(id, *proxy), "retirement validation")) result = 1;
+  if (!result && runtime_error(multicore_runtime().after_commit(id, *proxy), "retirement validation")) result = 1;
 #endif
   return result;
 }
@@ -1174,18 +1186,21 @@ int Difftest::do_store_check() {
 #ifdef CONFIG_DIFFTEST_STOREEVENT
   using difftest_detail::StoreAuditAction;
   const auto readiness = [&](const DifftestStoreEvent &store_event) {
-#if NUM_CORES > 1
-    const auto ready = multicore_runtime().legacy_store_reference_ready(id, store_event.storeUid);
-    if (ready.status == rvwmo::CheckStatus::Pending) return StoreAuditAction::Wait;
-    if (runtime_error(ready, "legacy reference store FIFO readiness")) return StoreAuditAction::Error;
-#endif
 #ifdef CONFIG_DIFFTEST_SQUASH
     if (store_event.stamp != commit_stamp)
       return StoreAuditAction::Wait;
+#else
+    (void)store_event;
 #endif // CONFIG_DIFFTEST_SQUASH
     return StoreAuditAction::Consume;
   };
   const auto audit = [&](const DifftestStoreEvent &store_event) {
+#if NUM_CORES > 1
+    const auto checked = multicore_runtime().check_store_event(
+        id, store_event.storeUid, store_event.addr, store_event.data, store_event.mask);
+    if (checked.status == rvwmo::CheckStatus::Pending) return StoreAuditAction::Wait;
+    if (runtime_error(checked, "independent reference store audit")) return StoreAuditAction::Error;
+#else
     auto addr = store_event.addr;
     auto data = store_event.data;
     auto mask = store_event.mask;
@@ -1209,10 +1224,6 @@ int Difftest::do_store_check() {
 
       return StoreAuditAction::Error;
     }
-
-#if NUM_CORES > 1
-    if (runtime_error(multicore_runtime().verify_store(id, store_event.storeUid, addr, data, mask),
-                      "independent reference store audit")) return StoreAuditAction::Error;
 #endif
     return StoreAuditAction::Consume;
   };

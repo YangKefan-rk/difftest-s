@@ -40,6 +40,15 @@ Candidate bytes may advance a reference before final source verification, but
 load acceptance still requires independent source-store audit and PPO/value
 checks. DUT load results never initialize expected reference bytes.
 
+On the direct Nanhu Runtime path, `DiffStoreLocalEvent` stages a scalar RAM
+store's identity and DUT bytes for comparison only. At retirement the matching
+Spike `difftest_exec_store_v1` single step returns its own physical address,
+data, and byte mask. Only a matching trace supplies LocalMem bytes. A later
+StoreEvent is checked against the saved trace without consuming Spike's FIFO
+again. Global publication still follows the ordered DUT effect, including when
+it precedes the REF audit; such a store cannot certify a load until audited.
+The existing per-frame architectural state comparison is unchanged.
+
 ## Coalesced publication
 
 `StorePublishEvent` can carry several logical stores under an explicit

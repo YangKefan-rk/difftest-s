@@ -429,8 +429,7 @@ CheckResult Runtime::publish_uc_store(const UcTransaction &transaction, const Uc
     if (!external_effect || !external_effect->request.device || completion.mask != 0xff ||
         !uc_word_is_declared(completion.address))
       return pending("UC publication awaits the bound StoreLocal record");
-    // The physical RAM write is an observed provisional store. Its later
-    // StoreLocal and independent REF execution remain separate obligations.
+    // Preserve the observed write rank without making DUT bytes locally readable.
     store.memory.po = store.id.uid;
     store.memory.address = completion.address & ~UINT64_C(15);
     const auto offset = completion.address - store.memory.address;
@@ -443,7 +442,7 @@ CheckResult Runtime::publish_uc_store(const UcTransaction &transaction, const Uc
     store.operation.store = true;
     store.operation.address = store.memory.address;
     store.operation.byte_mask = store.memory.mask;
-    result = checker_.record_store(store.memory, store.operation, StoreVerification::Provisional);
+    result = checker_.record_store(store.memory, store.operation, StoreVerification::AwaitingReference);
     if (!accepted(result)) return result;
     store.effect_recorded = true;
 #else
@@ -483,36 +482,22 @@ CheckResult Runtime::publish_uc_store(const UcTransaction &transaction, const Uc
   return result;
 }
 
-CheckResult Runtime::audit_native_uc_store(unsigned hart, const Active &active, RefProxy &reference) {
+CheckResult Runtime::validate_native_uc_store(const Active &active) const {
 #ifdef DIFFTEST_S_UC_NATIVE_V1
-  if (!active.uc_store_effect || !active.uc_store_effect->request.device)
-    return {}; // Device=0 retains the existing StoreEvent audit queue.
+  if (!active.uc_store_effect)
+    return {};
   const auto &effect = *active.uc_store_effect;
   const auto proof = uc_profile_.native_bridge->validate_qualified_effect(effect.request.key, effect.proof.endpoint_effect);
   if (!proof) return proof;
-  if (!effect.request.write || !uc_word_is_declared(effect.request.address) || effect.request.mask != 0xff ||
-      !harts_[hart].frame_ref_steps || effect.request.allocation.uid != active.instruction.uid ||
+  if (!effect.request.device || !effect.request.write || !uc_word_is_declared(effect.request.address) ||
+      effect.request.mask != 0xff || effect.request.store_uid != active.store_uid ||
+      effect.request.allocation.uid != active.instruction.uid ||
       effect.sample_cycle > active.retirement_source_cycle)
-    return invalid("device-classified RAM store lacks its independent REF step and prior qualified effect");
-  const auto store = harts_[hart].stores.find(effect.request.store_uid);
-  if (store == harts_[hart].stores.end() || store->second.verified)
-    return invalid("native RAM store REF audit was duplicated or lost its StoreLocal record");
-  if (!reference.store_commit)
-    return {CheckStatus::Unsupported, 0, "reference lacks ordinary store-log audit"};
-  uint64_t address = effect.request.address;
-  uint64_t data = 0;
-  uint8_t mask = effect.request.mask;
-  for (unsigned byte = 0; byte < 8; ++byte) data |= uint64_t(effect.bytes[byte]) << (8 * byte);
-  // These are observed comparison inputs to the ordinary independent REF log,
-  // exactly as in Difftest::do_store_check. They never initialize expected RAM.
-  const int mismatch = reference.store_commit(&address, &data, &mask);
-  if (mismatch || address != effect.request.address || mask != effect.request.mask)
-    return {CheckStatus::Violation, 0, "independent REF store address/data/mask differs from device-classified RAM store"};
-  return verify_store(hart, effect.request.store_uid, address, data, mask);
+    return invalid("device-classified RAM store lacks its prior qualified effect");
 #else
-  (void)hart; (void)active; (void)reference;
-  return {};
+  (void)active;
 #endif
+  return {};
 }
 
 CheckResult Runtime::capture_uc_completion(const UcCompletion &completion) {
@@ -762,14 +747,15 @@ bool Runtime::read_reference_memory(unsigned hart, uint64_t address, size_t size
   if (hart >= harts_.size() || !bytes || !global_memory().contains(address, size))
     return false;
   const auto &h = harts_[hart];
-  // The active UID excludes younger stores already observed in the DUT stream.
-  // These are provisional translation/fetch inputs; all stores still need REF audit.
   const uint64_t before_po = h.active ? h.active->instruction.uid
                                      : h.last_retired_uid + (h.last_retired_uid != UINT64_MAX);
-  for (size_t byte = 0; byte < size; ++byte)
-    if (!memory_.read_local(hart, before_po, address + byte, bytes[byte]) &&
-        !global_memory().read(address + byte, bytes + byte, 1))
+  for (size_t byte = 0; byte < size; ++byte) {
+    const uint64_t at = address + byte;
+    if (memory_.read_local(hart, before_po, at, bytes[byte]))
+      continue;
+    if (memory_.has_pending_local(hart, before_po, at) || !global_memory().read(at, bytes + byte, 1))
       return false;
+  }
   return true;
 }
 
@@ -959,11 +945,10 @@ CheckResult Runtime::observe_atomic(unsigned hart, const std::shared_ptr<Atomic>
   if (!sc && !atomic->read_seen)
     return pending("atomic read observation has not arrived");
   if (!lr)
-    for (unsigned byte = 0; byte < 8; ++byte) {
-      uint8_t local = 0;
-      if (((atomic->mask >> byte) & 1) && memory_.read_local(hart, atomic->id.uid, atomic->address + byte, local))
+    for (unsigned byte = 0; byte < 8; ++byte)
+      if (((atomic->mask >> byte) & 1) &&
+          memory_.has_pending_local(hart, atomic->id.uid, atomic->address + byte))
         return {CheckStatus::Violation, 1, "atomic write precedes an older same-address pending store"};
-    }
   MemoryOperation operation;
   operation.id = atomic->id;
   operation.attempt = atomic->attempt;
@@ -1166,6 +1151,24 @@ CheckResult Runtime::capture_atomics(unsigned hart, DiffTestState &state) {
   return {};
 }
 
+void Runtime::release_store(Hart &hart, uint64_t uid) {
+  auto store = hart.stores.find(uid);
+  // A late StoreEvent still needs the independent trace after writer reclamation.
+  if (!store->second.checker_released || !store->second.store_event_checked)
+    return;
+  auto instruction = store->second.id;
+  instruction.subaccess = 0;
+  auto members = hart.instruction_stores.find(instruction);
+  if (members != hart.instruction_stores.end()) {
+    auto &uids = members->second;
+    uids.erase(std::remove(uids.begin(), uids.end(), uid), uids.end());
+    if (uids.empty())
+      hart.instruction_stores.erase(members);
+  }
+  store_uids_.erase(store->second.id);
+  hart.stores.erase(store);
+}
+
 void Runtime::collect_released_stores() {
   for (const auto &id: checker_.take_released_stores()) {
     auto wire = store_uids_.find(id);
@@ -1175,17 +1178,8 @@ void Runtime::collect_released_stores() {
     }
     auto &hart = harts_.at(id.hart);
     const uint64_t uid = wire->second;
-    OperationId instruction = id;
-    instruction.subaccess = 0;
-    auto members = hart.instruction_stores.find(instruction);
-    if (members != hart.instruction_stores.end()) {
-      auto &uids = members->second;
-      uids.erase(std::remove(uids.begin(), uids.end(), uid), uids.end());
-      if (uids.empty())
-        hart.instruction_stores.erase(members);
-    }
-    hart.stores.erase(uid);
-    store_uids_.erase(wire);
+    hart.stores.at(uid).checker_released = true;
+    release_store(hart, uid);
   }
 }
 
@@ -1350,10 +1344,7 @@ CheckResult Runtime::capture(const std::vector<DiffTestState *> &states) {
       store.operation.store = true;
       store.operation.address = store.memory.address;
       store.operation.byte_mask = store.memory.mask;
-      // Local commit has no GMO rank. Register its identity immediately so REF
-      // may audit retired stores while source-time reads await queue closure.
-      // Snapshot resolution already handles older local stores arriving late.
-      result = checker_.record_store(store.memory, store.operation, StoreVerification::Provisional);
+      result = checker_.record_store(store.memory, store.operation, StoreVerification::AwaitingReference);
       if (!accepted(result))
         return result;
       store.recorded = true;
@@ -1744,9 +1735,12 @@ CheckResult Runtime::before_commit(unsigned hart, unsigned port, DiffTestState &
     auto found = h.instruction_stores.find(allocation->second);
     if (found == h.instruction_stores.end() || found->second.size() != 1)
       return unsupported("retired store lacks a single scalar allocation identity");
-    auto &store = h.stores.at(found->second.front());
+    active.store_uid = found->second.front();
+    const auto &store = h.stores.at(active.store_uid);
     if (!store.recorded)
       return pending("retired store awaits its local commit observation");
+    if (!reference.supports_store_step())
+      return unsupported("reference lacks difftest_exec_store_v1");
     if (store.external_effect) {
 #ifdef DIFFTEST_S_UC_NATIVE_V1
       if (store.external_effect->request.device) {
@@ -1760,6 +1754,9 @@ CheckResult Runtime::before_commit(unsigned hart, unsigned port, DiffTestState &
       }
 #endif
     }
+    auto qualified = validate_native_uc_store(active);
+    if (!qualified)
+      return qualified;
     active.instruction.memory.push_back(store.operation);
   }
   active.instruction_count = unsigned(commit.nFused) + 1;
@@ -1786,6 +1783,27 @@ void Runtime::observe_reference_instruction(void *context, uint64_t pc, uint32_t
   auto &hart = *static_cast<Hart *>(context);
   if (hart.active && hart.active->reference_instructions.size() <= hart.active->instruction_count)
     hart.active->reference_instructions.emplace_back(pc, instruction);
+}
+
+CheckResult Runtime::execute_reference(unsigned hart, RefProxy &reference) {
+  auto &active = harts_.at(hart).active;
+  if (!active)
+    return invalid("REF execution has no active retirement packet");
+  if (!active->store_uid) {
+    reference.ref_exec(1);
+    return {};
+  }
+  if (active->reference_store)
+    return invalid("REF store was stepped more than once");
+  StoreTrace trace;
+  if (reference.exec_store(active->instruction.pc, trace.address, trace.data, trace.mask)) {
+    std::ostringstream message;
+    message << "REF did not return one store trace: hart=" << hart << " storeUid=" << active->store_uid
+            << " pc=0x" << std::hex << active->instruction.pc;
+    return {CheckStatus::Violation, 0, message.str()};
+  }
+  active->reference_store = trace;
+  return {};
 }
 
 CheckResult Runtime::note_reference_step(unsigned hart) {
@@ -1861,9 +1879,11 @@ CheckResult Runtime::after_commit(unsigned hart, RefProxy &reference) {
     if (!result)
       return result;
   }
-  const auto native_store_audit = audit_native_uc_store(hart, active, reference);
-  if (!native_store_audit)
-    return native_store_audit;
+  if (active.store_uid) {
+    auto result = confirm_reference_store(h, active);
+    if (!result)
+      return failure_ = result;
+  }
   if (active.atomic && active.atomic->write_seen) {
     auto atomic = active.atomic;
     uint64_t address = atomic->address;
@@ -2016,63 +2036,21 @@ void Runtime::record_checked_fused_retirement(Active &active) {
   checked_fused_instruction_count_ += record.reference_instructions.size();
   checked_fused_retirements_.push_back(std::move(record));
 }
-bool Runtime::native_uc_store_audit_pending(unsigned hart) const {
-#ifdef DIFFTEST_S_UC_NATIVE_V1
-  const auto &active = harts_.at(hart).active;
-  return uc_profile_.kind == UcRamProfileKind::LinkNanExtraMemNative && active &&
-         active->uc_store_effect && active->uc_store_effect->request.device;
-#else
-  (void)hart;
-  return false;
-#endif
-}
-
-CheckResult Runtime::legacy_store_reference_ready(unsigned hart, uint64_t uid) const {
-  if (uc_profile_.kind != UcRamProfileKind::LinkNanExtraMemNative)
-    return {};
-  if (!covered())
-    return coverage_;
-  const auto &h = harts_.at(hart);
-  const auto found = h.stores.find(uid);
-  if (found == h.stores.end())
-    return invalid("legacy store audit lacks an exact StoreIdentity");
-  const auto &store = found->second;
-  if (store.verified)
-    return invalid("duplicate legacy REF store audit");
-  if (!store.recorded || store.id.uid > h.last_retired_uid ||
-      (native_uc_store_audit_pending(hart) && store.id.uid >= h.active->instruction.uid))
-    return pending("legacy store has not yet retired in independent REF");
-  return {};
-}
-
-CheckResult Runtime::verify_store(unsigned hart, uint64_t uid, uint64_t address, uint64_t data, uint8_t mask) {
-  if (!covered())
-    return coverage_;
-  auto &h = harts_.at(hart);
-  auto found = h.stores.find(uid);
-  if (found == h.stores.end() || !found->second.recorded)
-    return pending("REF-checked store metadata lacks local store record");
-  auto &store = found->second;
-  if (store.verified)
-    return invalid("duplicate REF store audit");
-  if (store.audited.empty())
-    store.audited.resize(store.memory.mask.size());
+CheckResult Runtime::confirm_reference_store(Hart &hart, const Active &active) {
+  auto &store = hart.stores.at(active.store_uid);
+  if (!active.reference_store || store.reference)
+    return invalid("retired store lacks a unique independent REF trace");
+  const auto &trace = *active.reference_store;
+  if (!trace.mask || trace.address % 8 || (trace.address & ~UINT64_C(15)) != store.memory.address)
+    return {CheckStatus::Violation, 0, "REF store address/mask is outside the observed StoreLocal span"};
+  const auto offset = trace.address - store.memory.address;
+  const auto size = store.memory.bytes.size();
   auto reference = store.memory;
+  reference.mask = mask_bytes(uint64_t(trace.mask) << offset, size);
+  reference.bytes.assign(size, 0);
   for (unsigned byte = 0; byte < 8; ++byte)
-    if ((mask >> byte) & 1) {
-      const uint64_t at = address + byte;
-      if (at < reference.address || at - reference.address >= reference.mask.size() ||
-          !reference.mask[at - reference.address])
-        return {CheckStatus::Violation, 0, "REF-checked store address/mask differs from provisional local write"};
-      const size_t offset = at - reference.address;
-      reference.bytes[offset] = (data >> (8 * byte)) & 255;
-      if (reference.bytes[offset] != store.memory.bytes[offset])
-        return {CheckStatus::Violation, 0, "REF-checked store data differs from provisional local write"};
-      store.audited[offset] = 1;
-    }
-  for (size_t byte = 0; byte < reference.mask.size(); ++byte)
-    if (reference.mask[byte] && !store.audited[byte])
-      return {};
+    if ((trace.mask >> byte) & 1)
+      reference.bytes[offset + byte] = trace.data >> (8 * byte);
   auto result = checker_.verify_store(store.id, reference);
   if (!result)
     return result;
@@ -2082,10 +2060,43 @@ CheckResult Runtime::verify_store(unsigned hart, uint64_t uid, uint64_t address,
     else
       audited_semantic_stores_.insert(store.id);
   }
-  store.verified = true;
+  store.reference = trace;
+  // Device-classified RAM has a qualified write effect instead of a StoreEvent.
+  store.store_event_checked = bool(active.uc_store_effect);
   collect_released_stores();
   return {};
 }
+
+CheckResult Runtime::check_store_event(unsigned hart, uint64_t uid, uint64_t address, uint64_t data, uint8_t mask) {
+  if (!covered())
+    return coverage_;
+  auto &h = harts_.at(hart);
+  auto found = h.stores.find(uid);
+  if (found == h.stores.end() || found->second.store_event_checked)
+    return invalid("StoreEvent lacks a unique store identity");
+  if (!found->second.reference) {
+    if (h.done || found->second.id.uid <= h.last_retired_uid)
+      return invalid("StoreEvent has no independently executed store: hart=" + std::to_string(hart) +
+                     " storeUid=" + std::to_string(uid));
+    return pending("StoreEvent awaits its independent REF step");
+  }
+  const auto &trace = *found->second.reference;
+  bool matches = trace.address == address && trace.mask == mask;
+  for (unsigned byte = 0; matches && byte < 8; ++byte)
+    if ((mask >> byte) & 1)
+      matches = (((trace.data ^ data) >> (8 * byte)) & 255) == 0;
+  if (!matches) {
+    std::ostringstream message;
+    message << "StoreEvent differs from independent REF: hart=" << hart << " storeUid=" << uid
+            << std::hex << " DUT=0x" << address << "/0x" << data << "/0x" << unsigned(mask)
+            << " REF=0x" << trace.address << "/0x" << trace.data << "/0x" << unsigned(trace.mask);
+    return failure_ = {CheckStatus::Violation, 0, message.str()};
+  }
+  found->second.store_event_checked = true;
+  release_store(h, uid);
+  return {};
+}
+
 CheckResult Runtime::note_done(unsigned hart, int code) {
   auto &h = harts_.at(hart);
   if (h.done)
@@ -2140,6 +2151,8 @@ CheckResult Runtime::finish() {
         return pending("INCOMPLETE_RUN: physical RAM write still awaits its bound StoreLocal");
       else if (entry.second.recorded && entry.second.id.uid > h.end_uid)
         return {CheckStatus::Unsupported, 0, "local store beyond the selected hart termination prefix"};
+      else if (entry.second.reference && !entry.second.store_event_checked)
+        return pending("INCOMPLETE_RUN: audited store still awaits its StoreEvent");
   for (auto &h: harts_)
     for (auto &entry: h.loads) {
       auto &load = entry.second;

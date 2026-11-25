@@ -182,6 +182,7 @@ public:
   f(ref_set_load_reader, difftest_set_load_reader, void, bool (*)(void*, uint64_t, size_t, uint8_t*), void*) \
   f(ref_set_instruction_observer, difftest_set_instruction_observer, void, void (*)(void*, uint64_t, uint32_t), void*) \
   f(ref_skip_one, difftest_skip_one, void, bool, bool, uint32_t, uint64_t)                                  \
+  f(ref_exec_store, difftest_exec_store_v1, int, uint64_t, uint64_t*, uint64_t*, uint8_t*)                   \
   f(ref_exec_fence_i, difftest_exec_fence_i, int, uint64_t, uint32_t)                                      \
   f(ref_guided_exec, difftest_guided_exec, void, void*)                                                     \
   f(ref_exec_fetch_access_fault, difftest_exec_fetch_access_fault, int, uint64_t, uint64_t)                 \
@@ -268,6 +269,11 @@ public:
   bool supports_atomic_store() const { return ref_atomic_commit != nullptr; }
   int atomic_commit(uint64_t *address, uint64_t *bytes, uint8_t *mask) {
     return ref_atomic_commit ? ref_atomic_commit(address, bytes, mask) : -1;
+  }
+
+  bool supports_store_step() const { return ref_exec_store != nullptr; }
+  int exec_store(uint64_t pc, uint64_t &address, uint64_t &data, uint8_t &mask) {
+    return ref_exec_store(pc, &address, &data, &mask);
   }
 
   bool set_load_reader(bool (*reader)(void *, uint64_t, size_t, uint8_t *), void *context) {
