@@ -243,6 +243,23 @@ CheckResult Checker::get_reference_candidate_load(const OperationId &operation, 
   return {};
 }
 
+CheckResult Checker::get_local_overlay_load(const OperationId &operation, uint32_t attempt,
+                                            std::vector<uint8_t> &bytes) {
+  if (!failure_)
+    return failure_;
+  auto found = loads_.find({operation, attempt});
+  if (found == loads_.end())
+    return pending("scalar reference load awaits its observed sample");
+  auto &sample = found->second;
+  const auto error = memory_.resolve_local_overlay(sample.snapshot, bytes);
+  if (error.find("candidate read awaits") == 0)
+    return pending(error);
+  if (!error.empty())
+    return remember_failure(invalid(error));
+  sample.use_local_overlay = true;
+  return {};
+}
+
 CheckResult Checker::observe_global(uint64_t address, const std::vector<uint8_t> &bytes,
                                     const std::vector<uint8_t> &mask, const std::vector<MemoryWriter> &writers,
                                     const std::vector<MemoryWriter> &completed, ObservationTime time) {
@@ -612,16 +629,25 @@ CheckResult Checker::drain(uint32_t hart) {
       for (const auto &actual: front.loads)
         if (actual.id == operation.id) {
           if (operation.source_kind == ReadSourceKind::ModeledWitness) {
-            for (size_t byte = 0; byte < operation.byte_mask.size(); ++byte)
-              if (operation.byte_mask[byte] && sample.snapshot.bytes[byte].value != actual.bytes[byte])
+            std::vector<uint8_t> overlay;
+            if (sample.use_local_overlay) {
+              auto error = memory_.resolve_local_overlay(sample.snapshot, overlay);
+              if (!error.empty())
+                return remember_failure(invalid(error));
+            }
+            for (size_t byte = 0; byte < operation.byte_mask.size(); ++byte) {
+              const uint8_t expected = sample.use_local_overlay ? overlay[byte] : sample.snapshot.bytes[byte].value;
+              if (operation.byte_mask[byte] && expected != actual.bytes[byte])
                 return remember_failure(
                     {CheckStatus::Violation, 0,
-                     "load value differs from modeled fixed-order witness: hart=" +
+                     std::string(sample.use_local_overlay ? "load value differs from LocalMem overlay: hart="
+                                                          : "load value differs from modeled fixed-order witness: hart=") +
                          std::to_string(operation.id.hart) + " uid=" + std::to_string(operation.id.uid) +
                          " pc=" + std::to_string(front.instruction.pc) +
                          " address=" + std::to_string(operation.address + byte) +
                          " actual=" + std::to_string(actual.bytes[byte]) +
-                         " expected=" + std::to_string(sample.snapshot.bytes[byte].value)});
+                         " expected=" + std::to_string(expected)});
+            }
           } else {
             auto error = memory_.compare(sample.snapshot, actual.bytes);
             if (!error.empty())

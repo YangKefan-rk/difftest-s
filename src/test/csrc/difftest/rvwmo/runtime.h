@@ -97,7 +97,6 @@ public:
   bool print_observed_prefix_final();
   bool export_semantic_observed_prefix() const;
 #endif
-  CheckResult check_store_event(unsigned hart, uint64_t store_uid, uint64_t address, uint64_t data, uint8_t mask);
   CheckResult note_done(unsigned hart, int code);
   CheckResult finish();
   bool read_reference_memory(unsigned hart, uint64_t address, size_t size, uint8_t *bytes) const;
@@ -138,11 +137,12 @@ private:
     OperationId id;
     MemoryStore memory;
     MemoryOperation operation;
-    std::optional<StoreTrace> reference;
     bool effect_recorded = false;
     bool recorded = false;
-    bool store_event_checked = false;
-    bool checker_released = false;
+    bool ref_verified = false;
+    bool cacheable = false;
+    bool uc_requested = false;
+    uint64_t local_cycle = 0;
     bool qualified_uc = false;
     std::shared_ptr<const UcJoinedEffect> external_effect;
     bool excluded_io = false;
@@ -157,11 +157,11 @@ private:
     unsigned source_id = 0;
     uint64_t source_sequence = 0;
     uint64_t address = 0;
+    uint32_t member_count = 0;
+    uint64_t last_store_uid = 0;
     std::vector<uint8_t> bytes;
     std::vector<uint8_t> mask;
     std::vector<uint64_t> writers;
-    std::set<uint64_t> members;
-    bool queued = false;
   };
   enum class AtomicKind { Rmw, LoadReserved, StoreConditional };
   struct Atomic {
@@ -232,10 +232,12 @@ private:
     uint64_t last_retired_uid = 0;
     uint64_t semantic_retirement_ordinal = 0;
     uint64_t accepted_retirement_instructions = 0;
-    uint64_t last_store_uid = 0;
+    uint64_t last_local_po = 0;
+    size_t pending_cacheable_stores = 0;
     std::map<uint16_t, OperationId> allocations;
     std::map<uint64_t, Store> stores;
-    std::map<OperationId, std::vector<uint64_t>> instruction_stores;
+    std::map<OperationId, uint64_t> instruction_stores;
+    std::map<uint64_t, std::deque<uint64_t>> cacheable_stores;
     std::map<OperationId, std::shared_ptr<Load>> loads;
     std::map<OperationId, uint32_t> attempts;
     std::map<OperationId, std::string> unsupported_allocations;
@@ -369,6 +371,7 @@ private:
   CheckResult consume_native_uc_effect(const UcJoinedEffect &effect);
   CheckResult validate_native_uc_store(const Active &active) const;
   CheckResult confirm_reference_store(Hart &hart, const Active &active);
+  CheckResult bind_store(Hart &hart, const OperationId &id, uint64_t uid);
   CheckResult record_uc_request(const UcRequest &request,
                                 std::shared_ptr<const UcBoundRequest> external_request = {});
   CheckResult enqueue_uc_completion(const UcCompletion &completion,
@@ -384,7 +387,7 @@ private:
   CheckResult unsupported(const std::string &reason);
   CheckResult advance(uint64_t watermark);
   CheckResult observe(const std::shared_ptr<Load> &load, ObservationTime time);
-  CheckResult complete_group(Group &group, ObservationTime time);
+  CheckResult complete_group(const Group &group, ObservationTime time);
   CheckResult observe_atomic(unsigned hart, const std::shared_ptr<Atomic> &atomic, ObservationTime time);
   CheckResult capture_atomics(unsigned hart, DiffTestState &state);
   void observe_write(uint64_t cycle, unsigned hart, uint64_t address, const std::vector<uint8_t> &mask,

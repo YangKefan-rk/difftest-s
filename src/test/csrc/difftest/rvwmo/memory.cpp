@@ -392,6 +392,36 @@ std::string Memory::resolve(MemorySnapshot &snapshot) const {
   }
   return {};
 }
+std::string Memory::resolve_local_overlay(const MemorySnapshot &snapshot, std::vector<uint8_t> &bytes) const {
+  auto active = snapshots_.find(snapshot.id);
+  if (active == snapshots_.end())
+    return "unknown or released memory snapshot";
+  const auto &record = active->second;
+  std::vector<const StoreRecord *> local(record.mask.size(), nullptr);
+  for (const auto &writer : record.candidates) {
+    const auto &candidate = stores_.at(writer);
+    // A write already published at sampling time belongs in GlobalMem.
+    if (candidate.global_time && *candidate.global_time <= record.time)
+      continue;
+    const auto &store = candidate.store;
+    for (size_t byte = 0; byte < record.mask.size(); ++byte) {
+      const uint64_t at = record.address + byte;
+      if (record.mask[byte] && at >= store.address && at - store.address < store.mask.size() &&
+          store.mask[at - store.address] && (!local[byte] || local[byte]->store.po < store.po))
+        local[byte] = &candidate;
+    }
+  }
+  bytes.resize(record.mask.size());
+  for (size_t byte = 0; byte < bytes.size(); ++byte) {
+    const auto *candidate = local[byte];
+    if (candidate && candidate->awaits_reference)
+      return "candidate read awaits independent REF local store";
+    bytes[byte] = candidate ? candidate->store.bytes[record.address + byte - candidate->store.address]
+                            : record.global_bytes[byte].value;
+  }
+  return {};
+}
+
 std::string Memory::resolve_modeled(MemorySnapshot &snapshot) const {
   auto active = snapshots_.find(snapshot.id);
   if (active == snapshots_.end())

@@ -239,8 +239,6 @@ int difftest_state() {
   }
 #if NUM_CORES > 1
   if (multicore_runtime().all_done()) {
-    for (int i = 0; i < NUM_CORES; i++)
-      if (difftest[i]->drain_store_checks()) return STATE_ABORT;
     const auto result = multicore_runtime().finish();
     if (result.status == rvwmo::CheckStatus::Pending) return -1;
     if (runtime_error(result, "all-hart finalization")) return STATE_ABORT;
@@ -328,10 +326,8 @@ int difftest_step() {
 #endif
   for (int i = 0; i < NUM_CORES; i++) {
 #if NUM_CORES > 1
-    if (multicore_runtime().done(i)) {
-      if (difftest[i]->drain_store_checks()) return 1;
+    if (multicore_runtime().done(i))
       continue;
-    }
 #endif
     int ret = difftest[i]->step();
     if (ret) {
@@ -689,12 +685,6 @@ inline int Difftest::check_all() {
       }
     }
   }
-
-#if NUM_CORES > 1 && !defined(CONFIG_DIFFTEST_SQUASH)
-  // StoreEvents can arrive in cycles without retirement.
-  if (do_store_check())
-    return 1;
-#endif
 
   if (update_delayed_writeback()) {
     return 1;
@@ -1173,15 +1163,6 @@ int Difftest::do_load_check(int i) {
   return 0;
 }
 
-int Difftest::drain_store_checks() {
-#ifdef CONFIG_DIFFTEST_STOREEVENT
-  store_event_record();
-  return do_store_check();
-#else
-  return 0;
-#endif
-}
-
 int Difftest::do_store_check() {
 #ifdef CONFIG_DIFFTEST_STOREEVENT
   using difftest_detail::StoreAuditAction;
@@ -1195,12 +1176,6 @@ int Difftest::do_store_check() {
     return StoreAuditAction::Consume;
   };
   const auto audit = [&](const DifftestStoreEvent &store_event) {
-#if NUM_CORES > 1
-    const auto checked = multicore_runtime().check_store_event(
-        id, store_event.storeUid, store_event.addr, store_event.data, store_event.mask);
-    if (checked.status == rvwmo::CheckStatus::Pending) return StoreAuditAction::Wait;
-    if (runtime_error(checked, "independent reference store audit")) return StoreAuditAction::Error;
-#else
     auto addr = store_event.addr;
     auto data = store_event.data;
     auto mask = store_event.mask;
@@ -1224,7 +1199,6 @@ int Difftest::do_store_check() {
 
       return StoreAuditAction::Error;
     }
-#endif
     return StoreAuditAction::Consume;
   };
   return difftest_detail::drain_store_audit_fifo(store_event_queue, readiness, audit);

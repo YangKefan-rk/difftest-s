@@ -54,6 +54,7 @@ public:
   // local stores preserve same-byte program order. It only advances REF execution;
   // source verification, canonical read-value and PPO checks remain mandatory.
   CheckResult get_reference_candidate_load(const OperationId &operation, uint32_t attempt, std::vector<uint8_t> &bytes);
+  CheckResult get_local_overlay_load(const OperationId &operation, uint32_t attempt, std::vector<uint8_t> &bytes);
   CheckResult observe_global(uint64_t address, const std::vector<uint8_t> &bytes, const std::vector<uint8_t> &mask,
                              const std::vector<MemoryWriter> &writers, const std::vector<MemoryWriter> &completed,
                              ObservationTime time);
@@ -94,6 +95,7 @@ private:
   struct LoadSample {
     MemoryOperation operation;
     MemorySnapshot snapshot;
+    bool use_local_overlay = false;
   };
   struct Retirement {
     RetiredInstruction instruction;

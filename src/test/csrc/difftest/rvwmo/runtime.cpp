@@ -29,6 +29,11 @@ CheckResult invalid(const std::string &message) {
 CheckResult pending(const std::string &message) {
   return {CheckStatus::Pending, 0, message};
 }
+constexpr size_t cache_line_bytes = 64;
+constexpr size_t max_pending_cacheable_stores = 65536;
+uint64_t cache_line_address(uint64_t address) {
+  return address & ~uint64_t(cache_line_bytes - 1);
+}
 // A retirement packet can contain up to 256 architectural instructions.
 // Reserving this UID interval preserves program order when expanding fusion.
 constexpr uint64_t allocation_uid_stride = 256;
@@ -405,9 +410,13 @@ CheckResult Runtime::record_uc_request(const UcRequest &request,
   if (uc_seen_transactions_.count(key) || uc_seen_transactions_.size() == max_semantic_events)
     return invalid("UC transaction identity was reused or capacity exhausted");
   if (request.kind == UcAccessKind::Store) {
-    const auto store = hart.stores.find(request.store_uid);
-    if (!request.store_uid || store == hart.stores.end() || store->second.id != allocation->second)
-      return invalid("UC request store UID does not identify the bound allocation");
+    auto bound = bind_store(hart, allocation->second, request.store_uid);
+    if (!bound)
+      return bound;
+    auto &store = hart.stores.at(request.store_uid);
+    if (store.cacheable || store.excluded_io || store.uc_requested)
+      return invalid("UC request repeats a store or names a non-UC store");
+    store.uc_requested = true;
   } else if (request.store_uid) {
     return invalid("UC load request unexpectedly names a store UID");
   }
@@ -657,8 +666,8 @@ CheckResult Runtime::capture_native_uc(const std::vector<DiffTestState *> &state
         allocation = live->second;
         if (write) {
           const auto store = harts_[hart].stores.find(store_uid);
-          if (store == harts_[hart].stores.end() || store->second.id != allocation)
-            return invalid("native request StoreIdentity differs from its live allocation");
+          if (!store_uid || (store != harts_[hart].stores.end() && store->second.id != allocation))
+            return invalid("native request store UID differs from its live allocation");
         } else if (store_uid) {
           return invalid("native read request carries a store UID");
         }
@@ -764,6 +773,24 @@ CheckResult Runtime::unsupported(const std::string &reason) {
     coverage_ = {CheckStatus::Unsupported, 0, reason};
   return coverage_;
 }
+CheckResult Runtime::bind_store(Hart &hart, const OperationId &id, uint64_t uid) {
+  if (!uid)
+    return invalid("store observation has no UID");
+  const auto by_uid = hart.stores.find(uid);
+  const auto by_instruction = hart.instruction_stores.find(id);
+  if (by_uid != hart.stores.end() || by_instruction != hart.instruction_stores.end()) {
+    if (by_uid == hart.stores.end() || by_instruction == hart.instruction_stores.end() ||
+        by_uid->second.id != id || by_instruction->second != uid)
+      return invalid("store UID and ROB allocation do not identify the same store");
+    return {};
+  }
+  Store store;
+  store.id = id;
+  hart.stores.emplace(uid, std::move(store));
+  hart.instruction_stores.emplace(id, uid);
+  store_uids_.emplace(id, uid);
+  return {};
+}
 void Runtime::timestamp(uint64_t cycle) {
   latest_cycle_ = std::max(latest_cycle_, cycle);
   last_effect_cycle_ = std::max(last_effect_cycle_, cycle);
@@ -777,23 +804,16 @@ CheckResult Runtime::allocate(unsigned hart, uint16_t rob) {
     // A reused ROB slot ends the previous allocation's speculative lifetime.
     // Committed stores remain live until their normal global/PPO reclamation.
     h.unsupported_allocations.erase(old->second);
-    auto members = h.instruction_stores.find(old->second);
-    if (members != h.instruction_stores.end()) {
-      auto &uids = members->second;
-      for (auto uid = uids.begin(); uid != uids.end();) {
-        auto store = h.stores.find(*uid);
-        if (store != h.stores.end() && !store->second.recorded) {
-          if (store->second.effect_recorded)
-            return invalid("physically published RAM store allocation reused before StoreLocal");
-          store_uids_.erase(store->second.id);
-          h.stores.erase(store);
-          uid = uids.erase(uid);
-        } else {
-          ++uid;
-        }
+    auto identity = h.instruction_stores.find(old->second);
+    if (identity != h.instruction_stores.end()) {
+      auto store = h.stores.find(identity->second);
+      if (!store->second.recorded) {
+        if (store->second.effect_recorded)
+          return invalid("physically published RAM store allocation reused before StoreLocal");
+        h.stores.erase(store);
+        store_uids_.erase(old->second);
+        h.instruction_stores.erase(identity);
       }
-      if (uids.empty())
-        h.instruction_stores.erase(members);
     }
     auto sample = h.loads.find(old->second);
     if (sample != h.loads.end() && !sample->second->retired) {
@@ -835,96 +855,76 @@ CheckResult Runtime::observe(const std::shared_ptr<Load> &load, ObservationTime 
   }
   return result;
 }
-CheckResult Runtime::complete_group(Group &group, ObservationTime time) {
+CheckResult Runtime::complete_group(const Group &group, ObservationTime time) {
   auto &h = harts_.at(group.hart);
-  std::vector<MemoryWriter> writers(group.bytes.size());
-  std::vector<MemoryWriter> completed;
-  std::vector<std::pair<OperationId, MemoryWriter>> ordered_members;
-  for (uint64_t member: group.members) {
-    auto found = h.stores.find(member);
-    if (found == h.stores.end() || !found->second.recorded)
-      return pending("global write awaits local store record");
-    ordered_members.push_back({found->second.id, found->second.memory.writer});
-  }
-  if (ordered_members.empty())
-    return pending("global write awaits store group membership");
-  std::sort(ordered_members.begin(), ordered_members.end(),
-            [](const auto &a, const auto &b) { return a.first < b.first; });
-  if (ordered_members.size() > std::numeric_limits<uint64_t>::max() - time.rank)
+  auto line = h.cacheable_stores.find(group.address);
+  if (line == h.cacheable_stores.end() || line->second.size() < group.member_count)
+    return {CheckStatus::Incomplete, 0, "Sbuffer completion lacks its StoreLocal prefix"};
+  auto &pending_stores = line->second;
+  if (pending_stores[group.member_count - 1] != group.last_store_uid)
+    return invalid("Sbuffer completion tail UID differs from its StoreLocal prefix");
+  if (group.member_count > std::numeric_limits<uint64_t>::max() - time.rank)
     return invalid("merged writer rank space exhausted");
+
+  // Replay the full program-order prefix, including overwritten stores.
+  std::array<uint64_t, cache_line_bytes> final_uids{};
+  std::vector<MemoryWriter> writers(cache_line_bytes);
+  std::vector<uint8_t> architectural_mask(cache_line_bytes);
+  std::vector<MemoryWriter> completed;
   std::vector<ObservationTime> completion_times;
-  for (const auto &member: ordered_members) {
-    completed.push_back(member.second);
+  completed.reserve(group.member_count);
+  completion_times.reserve(group.member_count);
+  for (size_t index = 0; index < group.member_count; ++index) {
+    const auto uid = pending_stores[index];
+    const auto &store = h.stores.at(uid);
+    if (store.local_cycle > group.cycle)
+      return invalid("Sbuffer completion precedes a StoreLocal in its prefix");
+    completed.push_back(store.memory.writer);
     completion_times.push_back({time.rank + completion_times.size(), true});
-  }
-  auto architectural_mask = group.mask;
-  for (size_t byte = 0; byte < group.bytes.size(); ++byte) {
-    if (!group.mask[byte])
-      continue;
-    if (!group.writers[byte]) {
-      // A miss refill may fill clean Sbuffer bytes and widen its physical mask.
-      // Such bytes are not logical stores. Required store bytes must still have
-      // a writer and are never removed from the architectural transaction.
-      const uint64_t address = group.address + byte;
-      bool required = false;
-      for (uint64_t member: group.members) {
-        const auto &store = h.stores.at(member).memory;
-        required |= address >= store.address && address - store.address < store.mask.size() &&
-                    store.mask[address - store.address];
+    const auto offset = store.memory.address - group.address;
+    for (size_t byte = 0; byte < store.memory.mask.size(); ++byte)
+      if (store.memory.mask[byte]) {
+        const auto lane = offset + byte;
+        final_uids[lane] = uid;
+        writers[lane] = store.memory.writer;
+        architectural_mask[lane] = 1;
       }
-      if (!required) {
-        architectural_mask[byte] = 0;
-        continue;
-      }
-    }
-    if (!group.writers[byte] || !group.members.count(group.writers[byte]))
-      return pending("global byte writer lacks matching store group membership: hart=" + std::to_string(group.hart) +
-                     " group=" + std::to_string(group.id) + " address=" + std::to_string(group.address) +
-                     " byte=" + std::to_string(byte) + " writer=" + std::to_string(group.writers[byte]) + " members=" +
-                     std::to_string(group.members.size()) + " first=" + std::to_string(*group.members.begin()));
-    auto found = h.stores.find(group.writers[byte]);
-    if (found == h.stores.end() || !found->second.recorded)
-      return pending("global byte writer awaits local record");
-    writers[byte] = found->second.memory.writer;
   }
+  // Refill-only bytes can widen the physical mask, but must have no writer.
+  for (size_t byte = 0; byte < cache_line_bytes; ++byte)
+    if ((final_uids[byte] && !group.mask[byte]) ||
+        (group.mask[byte] && group.writers[byte] != final_uids[byte]))
+      return invalid("Sbuffer byte writer or mask differs from its StoreLocal prefix: hart=" +
+                     std::to_string(group.hart) + " group=" + std::to_string(group.id) +
+                     " byte=" + std::to_string(byte));
+
   auto result =
       checker_.observe_global(group.address, group.bytes, architectural_mask, writers, completed, completion_times);
-  if (accepted(result)) {
-    if (semantic_export_enabled_) {
-      if (semantic_loads_.size() + semantic_groups_.size() == max_semantic_events) {
-        semantic_export_overflow_ = true;
-      } else if (!semantic_export_overflow_) {
-        SemanticGroup record{group.hart, group.id, group.cycle, group.source_id, group.source_sequence,
-                             group.address, enabled_byte_mask(architectural_mask), {}};
-        for (const auto &member : ordered_members) {
-          record.members.push_back(member.first);
-          record.visible_member_masks.emplace(member.first, 0);
-        }
-        for (size_t byte = 0; byte < architectural_mask.size(); ++byte) {
-          if (!architectural_mask[byte])
-            continue;
-          const auto writer = h.stores.find(group.writers[byte]);
-          if (writer == h.stores.end() || !record.visible_member_masks.count(writer->second.id)) {
-            semantic_export_overflow_ = true;
-            break;
-          }
-          const auto &logical = writer->second.operation;
-          const uint64_t address = group.address + byte;
-          if (address < logical.address || address - logical.address >= logical.byte_mask.size() ||
-              !logical.byte_mask[address - logical.address] || address - logical.address >= 64) {
-            semantic_export_overflow_ = true;
-            break;
-          }
-          record.visible_member_masks.at(writer->second.id) |= UINT64_C(1) << (address - logical.address);
-        }
-        if (!semantic_export_overflow_)
-          semantic_groups_.push_back(std::move(record));
+  if (!accepted(result))
+    return result;
+  if (semantic_export_enabled_) {
+    if (semantic_loads_.size() + semantic_groups_.size() == max_semantic_events) {
+      semantic_export_overflow_ = true;
+    } else if (!semantic_export_overflow_) {
+      SemanticGroup record{group.hart, group.id, group.cycle, group.source_id, group.source_sequence,
+                           group.address, enabled_byte_mask(architectural_mask), {}};
+      for (size_t index = 0; index < group.member_count; ++index) {
+        const auto &member = h.stores.at(pending_stores[index]).id;
+        record.members.push_back(member);
+        record.visible_member_masks.emplace(member, 0);
       }
+      for (size_t byte = 0; byte < cache_line_bytes; ++byte)
+        if (final_uids[byte])
+          record.visible_member_masks.at(h.stores.at(final_uids[byte]).id) |= UINT64_C(1) << byte;
+      semantic_groups_.push_back(std::move(record));
     }
-    ranks_consumed_ = completed.size();
-    return {};
   }
-  return result;
+  pending_stores.erase(pending_stores.begin(), pending_stores.begin() + group.member_count);
+  h.pending_cacheable_stores -= group.member_count;
+  if (pending_stores.empty())
+    h.cacheable_stores.erase(line);
+  ranks_consumed_ = completed.size();
+  return {};
 }
 void Runtime::observe_write(uint64_t cycle, unsigned hart, uint64_t address, const std::vector<uint8_t> &mask,
                             bool qualified_uc) {
@@ -1153,18 +1153,7 @@ CheckResult Runtime::capture_atomics(unsigned hart, DiffTestState &state) {
 
 void Runtime::release_store(Hart &hart, uint64_t uid) {
   auto store = hart.stores.find(uid);
-  // A late StoreEvent still needs the independent trace after writer reclamation.
-  if (!store->second.checker_released || !store->second.store_event_checked)
-    return;
-  auto instruction = store->second.id;
-  instruction.subaccess = 0;
-  auto members = hart.instruction_stores.find(instruction);
-  if (members != hart.instruction_stores.end()) {
-    auto &uids = members->second;
-    uids.erase(std::remove(uids.begin(), uids.end(), uid), uids.end());
-    if (uids.empty())
-      hart.instruction_stores.erase(members);
-  }
+  hart.instruction_stores.erase(store->second.id);
   store_uids_.erase(store->second.id);
   hart.stores.erase(store);
 }
@@ -1176,10 +1165,7 @@ void Runtime::collect_released_stores() {
       harts_.at(id.hart).atomics.erase(id);
       continue;
     }
-    auto &hart = harts_.at(id.hart);
-    const uint64_t uid = wire->second;
-    hart.stores.at(uid).checker_released = true;
-    release_store(hart, uid);
+    release_store(harts_.at(id.hart), wire->second);
   }
 }
 
@@ -1234,11 +1220,11 @@ CheckResult Runtime::capture(const std::vector<DiffTestState *> &states) {
   if (!source.status)
     return failure_ = source.status;
 #endif
-#if NUM_CORES > 1 && defined(CONFIG_DIFFTEST_STOREIDENTITYEVENT) && defined(CONFIG_DIFFTEST_STORELOCALEVENT) &&        \
-    defined(CONFIG_DIFFTEST_LOADSNAPSHOTEVENT) && defined(CONFIG_DIFFTEST_SBUFFEREVENT) &&                             \
-    defined(CONFIG_DIFFTEST_STOREEVENT) && defined(CONFIG_DIFFTEST_TLBEVENT) &&                                        \
-    defined(CONFIG_DIFFTEST_MEMORYTIMEEVENT) && !defined(CONFIG_DIFFTEST_SQUASH) && !defined(CONFIG_DIFFTEST_BATCH) && \
-    !defined(CONFIG_DIFFTEST_REPLAY)
+#if NUM_CORES > 1 && defined(CONFIG_DIFFTEST_STORELOCALEVENT) && defined(CONFIG_DIFFTEST_LOADSNAPSHOTEVENT) && \
+    defined(CONFIG_DIFFTEST_SBUFFEREVENT) && defined(CONFIG_DIFFTEST_TLBEVENT) &&                               \
+    defined(CONFIG_DIFFTEST_MEMORYTIMEEVENT) && defined(CONFIG_DIFFTEST_SOURCEPREFIXEVENT) &&                 \
+    !defined(CONFIG_DIFFTEST_STOREIDENTITYEVENT) && !defined(CONFIG_DIFFTEST_STOREEVENT) &&                    \
+    !defined(CONFIG_DIFFTEST_SQUASH) && !defined(CONFIG_DIFFTEST_BATCH) && !defined(CONFIG_DIFFTEST_REPLAY)
   if (states.size() != harts_.size())
     return invalid("runtime hart count differs from event producer");
   for (const auto *state: states)
@@ -1263,31 +1249,6 @@ CheckResult Runtime::capture(const std::vector<DiffTestState *> &states) {
     for (unsigned port = 0; port < CONFIG_DIFF_COMMIT_WIDTH; ++port)
       if (!h.done && state.commit[port].valid)
         timestamp(state.commit[port].timestamp);
-    for (unsigned port = 0; port < CONFIG_DIFF_STORE_IDENTITY_WIDTH; ++port) {
-      auto &event = state.store_identity[port];
-      if (!event.valid)
-        continue;
-      event.valid = 0;
-      if (h.done)
-        continue;
-      timestamp(event.timestamp);
-      auto allocation = h.allocations.find(event.robidx);
-      if (allocation == h.allocations.end())
-        return invalid("store allocation lacks ROB generation");
-      if (!event.storeUid || event.storeUid <= h.last_store_uid)
-        return invalid("reused, nonmonotonic or zero observed store UID");
-      h.last_store_uid = event.storeUid;
-      auto &members = h.instruction_stores[allocation->second];
-      Store store;
-      store.id = allocation->second;
-      store.id.subaccess = members.size();
-      store_uids_[store.id] = event.storeUid;
-      h.stores.emplace(event.storeUid, std::move(store));
-      members.push_back(event.storeUid);
-      if (event.isVector)
-        h.unsupported_allocations[allocation->second] =
-            "vector store observations are not yet covered by the scalar runtime";
-    }
     for (unsigned port = 0; port < CONFIG_DIFF_STORE_LOCAL_WIDTH; ++port) {
       auto &event = state.store_local[port];
       if (!event.valid)
@@ -1296,12 +1257,12 @@ CheckResult Runtime::capture(const std::vector<DiffTestState *> &states) {
       if (h.done)
         continue;
       timestamp(event.timestamp);
-      auto found = h.stores.find(event.storeUid);
-      if (found == h.stores.end())
-        return invalid("local commit lacks store allocation identity");
+      auto allocation = h.allocations.find(event.robidx);
+      if (allocation == h.allocations.end())
+        return invalid("StoreLocal lacks its ROB allocation");
       if (event.isVector || event.isUnaligned || event.wline || event.exception || !event.addressValid ||
           !event.dataValid) {
-        h.unsupported_allocations[found->second.id] =
+        h.unsupported_allocations[allocation->second] =
             "local store unsupported: hart=" + std::to_string(hart) + " uid=" + std::to_string(event.storeUid) +
             " addr=" + std::to_string(event.addr) + " vector=" + std::to_string(event.isVector) +
             " unaligned=" + std::to_string(event.isUnaligned) + " wline=" + std::to_string(event.wline) +
@@ -1309,20 +1270,36 @@ CheckResult Runtime::capture(const std::vector<DiffTestState *> &states) {
             " dataValid=" + std::to_string(event.dataValid) + " pmem=" + std::to_string(in_pmem(event.addr));
         continue;
       }
-      auto &store = found->second;
+      if (allocation->second.uid <= h.last_local_po)
+        return invalid("StoreLocal observations are not in increasing program order");
+      h.last_local_po = allocation->second.uid;
+      auto bound = bind_store(h, allocation->second, event.storeUid);
+      if (!bound)
+        return bound;
+      auto &store = h.stores.at(event.storeUid);
+      if (store.recorded || store.excluded_io)
+        return invalid("duplicate local store commit");
+      if (!event.mask || (event.addr & 15) || event.cacheable > 1)
+        return invalid("StoreLocal has an invalid scalar byte range or cacheability");
+      if (event.cacheable && h.pending_cacheable_stores == max_pending_cacheable_stores)
+        return {CheckStatus::Incomplete, 0, "pending cacheable StoreLocal bound exceeded"};
+      if (transport_watermark_ && event.timestamp <= *transport_watermark_)
+        return invalid("local commit arrived behind completed transport watermark");
+      store.cacheable = event.cacheable != 0;
+      store.local_cycle = event.timestamp;
       if (!in_pmem(event.addr)) {
         // Uncached device stores have no GlobalMem/SbufferCommit. Accept only
         // a matching skipped retirement, outside coherent RAM coverage.
+        if (store.cacheable || store.uc_requested)
+          return invalid("StoreLocal classifies an excluded device as RAM");
         store.excluded_io = true;
         store.excluded_io_address = event.addr;
         store.excluded_io_cycle = event.timestamp;
         store.excluded_io_mask = event.mask;
         continue;
       }
-      if (transport_watermark_ && event.timestamp <= *transport_watermark_)
-        return invalid("local commit arrived behind completed transport watermark");
-      if (store.recorded)
-        return invalid("duplicate local store commit");
+      if (store.cacheable && store.uc_requested)
+        return invalid("cacheable StoreLocal has an uncached request");
       if (store.effect_recorded) {
         const auto local_mask = mask_bytes(event.mask, 16);
         if (store.memory.address != event.addr || store.memory.mask != local_mask)
@@ -1348,14 +1325,9 @@ CheckResult Runtime::capture(const std::vector<DiffTestState *> &states) {
       if (!accepted(result))
         return result;
       store.recorded = true;
-    }
-    for (unsigned port = 0; port < CONFIG_DIFF_STORE_WIDTH; ++port) {
-      const auto &event = state.store[port];
-      if (event.valid && event.groupId && event.storeUid) {
-        auto &group = groups_[{hart, event.groupId}];
-        group.hart = hart;
-        group.id = event.groupId;
-        group.members.insert(event.storeUid);
+      if (store.cacheable) {
+        h.cacheable_stores[cache_line_address(event.addr)].push_back(event.storeUid);
+        ++h.pending_cacheable_stores;
       }
     }
     for (unsigned port = 0; port < CONFIG_DIFF_LOAD_SNAPSHOT_WIDTH; ++port) {
@@ -1413,13 +1385,16 @@ CheckResult Runtime::capture(const std::vector<DiffTestState *> &states) {
       if (!event.valid)
         continue;
       event.valid = 0;
-      if (!event.groupId) {
-        unsupported("store buffer completion has no transaction identity");
-        continue;
-      }
-      auto &group = groups_[{hart, event.groupId}];
-      if (group.queued)
-        continue;
+      if (!event.groupId || !event.memberCount || !event.lastStoreUid || !event.mask ||
+          event.addr != cache_line_address(event.addr))
+        return invalid("Sbuffer completion has an invalid line or store group identity");
+      if (event.memberCount > max_pending_cacheable_stores)
+        return {CheckStatus::Incomplete, 0, "Sbuffer completion exceeds the StoreLocal bound"};
+      const auto key = std::make_pair(hart, event.groupId);
+      auto member = groups_.try_emplace(key);
+      if (!member.second)
+        return invalid("duplicate queued Sbuffer transaction identity");
+      auto &group = member.first->second;
       if (transport_watermark_ && event.timestamp <= *transport_watermark_)
         return invalid("global completion arrived behind completed transport watermark");
       timestamp(event.timestamp);
@@ -1431,14 +1406,14 @@ CheckResult Runtime::capture(const std::vector<DiffTestState *> &states) {
       group.source_sequence = event.sourceSequence;
 #endif
       group.address = event.addr;
-      group.bytes.assign(event.data, event.data + 64);
-      group.mask = mask_bytes(event.mask, 64);
-      group.writers.assign(event.byteWriterUid, event.byteWriterUid + 64);
-      group.queued = true;
+      group.member_count = event.memberCount;
+      group.last_store_uid = event.lastStoreUid;
+      group.bytes.assign(event.data, event.data + cache_line_bytes);
+      group.mask = mask_bytes(event.mask, cache_line_bytes);
+      group.writers.assign(event.byteWriterUid, event.byteWriterUid + cache_line_bytes);
       // Refill-only bytes are not logical writes. Keep group.mask intact so
       // complete_group still rejects missing provenance for required bytes.
       observe_write(group.cycle, hart, group.address, logical_store_mask(group.mask, group.writers));
-      auto key = std::make_pair(hart, event.groupId);
       auto inserted =
           events_.emplace(EventKey{event.timestamp, 2, event.groupId, hart},
                           [this, key](ObservationTime time) { return complete_group(groups_.at(key), time); });
@@ -1487,22 +1462,17 @@ CheckResult Runtime::capture(const std::vector<DiffTestState *> &states) {
     return coverage_;
   if (latest_cycle_ == 0)
     return {};
-#ifdef CONFIG_DIFFTEST_SOURCEPREFIXEVENT
   // The slowest actual producer prefix determines closure, including gated
   // clocks and delivery counts. No host callback order supplies a memory rank.
   const auto memory_closed = uc_effective_watermark(source.closed_through);
   if (!memory_closed)
     return {};
   auto result = advance(*memory_closed);
-#else
-  // Older event producers cannot earn a certified final source boundary.
-  auto result = advance(latest_cycle_ > 3 ? latest_cycle_ - 3 : 0);
-#endif
   return result.status == CheckStatus::Pending ? CheckResult{} : result;
 #else
   (void)states;
   return unsupported(
-      "multicore RVWMO event capability is missing or batched/squashed/replayed transport is unsupported");
+      "multicore RVWMO requires qualified StoreLocal/Sbuffer producers and source-prefix transport");
 #endif
 }
 
@@ -1526,11 +1496,8 @@ CheckResult Runtime::before_commit(unsigned hart, unsigned port, DiffTestState &
     return unsupported("retirement lacks complete allocation identity stream");
   bool excluded_io = false;
   if (commit.skip && commit.isStore) {
-    auto members = h.instruction_stores.find(allocation->second);
-    if (members != h.instruction_stores.end() && members->second.size() == 1) {
-      auto store = h.stores.find(members->second.front());
-      excluded_io = store != h.stores.end() && store->second.excluded_io;
-    }
+    const auto store = h.instruction_stores.find(allocation->second);
+    excluded_io = store != h.instruction_stores.end() && h.stores.at(store->second).excluded_io;
   }
   bool qualified_uc = false;
   if (commit.skip && uc_profile_.kind != UcRamProfileKind::Disabled) {
@@ -1538,11 +1505,8 @@ CheckResult Runtime::before_commit(unsigned hart, unsigned port, DiffTestState &
       const auto load = h.loads.find(allocation->second);
       qualified_uc = load != h.loads.end() && load->second->qualified_uc;
     } else if (commit.isStore) {
-      const auto members = h.instruction_stores.find(allocation->second);
-      if (members != h.instruction_stores.end() && members->second.size() == 1) {
-        const auto store = h.stores.find(members->second.front());
-        qualified_uc = store != h.stores.end() && store->second.qualified_uc;
-      }
+      const auto store = h.instruction_stores.find(allocation->second);
+      qualified_uc = store != h.instruction_stores.end() && h.stores.at(store->second).qualified_uc;
     }
   }
   if ((commit.skip && !excluded_io && !qualified_uc) || commit.special ||
@@ -1710,7 +1674,9 @@ CheckResult Runtime::before_commit(unsigned hart, unsigned port, DiffTestState &
     // A remote source may await another hart's REF step. Candidate bytes let REF
     // advance; Checker retains final validation until every selected source is audited.
     std::vector<uint8_t> candidate;
-    auto result = checker_.get_reference_candidate_load(load->operation.id, load->operation.attempt, candidate);
+    auto result = load->qualified_uc
+                      ? checker_.get_reference_candidate_load(load->operation.id, load->operation.attempt, candidate)
+                      : checker_.get_local_overlay_load(load->operation.id, load->operation.attempt, candidate);
     if (!result)
       return result;
     const size_t offset = address - load->operation.address;
@@ -1733,12 +1699,14 @@ CheckResult Runtime::before_commit(unsigned hart, unsigned port, DiffTestState &
   }
   if (commit.isStore && !excluded_io) {
     auto found = h.instruction_stores.find(allocation->second);
-    if (found == h.instruction_stores.end() || found->second.size() != 1)
+    if (found == h.instruction_stores.end())
       return unsupported("retired store lacks a single scalar allocation identity");
-    active.store_uid = found->second.front();
+    active.store_uid = found->second;
     const auto &store = h.stores.at(active.store_uid);
     if (!store.recorded)
       return pending("retired store awaits its local commit observation");
+    if (!store.cacheable && !store.qualified_uc)
+      return unsupported("retired uncached RAM store lacks a qualified write effect");
     if (!reference.supports_store_step())
       return unsupported("reference lacks difftest_exec_store_v1");
     if (store.external_effect) {
@@ -1920,28 +1888,23 @@ CheckResult Runtime::after_commit(unsigned hart, RefProxy &reference) {
   }
   h.last_retired_uid = active.instruction.uid;
   if (active.instruction.memory.empty()) {
-    auto members = h.instruction_stores.find({hart, 0, active.instruction.uid, 0});
-    if (members != h.instruction_stores.end()) {
-      for (auto uid: members->second) {
-        auto store = h.stores.find(uid);
-        if (store != h.stores.end() && store->second.excluded_io) {
-          if (semantic_export_enabled_) {
-            semantic_excluded_device_store_ = true;
-            if (semantic_excluded_device_stores_.size() >= max_semantic_events) {
-              semantic_export_overflow_ = true;
-            } else {
-              semantic_excluded_device_stores_.push_back({store->second.id, uid, active.instruction.pc,
-                                                         active.instruction.instruction,
-                                                         store->second.excluded_io_address,
-                                                         store->second.excluded_io_cycle,
-                                                         store->second.excluded_io_mask});
-            }
+    auto found = h.instruction_stores.find({hart, 0, active.instruction.uid, 0});
+    if (found != h.instruction_stores.end()) {
+      const auto uid = found->second;
+      const auto &store = h.stores.at(uid);
+      if (store.excluded_io) {
+        if (semantic_export_enabled_) {
+          semantic_excluded_device_store_ = true;
+          if (semantic_excluded_device_stores_.size() >= max_semantic_events) {
+            semantic_export_overflow_ = true;
+          } else {
+            semantic_excluded_device_stores_.push_back({store.id, uid, active.instruction.pc,
+                                                       active.instruction.instruction, store.excluded_io_address,
+                                                       store.excluded_io_cycle, store.excluded_io_mask});
           }
-          store_uids_.erase(store->second.id);
-          h.stores.erase(store);
         }
+        release_store(h, uid);
       }
-      h.instruction_stores.erase(members);
     }
   }
   auto result = checker_.retire(active.instruction, loads);
@@ -2038,7 +2001,7 @@ void Runtime::record_checked_fused_retirement(Active &active) {
 }
 CheckResult Runtime::confirm_reference_store(Hart &hart, const Active &active) {
   auto &store = hart.stores.at(active.store_uid);
-  if (!active.reference_store || store.reference)
+  if (!active.reference_store || store.ref_verified)
     return invalid("retired store lacks a unique independent REF trace");
   const auto &trace = *active.reference_store;
   if (!trace.mask || trace.address % 8 || (trace.address & ~UINT64_C(15)) != store.memory.address)
@@ -2060,40 +2023,8 @@ CheckResult Runtime::confirm_reference_store(Hart &hart, const Active &active) {
     else
       audited_semantic_stores_.insert(store.id);
   }
-  store.reference = trace;
-  // Device-classified RAM has a qualified write effect instead of a StoreEvent.
-  store.store_event_checked = bool(active.uc_store_effect);
+  store.ref_verified = true;
   collect_released_stores();
-  return {};
-}
-
-CheckResult Runtime::check_store_event(unsigned hart, uint64_t uid, uint64_t address, uint64_t data, uint8_t mask) {
-  if (!covered())
-    return coverage_;
-  auto &h = harts_.at(hart);
-  auto found = h.stores.find(uid);
-  if (found == h.stores.end() || found->second.store_event_checked)
-    return invalid("StoreEvent lacks a unique store identity");
-  if (!found->second.reference) {
-    if (h.done || found->second.id.uid <= h.last_retired_uid)
-      return invalid("StoreEvent has no independently executed store: hart=" + std::to_string(hart) +
-                     " storeUid=" + std::to_string(uid));
-    return pending("StoreEvent awaits its independent REF step");
-  }
-  const auto &trace = *found->second.reference;
-  bool matches = trace.address == address && trace.mask == mask;
-  for (unsigned byte = 0; matches && byte < 8; ++byte)
-    if ((mask >> byte) & 1)
-      matches = (((trace.data ^ data) >> (8 * byte)) & 255) == 0;
-  if (!matches) {
-    std::ostringstream message;
-    message << "StoreEvent differs from independent REF: hart=" << hart << " storeUid=" << uid
-            << std::hex << " DUT=0x" << address << "/0x" << data << "/0x" << unsigned(mask)
-            << " REF=0x" << trace.address << "/0x" << trace.data << "/0x" << unsigned(trace.mask);
-    return failure_ = {CheckStatus::Violation, 0, message.str()};
-  }
-  found->second.store_event_checked = true;
-  release_store(h, uid);
   return {};
 }
 
@@ -2151,8 +2082,6 @@ CheckResult Runtime::finish() {
         return pending("INCOMPLETE_RUN: physical RAM write still awaits its bound StoreLocal");
       else if (entry.second.recorded && entry.second.id.uid > h.end_uid)
         return {CheckStatus::Unsupported, 0, "local store beyond the selected hart termination prefix"};
-      else if (entry.second.reference && !entry.second.store_event_checked)
-        return pending("INCOMPLETE_RUN: audited store still awaits its StoreEvent");
   for (auto &h: harts_)
     for (auto &entry: h.loads) {
       auto &load = entry.second;
@@ -2179,6 +2108,9 @@ CheckResult Runtime::finish() {
     return result;
   if (!events_.empty())
     return pending("INCOMPLETE_RUN: captured memory events await source-cycle closure");
+  for (const auto &hart : harts_)
+    if (hart.pending_cacheable_stores)
+      return pending("INCOMPLETE_RUN: StoreLocal awaits Sbuffer completion");
   auto final_check = checker_.finalize();
   if (final_check)
     finalized_ = true;
@@ -2320,7 +2252,7 @@ bool Runtime::export_semantic_observed_prefix() const {
     complete_external = bool(uc_profile_.native_bridge->finish()) && boundary.catalog_complete &&
         certified_closed && *certified_closed >= last_effect_cycle_ &&
         external_producers.size() == boundary.expected_producers &&
-        producers.size() == 4 * 124 && std::all_of(external_producers.begin(), external_producers.end(),
+        complete_roster && std::all_of(external_producers.begin(), external_producers.end(),
             [&](const UcRawWatermark &entry) {
               return entry.reset_verified && entry.closed_through &&
                      *entry.closed_through >= *certified_closed;

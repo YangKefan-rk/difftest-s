@@ -9,6 +9,7 @@ object ObservationClock {
   private[difftest] final class SourceContract(
     val maxSampleDelayEdges: Int,
     stableHartId: UInt,
+    val useCompactStoreEvents: Boolean,
   ) {
     private var nextSourceId = 0
 
@@ -35,13 +36,20 @@ object ObservationClock {
 
   def withSource[T](cycle: UInt)(body: => T): T = scopedSource(cycle, None)(body)
 
-  def withSource[T](cycle: UInt, maxSampleDelayEdges: Int, hartId: UInt)(body: => T): T = {
+  def withSource[T](
+    cycle: UInt,
+    maxSampleDelayEdges: Int,
+    hartId: UInt,
+    useCompactStoreEvents: Boolean = false,
+  )(body: => T): T = {
     require(maxSampleDelayEdges >= 0 && maxSampleDelayEdges < 256)
     require(hartId.getWidth > 0 && hartId.getWidth <= 8)
-    scopedSource(cycle, Some(new SourceContract(maxSampleDelayEdges, hartId)))(body)
+    scopedSource(cycle, Some(new SourceContract(maxSampleDelayEdges, hartId, useCompactStoreEvents)))(body)
   }
 
   private[difftest] def sourceContract: Option[SourceContract] = source.flatMap(_.contract)
+
+  def usesCompactStoreEvents: Boolean = sourceContract.exists(_.useCompactStoreEvents)
 
   def apply(): UInt = {
     val connected = source.getOrElse(throw new IllegalArgumentException("memory observation clock is not connected"))

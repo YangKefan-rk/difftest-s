@@ -73,6 +73,8 @@ public:
                      bool source_prefix_closed = false,
                      std::optional<MemoryWriter> atomic_writer = std::nullopt);
   std::string resolve(MemorySnapshot &snapshot) const;
+  // Scalar REF bytes: overlay the older local stores still private at the sample.
+  std::string resolve_local_overlay(const MemorySnapshot &snapshot, std::vector<uint8_t> &bytes) const;
   // Derives a specification witness independently of observed forwarding tags.
   // A complete ordered source prefix may certify a pending local writer after
   // the sample. Other candidates still need their actual publication rank.

@@ -254,8 +254,6 @@ public:
   bool has_commit = false;
   // Trigger a difftest checking procdure
   int step();
-  // Audit already retired stores after architectural termination.
-  int drain_store_checks();
   void update_nemuproxy(int, size_t);
   inline bool get_trap_valid() {
     return dut->trap.hasTrap;
