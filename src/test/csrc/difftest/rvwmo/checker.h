@@ -11,7 +11,8 @@ namespace rvwmo {
 
 enum class StoreVerification {
   Provisional,
-  Verified
+  Verified,
+  AwaitingReference
 };
 
 struct RetiredLoad {
@@ -112,7 +113,11 @@ private:
   std::map<uint32_t, uint64_t> next_writer_uid_;
   std::set<uint32_t> exhausted_writer_harts_;
   std::map<OperationId, MemoryOperation> stores_;
-  std::map<OperationId, MemoryStore> unverified_stores_;
+  struct UnverifiedStore {
+    MemoryStore observed;
+    StoreVerification verification;
+  };
+  std::map<OperationId, UnverifiedStore> unverified_stores_;
   std::set<OperationId> checked_stores_;
   std::set<OperationId> completed_stores_;
   std::set<OperationId> retired_pending_publication_;

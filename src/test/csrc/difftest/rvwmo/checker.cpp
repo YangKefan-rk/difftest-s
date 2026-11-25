@@ -155,7 +155,8 @@ CheckResult Checker::record_store(const MemoryStore &store, const MemoryOperatio
   auto statistics = ensure_statistics_hart(operation.id.hart);
   if (!statistics)
     return remember_failure(statistics);
-  auto error = memory_.commit_local(store);
+  auto error = verification == StoreVerification::AwaitingReference ? memory_.stage_local(store)
+                                                                     : memory_.commit_local(store);
   if (!error.empty())
     return remember_failure(invalid(error));
   writers_[store.writer] = operation.id;
@@ -168,8 +169,8 @@ CheckResult Checker::record_store(const MemoryStore &store, const MemoryOperatio
       next = store.writer.uid + 1;
   }
   stores_[operation.id] = operation;
-  if (verification == StoreVerification::Provisional)
-    unverified_stores_[operation.id] = store;
+  if (verification != StoreVerification::Verified)
+    unverified_stores_.emplace(operation.id, UnverifiedStore{store, verification});
   return accepted_event(poll());
 }
 
@@ -179,7 +180,7 @@ CheckResult Checker::verify_store(const OperationId &operation, const MemoryStor
   auto found = unverified_stores_.find(operation);
   if (found == unverified_stores_.end())
     return remember_failure(invalid("store verification references an unknown or already verified operation"));
-  const auto &candidate = found->second;
+  const auto &candidate = found->second.observed;
   bool matches = reference.writer == candidate.writer && reference.po == candidate.po &&
                  reference.address == candidate.address && reference.mask == candidate.mask &&
                  reference.bytes.size() == candidate.bytes.size();
@@ -194,6 +195,11 @@ CheckResult Checker::verify_store(const OperationId &operation, const MemoryStor
   auto &statistics = memory_statistics_.at(operation.hart);
   if (statistics.store_audits == std::numeric_limits<uint64_t>::max())
     return remember_failure(invalid("checker store-audit counter exhausted"));
+  if (found->second.verification == StoreVerification::AwaitingReference) {
+    auto error = memory_.confirm_local(reference);
+    if (!error.empty())
+      return remember_failure(invalid(error));
+  }
   unverified_stores_.erase(found);
   ++statistics.store_audits;
   return accepted_event(poll());
@@ -475,6 +481,7 @@ CheckResult Checker::prepare(Retirement &retirement) {
                      ? memory_.resolve_modeled(load->second.snapshot)
                      : memory_.resolve(load->second.snapshot);
     if (error == "forwarded source store has not locally committed" ||
+        error == "forwarded source store awaits independent REF" ||
         error.find("forwarding identity required") != std::string::npos ||
         error.find("modeled read awaits") != std::string::npos)
       return pending(error);

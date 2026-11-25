@@ -57,8 +57,12 @@ public:
   Memory(ReadGlobal read, WriteGlobal write);
 
   std::string commit_local(const MemoryStore &store);
+  // Staged DUT evidence can participate in publication, but cannot supply a local read.
+  std::string stage_local(const MemoryStore &store);
+  std::string confirm_local(const MemoryStore &reference);
   // Translation/fetch view only; architectural data loads use timed snapshots.
   bool read_local(uint32_t hart, uint64_t before_po, uint64_t address, uint8_t &byte) const;
+  bool has_pending_local(uint32_t hart, uint64_t before_po, uint64_t address) const;
   // writers[i] names the logical store responsible for transaction byte i.
   // completed contains all merged logical stores, including overwritten stores.
   std::string commit_global(uint64_t address, const std::vector<uint8_t> &bytes, const std::vector<uint8_t> &mask,
@@ -102,6 +106,8 @@ private:
     MemoryStore store;
     bool pending = true;
     std::optional<uint64_t> global_time;
+    bool awaits_reference = false;
+    void read_byte(uint64_t address, MemoryByte &byte) const;
   };
   struct SnapshotRecord {
     uint32_t hart = 0;
@@ -132,6 +138,8 @@ private:
   std::map<uint64_t, uint64_t> global_times_;
   std::map<uint32_t, std::map<uint64_t, std::vector<MemoryWriter>>> local_;
   std::map<uint64_t, SnapshotRecord> snapshots_;
+  std::string record_local(const MemoryStore &store, bool awaits_reference);
+  const StoreRecord *preceding_local(uint32_t hart, uint64_t before_po, uint64_t address) const;
   void retain_candidate(SnapshotRecord &snapshot, const MemoryWriter &writer);
   void retire_store(const MemoryWriter &writer);
   void collect_store(const MemoryWriter &writer);

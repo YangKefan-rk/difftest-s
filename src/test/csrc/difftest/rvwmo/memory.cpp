@@ -30,26 +30,65 @@ Memory::Memory(ReadGlobal read, WriteGlobal write) : read_(std::move(read)), wri
     throw std::invalid_argument("GlobalMem callbacks are required");
 }
 
-bool Memory::read_local(uint32_t hart, uint64_t before_po, uint64_t address, uint8_t &byte) const {
+const Memory::StoreRecord *Memory::preceding_local(uint32_t hart, uint64_t before_po, uint64_t address) const {
   auto local = local_.find(hart);
   if (local == local_.end())
-    return false;
+    return nullptr;
   auto versions = local->second.find(address);
   if (versions == local->second.end())
-    return false;
-  const MemoryStore *selected = nullptr;
+    return nullptr;
+  const StoreRecord *selected = nullptr;
   for (const auto &writer : versions->second) {
-    const auto &store = stores_.at(writer).store;
-    if (store.po < before_po && (!selected || store.po > selected->po))
-      selected = &store;
+    const auto &record = stores_.at(writer);
+    if (record.store.po < before_po && (!selected || record.store.po > selected->store.po))
+      selected = &record;
   }
-  if (!selected)
+  return selected;
+}
+
+bool Memory::read_local(uint32_t hart, uint64_t before_po, uint64_t address, uint8_t &byte) const {
+  const auto *selected = preceding_local(hart, before_po, address);
+  if (!selected || selected->awaits_reference)
     return false;
-  byte = selected->bytes.at(address - selected->address);
+  byte = selected->store.bytes.at(address - selected->store.address);
   return true;
 }
 
+bool Memory::has_pending_local(uint32_t hart, uint64_t before_po, uint64_t address) const {
+  return preceding_local(hart, before_po, address) != nullptr;
+}
+
+void Memory::StoreRecord::read_byte(uint64_t address, MemoryByte &byte) const {
+  byte.writer = store.writer;
+  byte.writer_time = global_time;
+  byte.deferred = awaits_reference;
+  if (!awaits_reference)
+    byte.value = store.bytes[address - store.address];
+}
+
 std::string Memory::commit_local(const MemoryStore &store) {
+  return record_local(store, false);
+}
+
+std::string Memory::stage_local(const MemoryStore &store) {
+  return record_local(store, true);
+}
+
+std::string Memory::confirm_local(const MemoryStore &reference) {
+  auto found = stores_.find(reference.writer);
+  if (found == stores_.end() || !found->second.awaits_reference)
+    return "REF confirms an unknown or already confirmed local store";
+  const auto &observed = found->second.store;
+  if (reference.po != observed.po || reference.address != observed.address || reference.mask != observed.mask ||
+      reference.bytes.size() != observed.bytes.size())
+    return "confirmed local store shape differs from its observation";
+  found->second.store.bytes = reference.bytes;
+  found->second.awaits_reference = false;
+  collect_store(reference.writer);
+  return {};
+}
+
+std::string Memory::record_local(const MemoryStore &store, bool awaits_reference) {
   auto error = check_range(store.address, store.bytes.size());
   if (!error.empty())
     return error;
@@ -61,7 +100,7 @@ std::string Memory::commit_local(const MemoryStore &store) {
     return "store UID zero is reserved";
   if (stores_.count(store.writer))
     return "duplicate live store UID";
-  stores_.emplace(store.writer, StoreRecord{store, true, std::nullopt});
+  stores_.emplace(store.writer, StoreRecord{store, true, std::nullopt, awaits_reference});
   // An early load sample can precede retirement of any of its older stores.
   // Preserve the newest eligible byte version until that sample is checked.
   for (auto &entry: snapshots_) {
@@ -274,29 +313,27 @@ std::string Memory::sample(uint32_t hart, uint64_t po, uint64_t time, uint64_t a
     record.global_bytes[i] = byte;
     if (byte.writer)
       ++references_[*byte.writer];
-    const MemoryStore *newest = nullptr;
+    const StoreRecord *newest = nullptr;
     auto local = local_.find(hart);
     if (local != local_.end()) {
       auto versions = local->second.find(at);
       if (versions != local->second.end()) {
         for (const auto &writer: versions->second) {
-          const auto &store = stores_.at(writer).store;
-          if (store.po < po) {
+          const auto &candidate = stores_.at(writer);
+          if (candidate.store.po < po) {
             retain_candidate(record, writer);
-            if (source_prefix_closed && !stores_.at(writer).global_time)
+            if (source_prefix_closed && !candidate.global_time)
               record.unpublished_after_sample.insert(writer);
-            if (!newest || store.po > newest->po)
-              newest = &store;
+            if (!newest || candidate.store.po > newest->store.po)
+              newest = &candidate;
           }
         }
       }
     }
     if (newest) {
-      byte.value = newest->bytes[at - newest->address];
-      byte.writer = newest->writer;
-      byte.writer_time = stores_.at(newest->writer).global_time;
-      record.latest_local_po[i] = newest->po;
-      byte.sampled_local_po = newest->po;
+      newest->read_byte(at, byte);
+      record.latest_local_po[i] = newest->store.po;
+      byte.sampled_local_po = newest->store.po;
     }
     if (!forwarded.empty() && forwarded[i]) {
       // Keep an independent source-store reference, not the DUT's returned value.
@@ -329,7 +366,9 @@ std::string Memory::resolve(MemorySnapshot &snapshot) const {
         auto source = stores_.find(*byte.writer);
         if (source == stores_.end())
           return "forwarded source store has not locally committed";
-        byte.writer_time = source->second.global_time;
+        source->second.read_byte(snapshot.address + i, byte);
+        if (byte.deferred)
+          return "forwarded source store awaits independent REF";
       }
       continue;
     }
@@ -347,9 +386,9 @@ std::string Memory::resolve(MemorySnapshot &snapshot) const {
       return byte_error("forwarding bypassed a newer local store", at);
     if (at < store.address || at - store.address >= store.bytes.size() || !store.mask[at - store.address])
       return byte_error("forwarding source does not write load byte", at);
-    byte.value = store.bytes[at - store.address];
-    byte.deferred = false;
-    byte.writer_time = found->second.global_time;
+    found->second.read_byte(at, byte);
+    if (byte.deferred)
+      return "forwarded source store awaits independent REF";
   }
   return {};
 }
@@ -397,8 +436,7 @@ std::string Memory::resolve_modeled(MemorySnapshot &snapshot) const {
       }
       if (!resolved[i].writer || *candidate.global_time > *latest[i]) {
         latest[i] = candidate.global_time;
-        resolved[i].value = store.bytes[at - store.address];
-        resolved[i].writer = writer;
+        candidate.read_byte(at, resolved[i]);
       } else if (*candidate.global_time == *latest[i] && resolved[i].writer && !(*resolved[i].writer == writer)) {
         return byte_error("distinct candidate stores share one global rank", at);
       }
@@ -412,13 +450,15 @@ std::string Memory::resolve_modeled(MemorySnapshot &snapshot) const {
     // than its GlobalMem baseline. Same-byte store PPO orders local versions;
     // the checker retains those publication obligations separately from L.
     if (!local.global_time) {
-      resolved[i].value = local.store.bytes[snapshot.address + i - local.store.address];
-      resolved[i].writer = local.store.writer;
+      local.read_byte(snapshot.address + i, resolved[i]);
       latest[i].reset();
     }
   }
-  for (size_t i = 0; i < resolved.size(); ++i)
+  for (size_t i = 0; i < resolved.size(); ++i) {
+    if (record.mask[i] && resolved[i].deferred)
+      return "modeled read awaits independent REF local store";
     resolved[i].writer_time = latest[i];
+  }
   snapshot.bytes = std::move(resolved);
   return {};
 }
@@ -466,8 +506,7 @@ std::string Memory::resolve_candidate(MemorySnapshot &snapshot) const {
         newest_local[i] = &candidate;
       if (candidate.global_time && (!provisional[i].writer || !latest[i] || *candidate.global_time > *latest[i])) {
         latest[i] = candidate.global_time;
-        provisional[i].value = store.bytes[at - store.address];
-        provisional[i].writer = writer;
+        candidate.read_byte(at, provisional[i]);
       }
     }
   }
@@ -478,14 +517,16 @@ std::string Memory::resolve_candidate(MemorySnapshot &snapshot) const {
     // The same-address store PPO will ultimately order all local versions.
     // Only an unresolved latest local version needs this provisional override.
     if (candidate && !candidate->global_time) {
-      provisional[i].value = candidate->store.bytes[snapshot.address + i - candidate->store.address];
-      provisional[i].writer = candidate->store.writer;
+      candidate->read_byte(snapshot.address + i, provisional[i]);
       latest[i].reset();
     } else if (!latest[i])
       return "candidate read awaits global baseline timestamp";
   }
-  for (size_t i = 0; i < provisional.size(); ++i)
+  for (size_t i = 0; i < provisional.size(); ++i) {
+    if (record.mask[i] && provisional[i].deferred)
+      return "candidate read awaits independent REF local store";
     provisional[i].writer_time = latest[i];
+  }
   snapshot.bytes = std::move(provisional);
   return {};
 }
@@ -523,7 +564,7 @@ std::string Memory::compare(MemorySnapshot &snapshot, const std::vector<uint8_t>
 }
 void Memory::collect_store(const MemoryWriter &writer) {
   auto found = stores_.find(writer);
-  if (found != stores_.end() && found->second.pending) return;
+  if (found != stores_.end() && (found->second.pending || found->second.awaits_reference)) return;
   if (references_.count(writer)) return;
   if (found != stores_.end()) stores_.erase(found);
   if (!has_global_reference(writer)) reclaimable_writers_.insert(writer);
