@@ -137,7 +137,6 @@ object Gateway {
   private var config = GatewayConfig()
   
   def needEndpoint = config.needEndpoint
-  def isSquash: Boolean = config.isSquash
 
   def setConfig(cfg: String): Unit = {
     cfg.foreach {

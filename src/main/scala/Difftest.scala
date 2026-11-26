@@ -423,12 +423,10 @@ class DiffMemoryTimeEvent extends MemoryTimeEvent with DifftestBundle {
 
 class DiffSourceResetEvent extends SourceResetEvent with DifftestBundle {
   override val desiredCppName: String = "source_reset"
-  override val squashGroup: Seq[String] = Seq()
 }
 
 class DiffSourcePrefixEvent extends SourcePrefixEvent with DifftestBundle with DifftestWithIndex {
   override val desiredCppName: String = "source_prefix"
-  override val squashGroup: Seq[String] = Seq()
 }
 
 class DiffStoreLocalEvent
@@ -438,7 +436,6 @@ class DiffStoreLocalEvent
   with DifftestSourceEvent {
   override def producerKind: Int = 4
   override val desiredCppName: String = "store_local"
-  override val squashGroup: Seq[String] = Seq()
 }
 
 class DiffLoadEvent extends LoadEvent with DifftestBundle with DifftestWithIndex {
@@ -479,7 +476,6 @@ class DiffAtomicMemoryEvent
   with DifftestSourceEvent {
   override def producerKind: Int = 8
   override val desiredCppName: String = "atomic_memory"
-  override val squashGroup: Seq[String] = Seq()
 }
 
 class DiffCMOInvalEvent extends CMOInvalEvent with DifftestBundle {

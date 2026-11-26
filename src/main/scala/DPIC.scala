@@ -213,7 +213,6 @@ class DPIC[T <: DifftestBundle](gen: T, config: GatewayConfig) extends DPICBase(
   }
 
   private def sourceBoundaryCallback: Seq[String] = gen match {
-    case _ if config.isSquash => Seq.empty
     case _: DiffSourceResetEvent =>
       Seq("difftest_rvwmo_source_reset(io_coreid, io_asserted, io_sourceCycle, io_sequence);")
     case _: DiffSourcePrefixEvent =>
@@ -410,9 +409,7 @@ object DPIC {
     interfaceCpp += ""
     interfaceCpp += "#include <cstdint>"
     interfaceCpp += "#include \"diffstate.h\""
-    if (!config.isSquash) {
-      interfaceCpp += "#include \"rvwmo/source_boundary.h\""
-    }
+    interfaceCpp += "#include \"rvwmo/source_boundary.h\""
     interfaceCpp += "#if defined(CONFIG_DIFFTEST_BATCH) && !defined(CONFIG_PLATFORM_FPGA)"
     interfaceCpp += "#include \"svdpi.h\""
     interfaceCpp += "#endif // CONFIG_DIFFTEST_BATCH && !CONFIG_PLATFORM_FPGA"

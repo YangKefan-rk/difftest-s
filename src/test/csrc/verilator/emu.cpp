@@ -498,10 +498,7 @@ Emulator::Emulator(int argc, const char *argv[])
   if (args.enable_diff) {
     init_globalmem();
     size_t ref_ramsize = args.ram_size ? simMemory->get_size() : 0;
-    if (init_nemuproxy(ref_ramsize)) {
-      trapCode = STATE_ABORT;
-      args.enable_runahead = false;
-    }
+    init_nemuproxy(ref_ramsize);
   }
 #endif // CONFIG_NO_DIFFTEST
 #ifdef ENABLE_RUNAHEAD
@@ -1196,8 +1193,7 @@ void Emulator::display_trapinfo() {
     difftest[i]->display_stats();
 
 #ifdef TRACE_INFLIGHT_MEM_INST
-    if (args.enable_runahead)
-      runahead[i]->memdep_watcher->print_pred_matrix();
+    runahead[i]->memdep_watcher->print_pred_matrix();
 #endif
   }
 

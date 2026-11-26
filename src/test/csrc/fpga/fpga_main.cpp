@@ -48,7 +48,7 @@ struct core_end_info_t {
 };
 static core_end_info_t core_end_info;
 
-int fpga_init();
+void fpga_init();
 void fpga_step();
 void cpu_endtime_check();
 void set_diff_ref_so(char *s);
@@ -59,10 +59,7 @@ FpgaXdma *xdma_device = NULL;
 int main(int argc, char *argv[]) {
   args_parsing(argc, argv);
 
-  if (int status = fpga_init()) {
-    fpga_finish();
-    return status;
-  }
+  fpga_init();
   printf("simv init\n");
   {
     std::unique_lock<std::mutex> lock(simv_mtx);
@@ -84,7 +81,7 @@ void set_diff_ref_so(char *s) {
   difftest_ref_so = buf;
 }
 
-int fpga_init() {
+void fpga_init() {
   xdma_device = new FpgaXdma();
   init_ram(work_load, DEFAULT_EMU_RAM_SIZE);
   init_flash(NULL);
@@ -93,10 +90,8 @@ int fpga_init() {
 
   init_device();
   init_globalmem();
-  if (int status = init_nemuproxy(DEFAULT_EMU_RAM_SIZE))
-    return status;
+  init_nemuproxy(DEFAULT_EMU_RAM_SIZE);
   xdma_device->ddr_load_workload(work_load);
-  return 0;
 }
 
 void fpga_finish() {

@@ -26,8 +26,7 @@
 #include <cstring>
 #include <memory>
 #include <vector>
-#if NUM_CORES > 1 && !defined(CONFIG_DIFFTEST_SQUASH)
-#define DIFFTEST_USE_RVWMO_RUNTIME
+#if NUM_CORES > 1
 #include "rvwmo/runtime.h"
 #include "rvwmo/source_boundary.h"
 #endif
@@ -43,10 +42,8 @@
 
 Difftest **difftest = NULL;
 #if NUM_CORES > 1
-static std::vector<int> native_exit_codes;
-#endif
-#ifdef DIFFTEST_USE_RVWMO_RUNTIME
 static std::unique_ptr<rvwmo::Runtime> multicore_session;
+static std::vector<int> native_exit_codes;
 static rvwmo::Runtime &multicore_runtime() {
   assert(multicore_session);
   return *multicore_session;
@@ -63,11 +60,9 @@ static int runtime_error(const rvwmo::CheckResult &result, const char *phase) {
 #endif
 
 bool difftest_read_reference_memory(unsigned hart, uint64_t address, size_t size, uint8_t *bytes) {
-#ifdef DIFFTEST_USE_RVWMO_RUNTIME
+#if NUM_CORES > 1
   if (multicore_session)
     return multicore_runtime().read_reference_memory(hart, address, size, bytes);
-#else
-  (void)hart;
 #endif
   return global_memory().read(address, bytes, size);
 }
@@ -189,15 +184,13 @@ bool is_pending_csr_write(uint32_t instruction) {
 int difftest_init() {
   assert(difftest == nullptr);
 #if NUM_CORES > 1
-  native_exit_codes.assign(NUM_CORES, STATE_RUNNING);
-#endif
-#ifdef DIFFTEST_USE_RVWMO_RUNTIME
   // A fuzzing process may initialize several independent DUT runs.
   rvwmo::UcRamProfile uc_profile;
   const auto configured_uc = rvwmo::native_uc_profile_from_environment(uc_profile);
   if (!configured_uc) uc_profile = {};
   multicore_session = std::make_unique<rvwmo::Runtime>(NUM_CORES, std::move(uc_profile));
   if (!configured_uc) multicore_session->exclude(configured_uc.message);
+  native_exit_codes.assign(NUM_CORES, STATE_RUNNING);
 #ifdef CONFIG_DIFFTEST_SOURCEPREFIXEVENT
   rvwmo::source_boundary().reset(NUM_CORES, CONFIG_DIFF_SOURCE_PREFIX_WIDTH);
 #else
@@ -222,23 +215,45 @@ int difftest_init() {
   return 0;
 }
 
-#if NUM_CORES > 1 && defined(CONFIG_DIFFTEST_SQUASH)
-static int reject_checked_multicore_squash() {
-  eprintf("Difftest does not support checked multicore Squash. Disable Squash or run without difftest.\n");
-  return 1;
-}
-#endif
-
-int init_nemuproxy(size_t ramsize) {
-#if NUM_CORES > 1 && defined(CONFIG_DIFFTEST_SQUASH)
-  (void)ramsize;
-  return reject_checked_multicore_squash();
-#else
+int init_nemuproxy(size_t ramsize = 0) {
   for (int i = 0; i < NUM_CORES; i++) {
     difftest[i]->update_nemuproxy(i, ramsize);
   }
   return 0;
+}
+
+int difftest_state() {
+  for (int i = 0; i < NUM_CORES; i++) {
+    if (difftest[i]->get_trap_valid()) {
+      const int code = difftest[i]->get_trap_code();
+#if NUM_CORES > 1
+      if (code != STATE_GOODTRAP && code != STATE_SIM_EXIT) return code;
+      if (runtime_error(multicore_runtime().note_done(i, code), "hart completion")) return STATE_ABORT;
+#else
+      return code;
 #endif
+    }
+    if (difftest[i]->proxy && difftest[i]->proxy->get_status()) {
+      return difftest[i]->proxy->get_status();
+    }
+  }
+#if NUM_CORES > 1
+  if (multicore_runtime().all_done()) {
+    const auto result = multicore_runtime().finish();
+    if (result.status == rvwmo::CheckStatus::Pending) return -1;
+    if (runtime_error(result, "all-hart finalization")) return STATE_ABORT;
+    if (multicore_runtime().print_final_statistics())
+      Info("RVWMO scalar PPO/read-value checks passed for all participating harts\n");
+#ifdef CONFIG_DIFFTEST_SOURCEPREFIXEVENT
+    const char *observed_prefix = std::getenv("DIFFTEST_S_OBSERVED_PREFIX");
+    if (observed_prefix && std::strcmp(observed_prefix, "1") == 0 &&
+        multicore_runtime().print_observed_prefix_final())
+      multicore_runtime().export_semantic_observed_prefix();
+#endif
+    return STATE_GOODTRAP;
+  }
+#endif
+  return -1;
 }
 
 #if NUM_CORES > 1
@@ -261,44 +276,6 @@ static int native_difftest_state() {
   return STATE_GOODTRAP;
 }
 #endif
-
-int difftest_state() {
-#if NUM_CORES > 1 && defined(CONFIG_DIFFTEST_SQUASH)
-  return native_difftest_state();
-#else
-  for (int i = 0; i < NUM_CORES; i++) {
-    if (difftest[i]->get_trap_valid()) {
-      const int code = difftest[i]->get_trap_code();
-#ifdef DIFFTEST_USE_RVWMO_RUNTIME
-      if (code != STATE_GOODTRAP && code != STATE_SIM_EXIT) return code;
-      if (runtime_error(multicore_runtime().note_done(i, code), "hart completion")) return STATE_ABORT;
-#else
-      return code;
-#endif
-    }
-    if (difftest[i]->proxy && difftest[i]->proxy->get_status()) {
-      return difftest[i]->proxy->get_status();
-    }
-  }
-#ifdef DIFFTEST_USE_RVWMO_RUNTIME
-  if (multicore_runtime().all_done()) {
-    const auto result = multicore_runtime().finish();
-    if (result.status == rvwmo::CheckStatus::Pending) return -1;
-    if (runtime_error(result, "all-hart finalization")) return STATE_ABORT;
-    if (multicore_runtime().print_final_statistics())
-      Info("RVWMO scalar PPO/read-value checks passed for all participating harts\n");
-#ifdef CONFIG_DIFFTEST_SOURCEPREFIXEVENT
-    const char *observed_prefix = std::getenv("DIFFTEST_S_OBSERVED_PREFIX");
-    if (observed_prefix && std::strcmp(observed_prefix, "1") == 0 &&
-        multicore_runtime().print_observed_prefix_final())
-      multicore_runtime().export_semantic_observed_prefix();
-#endif
-    return STATE_GOODTRAP;
-  }
-#endif
-  return -1;
-#endif
-}
 
 int difftest_nstep(int step, bool enable_diff) {
 #if CONFIG_DIFFTEST_ZONESIZE > 1
@@ -338,20 +315,17 @@ void difftest_set_dut() {
   }
 }
 int difftest_step() {
-#if NUM_CORES > 1 && defined(CONFIG_DIFFTEST_SQUASH)
-  return reject_checked_multicore_squash();
-#else
   difftest_set_dut();
 #if defined(CONFIG_DIFFTEST_QUERY) && !defined(CONFIG_DIFFTEST_BATCH)
   difftest_query_step();
 #endif // CONFIG_DIFFTEST_QUERY
-#ifdef DIFFTEST_USE_RVWMO_RUNTIME
+#if NUM_CORES > 1
   std::vector<DiffTestState *> states;
   for (int i = 0; i < NUM_CORES; ++i) states.push_back(difftest[i]->get_dut());
   if (runtime_error(multicore_runtime().capture(states), "event acquisition")) return 1;
 #endif
   for (int i = 0; i < NUM_CORES; i++) {
-#ifdef DIFFTEST_USE_RVWMO_RUNTIME
+#if NUM_CORES > 1
     if (multicore_runtime().done(i))
       continue;
 #endif
@@ -361,7 +335,6 @@ int difftest_step() {
     }
   }
   return 0;
-#endif
 }
 
 int difftest_check_trap() {
@@ -402,7 +375,7 @@ void difftest_finish() {
   }
   delete[] difftest;
   difftest = NULL;
-#ifdef DIFFTEST_USE_RVWMO_RUNTIME
+#if NUM_CORES > 1
   multicore_session.reset();
 #endif
 }
@@ -733,7 +706,7 @@ inline int Difftest::check_all() {
 
   const bool arch_compared = !access_fault_skipped;
   const bool arch_mismatch = arch_compared && proxy->compare(dut);
-#ifdef DIFFTEST_USE_RVWMO_RUNTIME
+#if NUM_CORES > 1
   if (arch_compared && !arch_mismatch && num_commit &&
       runtime_error(multicore_runtime().note_arch_compare(id, num_commit), "independent architecture comparison"))
     return 1;
@@ -858,7 +831,7 @@ void Difftest::do_exception() {
     proxy->ref_exec(1);
   }
 
-#if defined(DIFFTEST_USE_RVWMO_RUNTIME) && defined(CONFIG_DIFFTEST_LOADEVENT) && defined(CONFIG_DIFFTEST_ARCHVECREGSTATE)
+#if NUM_CORES > 1 && defined(CONFIG_DIFFTEST_LOADEVENT) && defined(CONFIG_DIFFTEST_ARCHVECREGSTATE)
   const uint32_t opcode = dut->event.exceptionInst & 0x7f;
   const uint32_t width = (dut->event.exceptionInst >> 12) & 7;
   if ((opcode == 0x07 || opcode == 0x27) && (width == 0 || width >= 5)) {
@@ -985,7 +958,7 @@ int Difftest::do_instr_commit(int i) {
   }
 #endif
 
-#ifdef DIFFTEST_USE_RVWMO_RUNTIME
+#if NUM_CORES > 1
   if (DEBUG_MODE_SKIP(dut->commit[i].valid, dut->commit[i].pc, dut->commit[i].inst))
     multicore_runtime().exclude("debug-mode skipped instruction lacks complete RVWMO semantics");
   if (runtime_error(multicore_runtime().before_commit(id, i, *dut, *proxy), "reference preparation")) return 1;
@@ -998,7 +971,7 @@ int Difftest::do_instr_commit(int i) {
   // MMIO accessing should not be a branch or jump, just +2/+4 to get the next pc
   // to skip the checking of an instruction, just copy the reg state to reference design
   bool independently_execute_uc = false;
-#ifdef DIFFTEST_USE_RVWMO_RUNTIME
+#if NUM_CORES > 1
   independently_execute_uc = multicore_runtime().independently_execute_skipped_uc(id);
 #endif
   if ((dut->commit[i].skip && !independently_execute_uc) ||
@@ -1014,7 +987,7 @@ int Difftest::do_instr_commit(int i) {
     // We use the physical register file to get wdata
     proxy->skip_one(dut->commit[i].isRVC, (dut->commit[i].rfwen && dut->commit[i].wdest != 0), dut->commit[i].fpwen,
                     dut->commit[i].vecwen, dut->commit[i].wdest, get_commit_data(i), dut);
-#ifdef DIFFTEST_USE_RVWMO_RUNTIME
+#if NUM_CORES > 1
     return runtime_error(multicore_runtime().after_commit(id, *proxy), "skipped retirement validation");
 #else
     return 0;
@@ -1063,7 +1036,7 @@ int Difftest::do_instr_commit(int i) {
       }
     } else
 #endif
-#ifdef DIFFTEST_USE_RVWMO_RUNTIME
+#if NUM_CORES > 1
     {
       if (runtime_error(multicore_runtime().execute_reference(id, *proxy), "independent REF execution")) {
         result = 1;
@@ -1116,7 +1089,7 @@ int Difftest::do_instr_commit(int i) {
   active_translations.clear();
 #endif
 
-#ifdef DIFFTEST_USE_RVWMO_RUNTIME
+#if NUM_CORES > 1
   if (!result && runtime_error(multicore_runtime().after_commit(id, *proxy), "retirement validation")) result = 1;
 #endif
   return result;
@@ -1174,7 +1147,7 @@ void Difftest::do_first_instr_commit() {
 }
 
 int Difftest::do_load_check(int i) {
-#if defined(DIFFTEST_USE_RVWMO_RUNTIME) && defined(CONFIG_DIFFTEST_LOADEVENT)
+#if NUM_CORES > 1 && defined(CONFIG_DIFFTEST_LOADEVENT)
   auto &load = dut->load[i];
   if (!load.valid)
     return 0;
@@ -1860,7 +1833,7 @@ void Difftest::load_event_record() {
 #ifdef CONFIG_DIFFTEST_CMOINVALEVENT
 int Difftest::cmo_inval_event_record() {
   if (dut->cmo_inval.valid) {
-#ifdef DIFFTEST_USE_RVWMO_RUNTIME
+#if NUM_CORES > 1
     Info("RVWMO UNSUPPORTED: CMO invalidation on core %d\n", id);
     return 1;
 #else
