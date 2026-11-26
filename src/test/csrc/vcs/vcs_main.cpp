@@ -224,7 +224,7 @@ extern "C" uint8_t simv_init() {
 #ifndef CONFIG_NO_DIFFTEST
   if (enable_difftest) {
     init_globalmem();
-    init_nemuproxy(ram_size);
+    return init_nemuproxy(ram_size);
   }
 #endif // CONFIG_NO_DIFFTEST
 

@@ -70,6 +70,7 @@ AbstractRefProxy::AbstractRefProxy(int coreid, size_t ram_size, const char *env,
     check_and_assert(ref_set_mhartid);
     ref_set_mhartid(coreid);
 
+#ifndef CONFIG_DIFFTEST_SQUASH
     check_and_assert(ref_set_physical_memory);
     const bool configured = ref_set_physical_memory(
         this,
@@ -90,6 +91,7 @@ AbstractRefProxy::AbstractRefProxy(int coreid, size_t ram_size, const char *env,
       fflush(stderr);
       abort();
     }
+#endif
   }
 
   // set ram_size before ref_init()
@@ -104,12 +106,14 @@ AbstractRefProxy::AbstractRefProxy(int coreid, size_t ram_size, const char *env,
 #endif // ENABLE_STORE_LOG
 
   ref_init();
+#ifndef CONFIG_DIFFTEST_SQUASH
   if (NUM_CORES > 1) {
     check_and_assert(ref_private_memory_bytes);
     if (ref_private_memory_bytes() != 0)
       panic("Core %d: external-memory reference allocated private RAM", coreid);
     Info("Core %d reference: external memory, private RAM bytes=0\n", coreid);
   }
+#endif
 }
 
 AbstractRefProxy::~AbstractRefProxy() {

@@ -2,6 +2,7 @@ package difftest
 
 import chisel3._
 import chisel3.util.experimental.BoringUtils
+import difftest.gateway.Gateway
 
 // The integration passes the common timebase through its instance boundary.
 // Only an explicit, pinned producer-delay contract enables source certification.
@@ -42,9 +43,13 @@ object ObservationClock {
     hartId: UInt,
     useCompactStoreEvents: Boolean = false,
   )(body: => T): T = {
-    require(maxSampleDelayEdges >= 0 && maxSampleDelayEdges < 256)
-    require(hartId.getWidth > 0 && hartId.getWidth <= 8)
-    scopedSource(cycle, Some(new SourceContract(maxSampleDelayEdges, hartId, useCompactStoreEvents)))(body)
+    if (Gateway.isSquash) {
+      withSource(cycle)(body)
+    } else {
+      require(maxSampleDelayEdges >= 0 && maxSampleDelayEdges < 256)
+      require(hartId.getWidth > 0 && hartId.getWidth <= 8)
+      scopedSource(cycle, Some(new SourceContract(maxSampleDelayEdges, hartId, useCompactStoreEvents)))(body)
+    }
   }
 
   private[difftest] def sourceContract: Option[SourceContract] = source.flatMap(_.contract)
