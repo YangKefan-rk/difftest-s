@@ -129,7 +129,7 @@ public:
   UcBridge &operator=(const UcBridge &) = delete;
 
   CheckResult ingest(const SfuzzUcRawRecord &record);
-  // Invoke after this capture's allocation/StoreIdentity passes. Only phase-1
+  // Invoke after capturing ROB allocations and local stores. Only phase-1
   // requests with exact current per-hart MemoryTime frames may resolve ROB.
   CheckResult bind_frame(const std::vector<uint64_t> &frame_cycles,
                          const UcAllocationResolver &resolve);

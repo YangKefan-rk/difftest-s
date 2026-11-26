@@ -1223,8 +1223,8 @@ CheckResult Runtime::capture(const std::vector<DiffTestState *> &states) {
 #if NUM_CORES > 1 && defined(CONFIG_DIFFTEST_STORELOCALEVENT) && defined(CONFIG_DIFFTEST_LOADSNAPSHOTEVENT) && \
     defined(CONFIG_DIFFTEST_SBUFFEREVENT) && defined(CONFIG_DIFFTEST_TLBEVENT) &&                               \
     defined(CONFIG_DIFFTEST_MEMORYTIMEEVENT) && defined(CONFIG_DIFFTEST_SOURCEPREFIXEVENT) &&                 \
-    !defined(CONFIG_DIFFTEST_STOREIDENTITYEVENT) && !defined(CONFIG_DIFFTEST_STOREEVENT) &&                    \
-    !defined(CONFIG_DIFFTEST_SQUASH) && !defined(CONFIG_DIFFTEST_BATCH) && !defined(CONFIG_DIFFTEST_REPLAY)
+    !defined(CONFIG_DIFFTEST_STOREEVENT) && !defined(CONFIG_DIFFTEST_SQUASH) &&                               \
+    !defined(CONFIG_DIFFTEST_BATCH) && !defined(CONFIG_DIFFTEST_REPLAY)
   if (states.size() != harts_.size())
     return invalid("runtime hart count differs from event producer");
   for (const auto *state: states)

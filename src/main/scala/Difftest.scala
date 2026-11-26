@@ -431,16 +431,6 @@ class DiffSourcePrefixEvent extends SourcePrefixEvent with DifftestBundle with D
   override val squashGroup: Seq[String] = Seq()
 }
 
-class DiffStoreIdentityEvent
-  extends StoreIdentityEvent
-  with DifftestBundle
-  with DifftestWithIndex
-  with DifftestSourceEvent {
-  override def producerKind: Int = 3
-  override val desiredCppName: String = "store_identity"
-  override val squashGroup: Seq[String] = Seq()
-}
-
 class DiffStoreLocalEvent
   extends StoreLocalEvent
   with DifftestBundle

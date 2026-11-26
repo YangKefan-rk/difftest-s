@@ -290,15 +290,12 @@ class SourcePrefixEvent extends DifftestBaseBundle with HasValid {
   val sequence = UInt(64.W)
 }
 
-class StoreIdentityEvent extends DifftestBaseBundle with HasValid {
+class StoreLocalEvent extends DifftestBaseBundle with HasValid {
   val timestamp = UInt(64.W)
   val storeUid = UInt(64.W)
   val robidx = UInt(10.W)
   val sqidx = UInt(16.W)
   val isVector = Bool()
-}
-
-class StoreLocalEvent extends StoreIdentityEvent {
   val addr = UInt(64.W)
   val data = Vec(16, UInt(8.W))
   val mask = UInt(16.W)
